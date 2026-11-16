@@ -3,7 +3,7 @@
 Signed tool receipts, out-of-process MCP receipt proxying, Ed25519 memory write-gating, and RAG source deduplication for autonomous agents.  
 Runs locally on CPU, GPU, or NPU in **3–11 ms**. Zero LLM API calls. MIT License.
 
-[PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks (`N=973`)](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)
+[Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks (`N=973`)](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)
 
 ---
 
@@ -68,6 +68,19 @@ epistemic-guard verify-log /var/log/agent/receipts.jsonl \
 ```
 
 **Security boundary note:** If the untrusted agent process has filesystem write access to `--log`, always pass `--pubkey-file` (stored outside the agent's writable directory) when running `verify-log` so an attacker cannot replace the entire log file under a newly generated keypair.
+
+You can also run `epistemic-guard` itself as a standalone stdio MCP verification server (`verify_narration`, `verify_receipt_log`, `corroborate_sources`):
+
+```json
+{
+  "mcpServers": {
+    "epistemic-guard": {
+      "command": "epistemic-guard",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
 
 ---
 
@@ -207,6 +220,6 @@ Evaluated across `LOCKED_COH_50` (`50`), `BLIND42_COH_100` (`100`), and `Organic
 
 ## License
 
-- **Source Code:** [MIT License](LICENSE) (`Copyright (c) 2026 Sean Maxwell` · [ORCID `0009-0004-0133-0463`](https://orcid.org/0009-0004-0133-0463)).
+- **Source Code:** [MIT License](LICENSE) (`Copyright (c) 2026 Sean Maxwell` · [ORCID `0009-0004-0133-0463`](https://orcid.org/0009-0004-0133-0463) · Built by [RollSolo](https://rollsolo.app), Member of NVIDIA Inception).
 - **INT8 Model Weights:** Derived from `Apache-2.0` / `MIT` upstream checkpoints (`cross-encoder/nli-MiniLM2-L6-H768`, `cross-encoder/ms-marco-MiniLM-L-6-v2`, `cross-encoder/nli-deberta-v3-xsmall`); see [`MODEL_NOTICES.md`](MODEL_NOTICES.md).
 - **Citation & Preprints:** [`CITATION.cff`](CITATION.cff) · Zenodo DOIs [`10.5281/zenodo.23649049`](https://doi.org/10.5281/zenodo.23649049), [`10.5281/zenodo.23901452`](https://doi.org/10.5281/zenodo.23901452), [`10.5281/zenodo.23901605`](https://doi.org/10.5281/zenodo.23901605), [`10.5281/zenodo.23901683`](https://doi.org/10.5281/zenodo.23901683).

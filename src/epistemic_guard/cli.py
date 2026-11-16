@@ -16,6 +16,7 @@ from epistemic_guard.corroboration import corroborate_sources
 from epistemic_guard.exceptions import EpistemicGuardError, ProvenanceError
 from epistemic_guard.integrations import ReceiptRecorder
 from epistemic_guard.mcp_proxy import run_mcp_stdio_proxy, verify_receipt_log_file
+from epistemic_guard.mcp_server import run_mcp_stdio_server
 from epistemic_guard.models import (
     MODEL_SPECS,
     default_cache_root,
@@ -366,6 +367,12 @@ def main(argv: list[str] | None = None) -> int:
     vl.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
     vl.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    ms = sub.add_parser(
+        "mcp-server",
+        help="Run a standalone stdio MCP server exposing epistemic-guard verification tools",
+    )
+    ms.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
+
     parsed = parser.parse_args(argv)
     if parsed.command == "doctor":
         return _cmd_doctor()
@@ -373,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_download(parsed)
     if parsed.command == "mcp-proxy":
         return _cmd_mcp_proxy(parsed)
+    if parsed.command == "mcp-server":
+        return run_mcp_stdio_server(device=parsed.device)
     if parsed.command == "verify-log":
         return _cmd_verify_log(parsed)
     return _cmd_demo()

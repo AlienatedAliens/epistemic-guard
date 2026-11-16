@@ -42,6 +42,11 @@ from epistemic_guard.mcp_proxy import (
     run_mcp_stdio_proxy,
     verify_receipt_log_file,
 )
+from epistemic_guard.mcp_server import (
+    MCP_TOOLS,
+    EpistemicGuardMcpServer,
+    run_mcp_stdio_server,
+)
 from epistemic_guard.models import (
     MODEL_PACK_VERSION,
     MODEL_SPECS,
@@ -97,6 +102,7 @@ __version__ = "0.4.0"
 
 __all__ = [
     "ELIGIBLE_PROVENANCE",
+    "MCP_TOOLS",
     "MODEL_PACK_VERSION",
     "MODEL_SPECS",
     "POLICY_TABLE_2D",
@@ -106,6 +112,7 @@ __all__ = [
     "DomainSigner",
     "EpistemicError",
     "EpistemicGuardError",
+    "EpistemicGuardMcpServer",
     "EpistemicModelUnavailableWarning",
     "Hazard",
     "HazardVerdict",
@@ -157,6 +164,7 @@ __all__ = [
     "read_public_key_file",
     "required_standard",
     "run_mcp_stdio_proxy",
+    "run_mcp_stdio_server",
     "shingle_jaccard_similarity",
     "sign_rule_approval",
     "signed_tool",
