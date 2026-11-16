@@ -1,18 +1,21 @@
-"""Command-line interface for `epistemic-guard`: `demo`, `doctor`, and `download-models`."""
+"""Command-line interface for `epistemic-guard`."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import sys
 import time
+from pathlib import Path
 
 import openvino as ov
 
 from epistemic_guard.corroboration import corroborate_sources
-from epistemic_guard.exceptions import ProvenanceError
+from epistemic_guard.exceptions import EpistemicGuardError, ProvenanceError
 from epistemic_guard.integrations import ReceiptRecorder
+from epistemic_guard.mcp_proxy import run_mcp_stdio_proxy, verify_receipt_log_file
 from epistemic_guard.models import (
     MODEL_SPECS,
     default_cache_root,
@@ -55,7 +58,7 @@ def _cmd_doctor() -> int:
 
 
 def _cmd_demo() -> int:
-    print("epistemic-guard v0.3.1 — Live Verification Demo")
+    print("epistemic-guard v0.4.0 — Live Verification Demo")
     print("=" * 68)
 
     master_key = os.urandom(32)
@@ -180,11 +183,115 @@ def _cmd_download(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
+    cmd = list(args.server_cmd)
+    if cmd[:1] == ["--"]:
+        cmd = cmd[1:]
+    if not cmd:
+        print(
+            "epistemic-guard mcp-proxy: missing target MCP server command after '--'.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        return run_mcp_stdio_proxy(
+            cmd,
+            log_path=args.log,
+            key_file=args.key_file,
+            pubkey_out=args.pubkey_out,
+            truncate_log=args.truncate,
+            include_aer1=args.aer1,
+        )
+    except (EpistemicGuardError, OSError, ValueError) as exc:
+        print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_verify_log(args: argparse.Namespace) -> int:
+    try:
+        verified = verify_receipt_log_file(
+            args.log_path,
+            expected_pubkey_hex=args.pubkey,
+            pubkey_file=args.pubkey_file,
+        )
+    except (EpistemicGuardError, OSError, ValueError) as exc:
+        if args.json:
+            print(json.dumps({"log_valid": False, "error": str(exc)}, sort_keys=True))
+        else:
+            print(f"TAMPER OR KEY ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    narration_text: str | None = args.narration
+    if args.narration_file is not None:
+        narration_text = Path(args.narration_file).read_text(encoding="utf-8")
+
+    if narration_text is None:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "log_valid": True,
+                        "entry_count": verified.entry_count,
+                        "merkle_root": verified.merkle_root,
+                        "head_chain_hash": verified.head_chain_hash,
+                        "public_key_hex": verified.public_key_hex,
+                        "key_pinned": verified.key_pinned,
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            pin_note = "pinned" if verified.key_pinned else "unpinned (self-declared)"
+            print(
+                f"OK: verified {verified.entry_count} receipt(s) | "
+                f"merkle_root={verified.merkle_root[:24]}... | key={pin_note}"
+            )
+        return 0
+
+    sup = ReceiptSupervisor(device=args.device, warn_on_missing=False)
+    verdict = sup.verify_narration(
+        narration_text,
+        receipts=verified.receipts,
+        user_prompt=args.prompt or "",
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "log_valid": True,
+                    "entry_count": verified.entry_count,
+                    "merkle_root": verified.merkle_root,
+                    "key_pinned": verified.key_pinned,
+                    "narration_valid": verdict.is_valid,
+                    "device": verdict.device,
+                    "unsupported_claims": list(verdict.unsupported_claims),
+                    "retry_prompt": (
+                        "" if verdict.is_valid else verdict.to_retry_prompt(verified.receipts)
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
+    elif verdict.is_valid:
+        print(
+            f"OK: {verified.entry_count} receipt(s) verified; assistant narration grounded "
+            f"(device={verdict.device})."
+        )
+    else:
+        print(
+            f"NARRATION UNGROUNDED ({len(verdict.unsupported_spans)} span(s) flagged):",
+            file=sys.stderr,
+        )
+        print(verdict.to_retry_prompt(verified.receipts), file=sys.stderr)
+    return 0 if verdict.is_valid else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="epistemic-guard",
         description=(
-            "Signed tool receipts, memory write-gating, and RAG deduplication for Python agents."
+            "Signed tool receipts, out-of-process MCP proxy, memory write-gating, "
+            "and RAG deduplication."
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -203,11 +310,71 @@ def main(argv: list[str] | None = None) -> int:
     dl.add_argument("--base-url", default=None, help="Release mirror URL override")
     dl.add_argument("--force", action="store_true", help="Re-download even if SHA-256 matches")
 
+    mp = sub.add_parser(
+        "mcp-proxy",
+        help="Wrap a stdio MCP server in an out-of-process Ed25519 receipt signer",
+    )
+    mp.add_argument(
+        "--log",
+        required=True,
+        help="Append-only JSONL receipt log path",
+    )
+    mp.add_argument(
+        "--key-file",
+        default=None,
+        help="Path to 32-byte Ed25519 seed file (created with 0600 mode if missing)",
+    )
+    mp.add_argument(
+        "--pubkey-out",
+        default=None,
+        help="Write the corresponding Ed25519 public key JSON to this path",
+    )
+    mp.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Truncate existing --log file on startup instead of resuming its Merkle chain",
+    )
+    mp.add_argument(
+        "--aer1",
+        action="store_true",
+        help="Include an exported AER-1 envelope alongside each native ToolReceipt",
+    )
+    mp.add_argument(
+        "server_cmd",
+        nargs=argparse.REMAINDER,
+        help="Target MCP server command and arguments (place after '--')",
+    )
+
+    vl = sub.add_parser(
+        "verify-log",
+        help="Verify Ed25519 signatures and Merkle roots in an mcp-proxy JSONL log",
+    )
+    vl.add_argument("log_path", help="Path to JSONL receipt log produced by mcp-proxy")
+    vl.add_argument("--pubkey", default=None, help="Expected 64-char hex Ed25519 public key")
+    vl.add_argument("--pubkey-file", default=None, help="Path to public key file (--pubkey-out)")
+    vl.add_argument(
+        "--narration",
+        default=None,
+        help="Assistant reply text to check against the verified receipts",
+    )
+    vl.add_argument(
+        "--narration-file",
+        default=None,
+        help="Path to text file containing an assistant reply to check",
+    )
+    vl.add_argument("--prompt", default=None, help="Optional user prompt context for supervision")
+    vl.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
+    vl.add_argument("--json", action="store_true", help="Emit JSON output")
+
     parsed = parser.parse_args(argv)
     if parsed.command == "doctor":
         return _cmd_doctor()
     if parsed.command == "download-models":
         return _cmd_download(parsed)
+    if parsed.command == "mcp-proxy":
+        return _cmd_mcp_proxy(parsed)
+    if parsed.command == "verify-log":
+        return _cmd_verify_log(parsed)
     return _cmd_demo()
 
 

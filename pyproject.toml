@@ -1,7 +1,7 @@
 [project]
 name = "epistemic-guard"
-version = "0.3.1"
-description = "Signed tool receipts, Ed25519 memory write-gating, and RAG source deduplication for Python agents (CPU/NPU, zero LLM calls)"
+version = "0.4.0"
+description = "Signed tool receipts, out-of-process MCP receipt proxy, Ed25519 memory write-gating, and RAG deduplication for agents (CPU/NPU, zero LLM calls)"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Sean Maxwell" }]
@@ -9,6 +9,7 @@ requires-python = ">=3.10"
 keywords = [
     "agents",
     "mcp",
+    "mcp-proxy",
     "tool-calling",
     "ed25519",
     "provenance",
@@ -48,8 +49,11 @@ dev = [
 epistemic-guard = "epistemic_guard.cli:main"
 
 [project.urls]
-Repository = "https://github.com/AlienatedAliens/ProjectLucca/tree/main/packages/epistemic-guard"
-Issues = "https://github.com/AlienatedAliens/ProjectLucca/issues"
+Homepage = "https://github.com/AlienatedAliens/epistemic-guard"
+Repository = "https://github.com/AlienatedAliens/epistemic-guard"
+Issues = "https://github.com/AlienatedAliens/epistemic-guard/issues"
+Benchmarks = "https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks"
+Demo = "https://huggingface.co/spaces/RollSolo/epistemic-guard"
 "Author ORCID" = "https://orcid.org/0009-0004-0133-0463"
 
 [build-system]
@@ -71,10 +75,23 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+include = ["src/**/*.py", "tests/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "BLE", "S", "UP", "ANN", "PL"]
+ignore = ["PLR0913", "PLR2004", "S105", "PLR0911", "PLR0912", "PLR0915", "PLR0917", "S311", "S324", "BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S102", "S106", "S603", "S607", "S608", "ANN", "PLR", "BLE001", "PLC0415", "E501"]
+"src/epistemic_guard/mcp_proxy.py" = ["S603"]
+"src/epistemic_guard/models.py" = ["S310"]
+
 [tool.mypy]
 strict = true
 
 [[tool.mypy.overrides]]
 module = ["openvino.*", "tokenizers.*"]
 ignore_missing_imports = true
-

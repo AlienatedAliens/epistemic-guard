@@ -18,7 +18,7 @@ from epistemic_guard.exceptions import EpistemicModelUnavailableWarning, ModelIn
 
 MODEL_PACK_VERSION: Final[str] = "v0.3.0"
 DEFAULT_RELEASE_BASE_URL: Final[str] = (
-    "https://github.com/AlienatedAliens/ProjectLucca/releases/download/"
+    "https://github.com/AlienatedAliens/epistemic-guard/releases/download/"
     f"epistemic-guard-models-{MODEL_PACK_VERSION}"
 )
 

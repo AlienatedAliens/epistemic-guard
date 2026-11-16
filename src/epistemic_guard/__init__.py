@@ -1,5 +1,5 @@
-"""`epistemic-guard`: Signed tool receipts, memory write-gating, and RAG source deduplication
-for Python agents (MIT License, local CPU/GPU/NPU execution).
+"""`epistemic-guard`: Signed tool receipts, out-of-process MCP proxy, memory write-gating,
+and RAG source deduplication for autonomous agents (MIT License, local CPU/GPU/NPU).
 """
 
 from epistemic_guard.corroboration import (
@@ -31,6 +31,16 @@ from epistemic_guard.integrations import (
     ReceiptRecorder,
     signed_tool,
     verify_chat_turn,
+)
+from epistemic_guard.mcp_proxy import (
+    McpStdioProxy,
+    ReceiptLogEntry,
+    ReceiptLogVerification,
+    ReceiptLogWriter,
+    load_or_create_mcp_signer,
+    read_public_key_file,
+    run_mcp_stdio_proxy,
+    verify_receipt_log_file,
 )
 from epistemic_guard.models import (
     MODEL_PACK_VERSION,
@@ -83,7 +93,7 @@ from epistemic_guard.supervision import (
     parse_structured_action_tags,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "ELIGIBLE_PROVENANCE",
@@ -99,6 +109,7 @@ __all__ = [
     "EpistemicModelUnavailableWarning",
     "Hazard",
     "HazardVerdict",
+    "McpStdioProxy",
     "MerkleInclusionProof",
     "MerkleReceiptLog",
     "MerkleTamperError",
@@ -114,6 +125,9 @@ __all__ = [
     "Provenance",
     "ProvenanceError",
     "ProvenanceGate",
+    "ReceiptLogEntry",
+    "ReceiptLogVerification",
+    "ReceiptLogWriter",
     "ReceiptRecorder",
     "ReceiptSupervisor",
     "SQLiteProvenanceStore",
@@ -136,10 +150,13 @@ __all__ = [
     "evaluate_web_evidence_burden",
     "generate_operator_keypair",
     "is_creative_or_meta_prompt",
+    "load_or_create_mcp_signer",
     "mask_non_assertive_spans",
     "meets_standard",
     "parse_structured_action_tags",
+    "read_public_key_file",
     "required_standard",
+    "run_mcp_stdio_proxy",
     "shingle_jaccard_similarity",
     "sign_rule_approval",
     "signed_tool",
@@ -148,5 +165,6 @@ __all__ = [
     "standard_for_confidence",
     "verify_chat_turn",
     "verify_model_dir",
+    "verify_receipt_log_file",
     "verify_rule_approval_token",
 ]
