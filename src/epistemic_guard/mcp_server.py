@@ -17,7 +17,7 @@ _DEFAULT_PROTOCOL_VERSION: Final[str] = "2024-11-05"
 _SUPPORTED_PROTOCOLS: Final[frozenset[str]] = frozenset(
     {"2024-11-05", "2025-03-26", "2025-06-18"}
 )
-_SERVER_VERSION: Final[str] = "0.4.0"
+_SERVER_VERSION: Final[str] = "0.4.1"
 
 MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
@@ -202,7 +202,12 @@ def _parse_receipts(raw_items: object) -> list[ToolReceipt]:
     for idx, item in enumerate(raw_items):
         if not isinstance(item, Mapping):
             raise ValueError(f"receipts[{idx}] must be an object.")
-        if item.get("aer1_version") or item.get("spec_version"):
+        if (
+            "receipt_schema_version" in item
+            or "canonical_bytes" in item
+            or item.get("aer1_version")
+            or item.get("spec_version")
+        ):
             parsed.append(ToolReceipt.from_aer1(dict(item)))
             continue
         tool_name = item.get("tool")

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
+from os import PathLike
+from pathlib import Path
 from typing import Any, Final
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
@@ -103,6 +107,30 @@ class SignedPayload(UnsignedPayload):
     signer_domain: str
 
 
+_AER1_CORE_FIELDS: Final[tuple[str, ...]] = (
+    "id",
+    "receipt_schema_version",
+    "created_at",
+    "tool",
+    "provenance_class",
+    "canonical_bytes",
+    "output_hash",
+    "verification_status",
+)
+_AER1_UUID_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+_AER1_RFC3339_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})\Z"
+)
+_AER1_HASH_RE: Final[re.Pattern[str]] = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+_AER1_PROV_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(EXECUTED BY [A-Z0-9][A-Z0-9 ._-]*|OBSERVED VIA GATEWAY|LOGGED BY AGENT)\Z"
+)
+_AER1_B64_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9+/]*={0,2}\Z")
+_AER1_NIL_UUID: Final[str] = "00000000-0000-0000-0000-000000000000"
+
+
 def _coerce_receipt_arg(val: object) -> str | int | float | bool:
     if isinstance(val, (str, int, float, bool)):
         return val
@@ -112,18 +140,272 @@ def _coerce_receipt_arg(val: object) -> str | int | float | bool:
         return str(val)
 
 
-def _decode_aer1_canonical_bytes(raw: object) -> bytes | None:
-    if isinstance(raw, bytes):
-        return raw
-    if not isinstance(raw, str) or not raw:
-        return None
-    stripped = raw.strip()
-    if stripped.startswith("{"):
-        return raw.encode("utf-8")
+def _is_strict_rfc3339(value: object) -> bool:
+    """Validate strict RFC 3339 calendar date/time (no leap-second 60 or non-leap Feb 29)."""
+    if not isinstance(value, str) or not _AER1_RFC3339_RE.match(value):
+        return False
+    if not value.endswith("Z"):
+        off = value[-6:]
+        try:
+            oh, om = int(off[1:3]), int(off[4:6])
+        except ValueError:
+            return False
+        if not (0 <= oh <= 23 and 0 <= om <= 59):
+            return False
     try:
-        return base64.b64decode(stripped, validate=True)
-    except Exception:
-        return raw.encode("utf-8")
+        year = int(value[0:4])
+        month = int(value[5:7])
+        day = int(value[8:10])
+        hour = int(value[11:13])
+        minute = int(value[14:16])
+        second = int(value[17:19])
+    except ValueError:
+        return False
+    if not (1 <= month <= 12):
+        return False
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return False
+    if month in {1, 3, 5, 7, 8, 10, 12}:
+        max_day = 31
+    elif month in {4, 6, 9, 11}:
+        max_day = 30
+    else:
+        is_leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        max_day = 29 if is_leap else 28
+    return 1 <= day <= max_day
+
+
+def _parse_json_with_duplicate_check(text: str) -> tuple[object, str | None]:
+    """Parse JSON text while capturing the first duplicate object member name, if any."""
+    duplicates: list[str] = []
+
+    def _hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        seen: set[str] = set()
+        for key, _val in pairs:
+            if key in seen and not duplicates:
+                duplicates.append(key)
+            seen.add(key)
+        return dict(pairs)
+
+    parsed: object = json.loads(text, object_pairs_hook=_hook)
+    return parsed, (duplicates[0] if duplicates else None)
+
+
+def _is_aer1_legacy_production_shape(rec: Mapping[str, Any]) -> bool:
+    """Narrow legacy schema 0.2/0.3 production envelope check (`timestamp` + `tool_context`)."""
+    if "created_at" in rec:
+        return False
+    if rec.get("receipt_schema_version") not in {"0.2", "0.3"}:
+        return False
+    ts = rec.get("timestamp")
+    if not isinstance(ts, str) or not ts:
+        return False
+    tool = rec.get("tool")
+    ctx = rec.get("tool_context")
+    if not isinstance(tool, str) or not tool or not isinstance(ctx, Mapping):
+        return False
+    if not all(isinstance(ctx.get(k), str) and bool(ctx[k]) for k in ("name", "version", "scope")):
+        return False
+    return bool(ctx.get("name") == tool)
+
+
+def _json_quote(val: object) -> str:
+    return json.dumps(val, ensure_ascii=False)
+
+
+def _derive_aer1_uuid(call_id: str, canon_sha: str) -> str:
+    if _AER1_UUID_RE.match(call_id) and call_id != _AER1_NIL_UUID:
+        return call_id
+    digest = bytearray(
+        hashlib.sha256(f"epistemic-guard:aer1-id:{call_id}:{canon_sha}".encode()).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(UUID(bytes=bytes(digest)))
+
+
+def _normalize_aer1_timestamp(ts: str) -> str:
+    if _is_strict_rfc3339(ts):
+        return ts
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        return dt.isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _validate_and_decode_aer1(
+    rec: Mapping[str, Any],
+    *,
+    duplicate_member: str | None,
+    verify_commitment: bool,
+    expected_id: str | None,
+    resolved_record: Mapping[str, Any] | None,
+) -> tuple[bytes, Mapping[str, Any], str, bool]:
+    legacy_prod = _is_aer1_legacy_production_shape(rec)
+    required: Sequence[str] = (
+        tuple(f for f in _AER1_CORE_FIELDS if f != "created_at") + ("timestamp", "tool_context")
+        if legacy_prod
+        else _AER1_CORE_FIELDS
+    )
+    for field_name in required:
+        if field_name not in rec:
+            raise SignatureTamperError(f"missing required member: {field_name}")
+
+    rid = rec["id"]
+    if not isinstance(rid, str) or not _AER1_UUID_RE.match(rid):
+        raise SignatureTamperError("id is not a lowercase UUID")
+    if rid == _AER1_NIL_UUID:
+        raise SignatureTamperError("id is the nil UUID")
+
+    rsv = rec["receipt_schema_version"]
+    if not isinstance(rsv, str) or not rsv:
+        raise SignatureTamperError("receipt_schema_version is not a non-empty string")
+
+    created_val = rec["timestamp"] if legacy_prod else rec["created_at"]
+    if not isinstance(created_val, str):
+        raise SignatureTamperError("created_at is not a string")
+    if not _AER1_RFC3339_RE.match(created_val):
+        raise SignatureTamperError("created_at is not RFC 3339")
+    if not _is_strict_rfc3339(created_val):
+        raise SignatureTamperError("created_at is not a valid calendar date/time")
+
+    tool_val = rec["tool_context"] if legacy_prod else rec["tool"]
+    if not isinstance(tool_val, Mapping) or not all(
+        isinstance(tool_val.get(k), str) and bool(tool_val[k])
+        for k in ("name", "version", "scope")
+    ):
+        raise SignatureTamperError("tool is not an object with name/version/scope strings")
+
+    prov_cls = rec["provenance_class"]
+    if not isinstance(prov_cls, str) or not _AER1_PROV_RE.match(prov_cls):
+        raise SignatureTamperError("provenance_class is not a known class")
+
+    cb = rec["canonical_bytes"]
+    if not isinstance(cb, str) or not _AER1_B64_RE.match(cb):
+        raise SignatureTamperError("canonical_bytes is not valid base64")
+    try:
+        canon_bytes = base64.b64decode(cb, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise SignatureTamperError("canonical_bytes is not valid base64") from exc
+    if base64.b64encode(canon_bytes).decode("ascii") != cb:
+        raise SignatureTamperError("canonical_bytes is not the canonical base64 spelling")
+    try:
+        canon_text = canon_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SignatureTamperError("canonical_bytes is not valid UTF-8") from exc
+
+    oh = rec["output_hash"]
+    if not isinstance(oh, str) or not _AER1_HASH_RE.match(oh):
+        raise SignatureTamperError("output_hash is not sha256: + lowercase hex digest")
+
+    computed_hex = hashlib.sha256(canon_bytes).hexdigest()
+    if verify_commitment and oh != f"sha256:{computed_hex}":
+        raise SignatureTamperError("output_hash does not match sha256(canonical_bytes)")
+
+    try:
+        inner_parsed, inner_dup = _parse_json_with_duplicate_check(canon_text)
+    except json.JSONDecodeError as exc:
+        raise SignatureTamperError("canonical payload is not valid JSON") from exc
+    if inner_dup is not None:
+        raise SignatureTamperError(f"duplicate member name: {inner_dup}")
+
+    ih = rec.get("input_hash")
+    if ih is not None:
+        if not isinstance(ih, str) or not _AER1_HASH_RE.match(ih):
+            raise SignatureTamperError("input_hash is not sha256: + lowercase hex digest")
+        if verify_commitment and isinstance(inner_parsed, Mapping) and "inputs" in inner_parsed:
+            inputs_raw = json.dumps(
+                inner_parsed["inputs"], sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            want_ih = f"sha256:{hashlib.sha256(inputs_raw).hexdigest()}"
+            if ih != want_ih:
+                raise SignatureTamperError(
+                    "input_hash does not match sha256(canonical JSON of the recorded inputs)"
+                )
+
+    ver_status = rec["verification_status"]
+    if legacy_prod:
+        if not isinstance(ver_status, str) or not ver_status:
+            raise SignatureTamperError("verification_status is not a non-empty string")
+    elif ver_status != "verified":
+        raise SignatureTamperError("verification_status is not verified")
+
+    if duplicate_member is not None:
+        raise SignatureTamperError(f"duplicate member name: {duplicate_member}")
+
+    if verify_commitment:
+        inner_ver = (
+            inner_parsed.get("receipt_schema_version")
+            if isinstance(inner_parsed, Mapping)
+            else None
+        )
+        legacy_ver = inner_ver if inner_ver is not None else rsv
+        is_legacy = legacy_ver is not None and str(legacy_ver) in {"0.2", "0.3"}
+        if not is_legacy:
+            if inner_ver is not None:
+                if str(inner_ver) != str(rsv):
+                    raise SignatureTamperError(
+                        f"receipt_schema_version: outer {_json_quote(rsv)} "
+                        f"does not match committed {_json_quote(inner_ver)}"
+                    )
+            else:
+                raise SignatureTamperError(
+                    f"receipt_schema_version: one side missing "
+                    f"(outer={_json_quote(rsv)} committed={_json_quote(inner_ver)})"
+                )
+            if isinstance(inner_parsed, Mapping):
+                issuer_claims = inner_parsed.get("issuer_claims")
+                committed_pc = (
+                    issuer_claims.get("provenance_class")
+                    if isinstance(issuer_claims, Mapping)
+                    else None
+                )
+                if committed_pc is not None:
+                    if committed_pc != prov_cls:
+                        raise SignatureTamperError(
+                            f"provenance binding: outer {_json_quote(prov_cls)} "
+                            f"does not match committed {_json_quote(committed_pc)}"
+                        )
+                else:
+                    raise SignatureTamperError(
+                        f"provenance binding: one side missing "
+                        f"(outer={_json_quote(prov_cls)} committed={_json_quote(committed_pc)})"
+                    )
+            else:
+                raise SignatureTamperError(
+                    "provenance binding: canonical payload did not decode to an object"
+                )
+
+    if expected_id is not None and rid != expected_id:
+        raise SignatureTamperError(
+            f"id mismatch: artifact id {rid!r} does not match "
+            f"the externally supplied expected id {expected_id!r}"
+        )
+    if resolved_record is not None:
+        rrec_raw = resolved_record.get("receipt")
+        rrec: object = rrec_raw if isinstance(rrec_raw, Mapping) else resolved_record
+        if not isinstance(rrec, Mapping):
+            raise SignatureTamperError("resolved record is not a JSON object")
+        r_digest = rrec.get("output_hash")
+        r_id = rrec.get("id")
+        if r_digest != oh:
+            raise SignatureTamperError(
+                f"id mismatch: resolved record digest {r_digest!r} disagrees "
+                f"with the artifact's committed digest {oh!r}"
+            )
+        if r_id is not None and r_id != rid:
+            raise SignatureTamperError(
+                f"id mismatch: resolved record carries id {r_id!r}, "
+                f"not the artifact's id {rid!r}"
+            )
+
+    canon_obj: Mapping[str, Any] = inner_parsed if isinstance(inner_parsed, Mapping) else {}
+    return canon_bytes, canon_obj, computed_hex, legacy_prod
 
 
 class ToolReceipt(BaseModel):
@@ -143,48 +425,65 @@ class ToolReceipt(BaseModel):
     @classmethod
     def from_aer1(
         cls,
-        payload: Mapping[str, Any],
+        payload: Mapping[str, Any] | str | bytes | PathLike[str],
         *,
         verify_commitment: bool = True,
+        expected_id: str | None = None,
+        resolved_record: Mapping[str, Any] | None = None,
     ) -> ToolReceipt:
-        """Parse an AER-1 (`draft-zambo-aer1`) receipt or verify envelope into a `ToolReceipt`."""
-        rec_raw = payload.get("receipt")
-        rec: Mapping[str, Any] = rec_raw if isinstance(rec_raw, Mapping) else payload
-
-        canon_bytes = _decode_aer1_canonical_bytes(rec.get("canonical_bytes"))
-        expected_hash = str(rec.get("output_hash", "")).strip()
-        computed_hex = ""
-        if canon_bytes is not None:
-            computed_hex = hashlib.sha256(canon_bytes).hexdigest()
-            if verify_commitment and expected_hash:
-                exp_hex = expected_hash.removeprefix("sha256:").lower()
-                if computed_hex != exp_hex:
-                    raise SignatureTamperError(
-                        f"AER-1 canonical_bytes SHA-256 ({computed_hex}) != "
-                        f"output_hash ({exp_hex})."
-                    )
-
-        canon_obj: Mapping[str, Any] = {}
-        if canon_bytes is not None:
+        """Parse and verify an AER-1 (`draft-zambo-aer1`) receipt into a `ToolReceipt`."""
+        duplicate_member: str | None = None
+        if isinstance(payload, PathLike):
             try:
-                parsed = json.loads(canon_bytes.decode("utf-8"))
-                if isinstance(parsed, Mapping):
-                    canon_obj = parsed
-            except Exception:
-                canon_obj = {}
-
-        tool_block = rec.get("tool") or canon_obj.get("tool")
-        if isinstance(tool_block, Mapping):
-            tool_name = str(tool_block.get("name", "unknown_tool"))
-        elif isinstance(tool_block, str) and tool_block:
-            tool_name = tool_block
+                raw_text = Path(payload).read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise SignatureTamperError("receipt is not valid UTF-8") from exc
+            try:
+                loaded, duplicate_member = _parse_json_with_duplicate_check(raw_text)
+            except json.JSONDecodeError as exc:
+                raise SignatureTamperError("receipt is not valid JSON") from exc
+            if not isinstance(loaded, Mapping):
+                raise SignatureTamperError("receipt is not a JSON object")
+            outer_map: Mapping[str, Any] = loaded
+        elif isinstance(payload, (str, bytes)):
+            if isinstance(payload, bytes):
+                try:
+                    raw_text = payload.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise SignatureTamperError("receipt is not valid UTF-8") from exc
+            else:
+                raw_text = payload
+            try:
+                loaded, duplicate_member = _parse_json_with_duplicate_check(raw_text)
+            except json.JSONDecodeError as exc:
+                raise SignatureTamperError("receipt is not valid JSON") from exc
+            if not isinstance(loaded, Mapping):
+                raise SignatureTamperError("receipt is not a JSON object")
+            outer_map = loaded
+        elif isinstance(payload, Mapping):
+            outer_map = payload
         else:
-            tools_list = rec.get("tools")
-            tool_name = (
-                str(tools_list[0])
-                if isinstance(tools_list, list) and tools_list
-                else "unknown_tool"
-            )
+            raise SignatureTamperError("receipt is not a JSON object")
+
+        rec_nested = outer_map.get("receipt")
+        rec: Mapping[str, Any] = (
+            rec_nested
+            if isinstance(rec_nested, Mapping)
+            and "canonical_bytes" not in outer_map
+            and "id" not in outer_map
+            else outer_map
+        )
+
+        _canon_bytes, canon_obj, computed_hex, legacy_prod = _validate_and_decode_aer1(
+            rec,
+            duplicate_member=duplicate_member,
+            verify_commitment=verify_commitment,
+            expected_id=expected_id,
+            resolved_record=resolved_record,
+        )
+
+        tool_block = rec["tool_context"] if legacy_prod else rec["tool"]
+        tool_name = str(tool_block["name"])
 
         steps = rec.get("steps")
         step0 = (
@@ -205,6 +504,10 @@ class ToolReceipt(BaseModel):
         if isinstance(prov_obj, Mapping) and isinstance(prov_obj.get("request"), Mapping):
             args_map = {
                 str(k): _coerce_receipt_arg(v) for k, v in prov_obj["request"].items()
+            }
+        elif isinstance(canon_obj.get("inputs"), Mapping):
+            args_map = {
+                str(k): _coerce_receipt_arg(v) for k, v in canon_obj["inputs"].items()
             }
 
         if isinstance(out_obj, Mapping):
@@ -234,21 +537,17 @@ class ToolReceipt(BaseModel):
         elif step_status in {"failed", "error"}:
             ok = False
 
-        ver_status = str(rec.get("verification_status", "")).lower()
-        if ver_status in {"failed", "invalid", "tampered"}:
-            ok = False
-
-        out_sha = computed_hex or expected_hash.removeprefix("sha256:").lower()
+        created_str = str(rec["timestamp"] if legacy_prod else rec["created_at"])
         return cls(
             tool=tool_name,
             ok=ok,
             executed=executed,
             error_code=error_code,
-            call_id=str(rec.get("id") or f"rcpt-{uuid4().hex[:10]}"),
+            call_id=str(rec["id"]),
             args=args_map,
             output=output_text,
-            output_sha256=out_sha,
-            timestamp_utc=str(rec.get("created_at") or datetime.now(UTC).isoformat()),
+            output_sha256=computed_hex,
+            timestamp_utc=created_str,
         )
 
     def to_aer1(
@@ -261,6 +560,8 @@ class ToolReceipt(BaseModel):
         prov_cls = provenance_class or (
             "EXECUTED BY EPISTEMIC-GUARD" if self.executed else "OBSERVED VIA GATEWAY"
         )
+        if not _AER1_PROV_RE.match(prov_cls):
+            raise ValueError(f"Invalid AER-1 provenance_class: {prov_cls!r}")
         if not self.executed:
             out_block: dict[str, Any] = {
                 "arguments_received": dict(self.args),
@@ -290,18 +591,21 @@ class ToolReceipt(BaseModel):
             step_status = "success"
 
         canon_payload = {
+            "caller": {"id": self.call_id, "type": "call"},
             "issuer_claims": {"provenance_class": prov_cls},
             "output": out_block,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.3.1"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.4.1"},
         }
         canon_raw = json.dumps(canon_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         canon_sha = hashlib.sha256(canon_raw).hexdigest()
+        aer1_id = _derive_aer1_uuid(self.call_id, canon_sha)
+        created_at = _normalize_aer1_timestamp(self.timestamp_utc)
         return {
-            "id": self.call_id,
-            "created_at": self.timestamp_utc,
+            "id": aer1_id,
+            "created_at": created_at,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.3.1"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.4.1"},
             "provenance_class": prov_cls,
             "canonical_bytes": base64.b64encode(canon_raw).decode("ascii"),
             "output_hash": f"sha256:{canon_sha}",
@@ -310,7 +614,7 @@ class ToolReceipt(BaseModel):
                 {
                     "tool": self.tool,
                     "status": step_status,
-                    "completed_at": self.timestamp_utc,
+                    "completed_at": created_at,
                 }
             ],
         }

@@ -626,6 +626,8 @@ def test_pre_dispatch_rejections_retry_audit_and_aer1_interop() -> None:
         "id": "8869c25f-a500-4502-ac54-6b208f052a33",
         "created_at": "2026-11-15T12:30:09.264Z",
         "receipt_schema_version": "0.4",
+        "tool": {"name": "live_price", "scope": "public", "version": "4.1.4"},
+        "provenance_class": "EXECUTED BY ZAMBO",
         "tools": ["live_price"],
         "steps": [{"tool": "live_price", "status": "success"}],
         "output_hash": "sha256:fdbafaa8207daa6c7822da584255b3e8c5f2f07644dd2cd697c7c7c3e1fc2c5d",
@@ -650,6 +652,8 @@ def test_pre_dispatch_rejections_retry_audit_and_aer1_interop() -> None:
             "id": "9e5d5513-bcd0-4f0f-b6cd-8bebf9cd7f77",
             "created_at": "2026-11-15T12:30:10.053Z",
             "receipt_schema_version": "0.4",
+            "tool": {"name": "memory_remember", "scope": "public", "version": "4.1.4"},
+            "provenance_class": "OBSERVED VIA GATEWAY",
             "steps": [{"tool": "memory_remember", "status": "rejected_before_execution"}],
             "output_hash": "sha256:e45b2cc7d5a0545e0a3b8191dabec43b3f6772bf793c6d088262eb5c9319c20e",
             "canonical_bytes": (
