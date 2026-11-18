@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AlienatedAliens/epistemic-guard",
+  "title": "epistemic-guard: Signed Tool Receipts & Verification",
+  "description": "Verify agent tool claims against Ed25519 receipts and collapse syndicated RAG copies locally.",
+  "version": "0.4.2",
+  "websiteUrl": "https://rollsolo.app/epistemic-guard",
+  "repository": {
+    "url": "https://github.com/AlienatedAliens/epistemic-guard",
+    "source": "github",
+    "id": "1459410584"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "epistemic-guard",
+      "version": "0.4.2",
+      "runtimeHint": "uvx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp-server",
+          "description": "Launch the stdio MCP verification server (verify_narration, verify_receipt_log, corroborate_sources)."
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

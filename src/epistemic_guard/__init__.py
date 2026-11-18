@@ -98,7 +98,7 @@ from epistemic_guard.supervision import (
     parse_structured_action_tags,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 __all__ = [
     "ELIGIBLE_PROVENANCE",

@@ -1,5 +1,7 @@
 # `epistemic-guard`
 
+<!-- mcp-name: io.github.AlienatedAliens/epistemic-guard -->
+
 Signed tool receipts, out-of-process MCP receipt proxying, Ed25519 memory write-gating, and RAG source deduplication for autonomous agents.  
 Runs locally on CPU, GPU, or NPU in **3–11 ms**. Zero LLM API calls. MIT License.
 
@@ -209,7 +211,12 @@ Evaluated across `LOCKED_COH_50` (`50`), `BLIND42_COH_100` (`100`), and `Organic
 
 ## Ecosystem Comparison & Disclosures
 
+- **OWASP Top 10 for Agentic Applications (2026) coverage:**
+  - **`ASI02` (Tool Misuse & Phantom Execution):** `mcp-proxy`, `@recorder.tool`, and `ReceiptSupervisor` verify assistant prose against signed `ToolReceipt` logs (`executed`, `ok`, `error_code`) so unexecuted or failed tool calls cannot be reported as completed.
+  - **`ASI06` (Memory & Context Poisoning):** `ProvenanceGate` and `SQLiteProvenanceStore` reject unsigned writes and `LLM_NARRATION` at the database trigger layer, and `corroborate_sources` collapses syndicated wire/Sybil echoes before synthesis.
+  - **`ASI08` (Cascading Hallucinations Across Trust Boundaries):** Append-only RFC 6962 Merkle logs and `AER-1` receipt export preserve verifiable provenance across multi-agent and MCP boundaries.
 - **Scope vs adjacent projects:**
+  - **[Pipelock](https://github.com/pipelab-org/pipelock):** Go egress/MCP proxy that scans outbound network traffic for SSRF/exfiltration and emits mediator-signed receipts; `epistemic-guard` adds post-turn clause-level prose verification (`ReceiptSupervisor`), Ed25519 SQLite memory write-gating, and syndicated RAG source deduplication in Python (`0 MiB` VRAM).
   - **[NabaOS](https://github.com/nabaos/nabaos):** Full Rust agent runtime with OS sandboxing and Ed25519-signed static constitutions. `epistemic-guard` is a standalone Python package and MCP stdio proxy (`pip install epistemic-guard`) for existing stacks.
   - **Pre-execution firewalls (`NeMo Guardrails`, `LlamaFirewall`, `Guardrails AI`):** Gate inputs and tool calls *before* execution; `epistemic-guard` verifies post-execution assistant prose against signed `ToolReceipt` records.
   - **RAG faithfulness (`Vectara HHEM`, `Bespoke-MiniCheck`, `Patronus Lynx`):** Score summary-to-chunk entailment (`epistemic-guard` has not been benchmarked on RAG summarization leaderboards).

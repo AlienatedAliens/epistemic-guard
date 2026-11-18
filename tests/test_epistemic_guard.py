@@ -309,6 +309,71 @@ def test_download_models_sha256_verification_and_tamper_rejection(tmp_path: Path
             download_models(["web_evidence"], cache_dir=cache_dir, base_url=base_url, force=True)
 
 
+def test_download_models_hf_resolve_and_github_fallback(tmp_path: Path) -> None:
+    fake_files = {
+        "config.json": b'{"num_labels": 3}',
+        "openvino_model.bin": b"\x01\x02\x03\x04",
+        "openvino_model.xml": b"<net/>",
+        "tokenizer.json": b"{}",
+    }
+    fake_hashes = {k: hashlib.sha256(v).hexdigest() for k, v in fake_files.items()}
+
+    hf_root = tmp_path / "resolve" / "main"
+    sub = hf_root / "web_evidence_int8"
+    sub.mkdir(parents=True)
+    (hf_root / "config.json").write_bytes(b'{"pack_version": "v0.3.0"}')
+    for fname, data in fake_files.items():
+        (sub / fname).write_bytes(data)
+
+    gh_mirror = tmp_path / "gh_releases"
+    gh_mirror.mkdir()
+    tar_path = gh_mirror / "web_evidence_int8.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for fname, data in fake_files.items():
+            info = tarfile.TarInfo(name=f"web_evidence_int8/{fname}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    patched_spec = MODEL_SPECS["web_evidence"].__class__(
+        key="web_evidence",
+        subdir="web_evidence_int8",
+        archive_name="web_evidence_int8.tar.gz",
+        env_var="EPISTEMIC_GUARD_WEB_EVIDENCE_DIR",
+        legacy_subdirs=(),
+        upstream_base_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        upstream_license="Apache-2.0",
+        total_size_mb=0.01,
+        files_sha256=fake_hashes,
+    )
+
+    with patch.dict("epistemic_guard.models.MODEL_SPECS", {"web_evidence": patched_spec}):
+        # 1. Direct HF /resolve/main layout succeeds and verifies SHA-256
+        cache_hf = tmp_path / "cache_hf"
+        installed = download_models(
+            ["web_evidence"], cache_dir=cache_hf, base_url=hf_root.as_uri()
+        )
+        assert (installed["web_evidence"] / "openvino_model.xml").exists()
+
+        # 2. Tampering on HF /resolve/main raises ModelIntegrityError (never falls back silently)
+        (sub / "openvino_model.bin").write_bytes(b"TAMPERED")
+        with (
+            patch("epistemic_guard.models.DEFAULT_HF_RESOLVE_BASE_URL", hf_root.as_uri()),
+            patch("epistemic_guard.models.DEFAULT_RELEASE_BASE_URL", gh_mirror.as_uri()),
+            pytest.raises(ModelIntegrityError),
+        ):
+            download_models(["web_evidence"], cache_dir=cache_hf, force=True)
+
+        # 3. Network/missing file on default HF primary falls back cleanly to GitHub Releases
+        broken_hf = (tmp_path / "resolve" / "unreachable").as_uri()
+        cache_fb = tmp_path / "cache_fb"
+        with (
+            patch("epistemic_guard.models.DEFAULT_HF_RESOLVE_BASE_URL", broken_hf),
+            patch("epistemic_guard.models.DEFAULT_RELEASE_BASE_URL", gh_mirror.as_uri()),
+        ):
+            installed_fb = download_models(["web_evidence"], cache_dir=cache_fb)
+            assert (installed_fb["web_evidence"] / "openvino_model.bin").exists()
+
+
 def test_corroborate_sources_syndication_dedup_and_consensus() -> None:
     wire_copy = (
         "The central reserve announced on Thursday that overnight lending rates will remain "

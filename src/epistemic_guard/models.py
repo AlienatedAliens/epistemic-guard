@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import platform
@@ -12,15 +13,19 @@ import urllib.request
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import BinaryIO, Final, cast
 
 from epistemic_guard.exceptions import EpistemicModelUnavailableWarning, ModelIntegrityError
 
 MODEL_PACK_VERSION: Final[str] = "v0.3.0"
+DEFAULT_HF_RESOLVE_BASE_URL: Final[str] = (
+    "https://huggingface.co/RollSolo/epistemic-guard-int8/resolve/main"
+)
 DEFAULT_RELEASE_BASE_URL: Final[str] = (
     "https://github.com/AlienatedAliens/epistemic-guard/releases/download/"
     f"epistemic-guard-models-{MODEL_PACK_VERSION}"
 )
+_HTTP_HEADERS: Final[dict[str, str]] = {"User-Agent": "epistemic-guard/0.4.2 (openvino)"}
 
 
 @dataclass(frozen=True)
@@ -196,7 +201,13 @@ def resolve_managed_model_dir(
 
     # Local ProjectLucca monorepo development roots (INT8 first, then legacy FP16)
     repo_guess = Path(__file__).resolve().parents[4]
-    for base in (Path.cwd(), repo_guess, Path(r"C:\ProjectLucca")):
+    local_roots = (
+        Path.cwd(),
+        repo_guess,
+        Path(r"C:\Projects\ProjectLucca"),
+        Path(r"C:\ProjectLucca"),
+    )
+    for base in local_roots:
         candidates.append(base / "models" / "epistemic_guard_int8" / spec.subdir)
         for leg in spec.legacy_subdirs:
             candidates.append(base / "models" / leg)
@@ -232,6 +243,53 @@ def _safe_extract_tar(tar: tarfile.TarFile, dest: Path) -> None:
     tar.extractall(path=dest, filter="data")
 
 
+def _url_open(url: str, timeout: int = 120) -> BinaryIO:
+    if url.startswith(("http://", "https://")):
+        req = urllib.request.Request(url, headers=_HTTP_HEADERS)  # noqa: S310
+        return cast(BinaryIO, urllib.request.urlopen(req, timeout=timeout))  # noqa: S310
+    return cast(BinaryIO, urllib.request.urlopen(url, timeout=timeout))  # noqa: S310
+
+
+def _download_hf_subdir(base_url: str, spec: ModelSpec, tmp_path: Path) -> Path:
+    cand = tmp_path / spec.subdir
+    cand.mkdir(parents=True, exist_ok=True)
+    for fname in spec.files_sha256:
+        file_url = f"{base_url}/{spec.subdir}/{fname}"
+        dest_file = cand / fname
+        try:
+            with _url_open(file_url, timeout=120) as resp, dest_file.open("wb") as out:
+                shutil.copyfileobj(resp, out)
+        except Exception as exc:
+            raise OSError(f"Failed to download '{fname}' from {file_url}: {exc}") from exc
+    verify_model_dir(cand, spec.files_sha256)
+    return cand
+
+
+def _download_tar_archive(base_url: str, spec: ModelSpec, tmp_path: Path) -> Path:
+    url = f"{base_url}/{spec.archive_name}"
+    archive_path = tmp_path / spec.archive_name
+    try:
+        with _url_open(url, timeout=120) as resp, archive_path.open("wb") as out:
+            shutil.copyfileobj(resp, out)
+    except Exception as exc:
+        raise ModelIntegrityError(
+            f"Failed to download '{spec.key}' model archive from {url}: {exc}"
+        ) from exc
+
+    extract_dir = tmp_path / "extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive_path, mode="r:gz") as tf:
+            _safe_extract_tar(tf, extract_dir)
+    except Exception as exc:
+        raise ModelIntegrityError(f"Invalid tar.gz archive for '{spec.key}': {exc}") from exc
+
+    sub_cand = extract_dir / spec.subdir
+    cand = sub_cand if sub_cand.is_dir() else extract_dir
+    verify_model_dir(cand, spec.files_sha256)
+    return cand
+
+
 def download_models(
     models: tuple[str, ...] | list[str] = ("action_claim", "hazard", "web_evidence", "nli"),
     *,
@@ -239,14 +297,13 @@ def download_models(
     base_url: str | None = None,
     force: bool = False,
 ) -> dict[str, Path]:
-    """Download and SHA-256-verify OpenVINO INT8 model archives into the local cache."""
+    """Download and SHA-256-verify OpenVINO INT8 models (HF Hub primary, GitHub fallback)."""
     target_root = Path(cache_dir) if cache_dir is not None else default_cache_root()
     target_root.mkdir(parents=True, exist_ok=True)
-    resolved_base = (
-        base_url
-        or os.environ.get("EPISTEMIC_GUARD_MODEL_BASE_URL")
-        or DEFAULT_RELEASE_BASE_URL
-    ).rstrip("/")
+    explicit_override = base_url or os.environ.get("EPISTEMIC_GUARD_MODEL_BASE_URL")
+    resolved_base = (explicit_override or DEFAULT_HF_RESOLVE_BASE_URL).rstrip("/")
+    use_default_fallback = explicit_override is None
+    pinged_hf_root = False
 
     installed: dict[str, Path] = {}
     for key in models:
@@ -263,32 +320,27 @@ def download_models(
             except ModelIntegrityError:
                 shutil.rmtree(dest_dir, ignore_errors=True)
 
-        url = f"{resolved_base}/{spec.archive_name}"
+        if use_default_fallback and not pinged_hf_root:
+            pinged_hf_root = True
+            with contextlib.suppress(Exception), _url_open(
+                f"{resolved_base}/config.json", timeout=10
+            ) as resp:
+                resp.read(4096)
+
         with tempfile.TemporaryDirectory(prefix=f"eg_{key}_") as tmp:
             tmp_path = Path(tmp)
-            archive_path = tmp_path / spec.archive_name
-            try:
-                with (
-                    urllib.request.urlopen(url, timeout=120) as resp,  # noqa: S310
-                    archive_path.open("wb") as out,
-                ):
-                    shutil.copyfileobj(resp, out)
-            except Exception as exc:
-                raise ModelIntegrityError(
-                    f"Failed to download '{key}' model archive from {url}: {exc}"
-                ) from exc
+            if "/resolve/" in resolved_base:
+                try:
+                    cand = _download_hf_subdir(resolved_base, spec, tmp_path)
+                except ModelIntegrityError:
+                    raise
+                except OSError as exc:
+                    if not use_default_fallback:
+                        raise ModelIntegrityError(str(exc)) from exc
+                    cand = _download_tar_archive(DEFAULT_RELEASE_BASE_URL, spec, tmp_path)
+            else:
+                cand = _download_tar_archive(resolved_base, spec, tmp_path)
 
-            extract_dir = tmp_path / "extracted"
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                with tarfile.open(archive_path, mode="r:gz") as tf:
-                    _safe_extract_tar(tf, extract_dir)
-            except Exception as exc:
-                raise ModelIntegrityError(f"Invalid tar.gz archive for '{key}': {exc}") from exc
-
-            sub_cand = extract_dir / spec.subdir
-            cand = sub_cand if sub_cand.is_dir() else extract_dir
-            verify_model_dir(cand, spec.files_sha256)
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
             shutil.move(str(cand), str(dest_dir))
