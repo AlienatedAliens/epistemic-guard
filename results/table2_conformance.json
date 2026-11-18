@@ -1,0 +1,133 @@
+{
+ "aer1_interop": {
+  "digest_mismatches_rejected": 50,
+  "digest_rejection_pct": 100.0,
+  "n_aer1_cases": 50,
+  "valid_roundtrip_pct": 100.0,
+  "valid_roundtrips": 50
+ },
+ "mcp_proxy_wire": {
+  "child_env_key_leaks": 0,
+  "executed_false_count": 10,
+  "executed_true_count": 30,
+  "failure_mode_count": 4,
+  "key_pinned": 1,
+  "n_per_failure_mode": 10,
+  "n_wire_calls": 40,
+  "succeeded_ok_count": 10,
+  "tampered_log_rejected": 1,
+  "verified_entries": 40,
+  "wire_verification_pct": 100.0
+ },
+ "merkle_receipts": {
+  "false_accepts": 0,
+  "n_receipts": 200,
+  "tamper_rejection_pct": 100.0,
+  "tampered_payloads_rejected": 200,
+  "valid_inclusion_pct": 100.0,
+  "valid_inclusion_proofs": 200
+ },
+ "sqlite_provenance_gate": {
+  "false_rejection_pct": 0.0,
+  "false_rejections": 0,
+  "immutable_sql_triggers_blocked": 2,
+  "immutable_sql_triggers_tested": 2,
+  "n_forged_key_attempts": 50,
+  "n_llm_narration_attempts": 50,
+  "n_total_write_attempts": 300,
+  "n_unauthorized_writes": 100,
+  "n_valid_writes": 200,
+  "unauthorized_block_pct": 100.0,
+  "unauthorized_writes_blocked": 100,
+  "valid_writes_accepted": 200,
+  "verified_chain_records": 200
+ },
+ "syndication_dedup": {
+  "duplicate_urls_collapsed_per_cluster": 2,
+  "high_hazard_block_pct": 100.0,
+  "high_hazard_false_consensus_blocked": 45,
+  "mirrors_per_cluster": 3,
+  "n_syndication_clusters": 45,
+  "single_origin_clusters_collapsed": 45,
+  "single_origin_collapse_pct": 100.0,
+  "total_duplicate_urls_collapsed": 90,
+  "total_syndicated_urls": 135
+ },
+ "provenance": {
+  "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
+  "command": [
+   "python",
+   "experiments/scripts/run_protocol_conformance.py"
+  ],
+  "cwd": ".",
+  "inputs": [
+   {
+    "path": "pyproject.toml",
+    "sha256": "0f485216154aa3fa3a53f096431a73b59312623a7bfd8a4537d70821bb5e1e62"
+   },
+   {
+    "path": "src/epistemic_guard/__init__.py",
+    "sha256": "3f60a62c2fb163e019631461ffe6b503064f0090279993fd3a601c92f8aa1091"
+   },
+   {
+    "path": "src/epistemic_guard/cli.py",
+    "sha256": "651f3a88a891fa462aec6f4c906af02cca4c5e6ec610285e82397f0f95444d9a"
+   },
+   {
+    "path": "src/epistemic_guard/corroboration.py",
+    "sha256": "01822bd0889da8fd931e87f8878660e98db3e1d0600ddc6cbdf713599a87eab0"
+   },
+   {
+    "path": "src/epistemic_guard/exceptions.py",
+    "sha256": "c8293e8f8e445991c09f22e9a19624c384733d6b9d2dc922a43fc7618ce83498"
+   },
+   {
+    "path": "src/epistemic_guard/hazard.py",
+    "sha256": "70e2d2fba2bc85af4f54beb0c8c7acf33132f3aa669acc87ee766f23d108aa31"
+   },
+   {
+    "path": "src/epistemic_guard/integrations.py",
+    "sha256": "d8d444a3b6b66b47482630fb5fff4fa7d580fb0bbd7ae2554117b6bad0c58a14"
+   },
+   {
+    "path": "src/epistemic_guard/mcp_proxy.py",
+    "sha256": "2730fc1720df753e305406c3efdad533f428834d95cd5dfa166c53b44e1d969c"
+   },
+   {
+    "path": "src/epistemic_guard/mcp_server.py",
+    "sha256": "26c6a296876575bf285277b6c82728139f23f807e645f19898c3d5e0f8e1b9c9"
+   },
+   {
+    "path": "src/epistemic_guard/models.py",
+    "sha256": "81a1bb57622f8d0dfcabaf97ef5abc0d710afb4f709d54bb1271eec543ed5e68"
+   },
+   {
+    "path": "src/epistemic_guard/nli.py",
+    "sha256": "88e9bdf7bcb938b878921cf0c0e6664d1824904d2098ddf382428929ac6519cd"
+   },
+   {
+    "path": "src/epistemic_guard/provenance.py",
+    "sha256": "707e2cdc325003784f3627cd83d0a7760ca9564063cd184b42866c60f4024aa2"
+   },
+   {
+    "path": "src/epistemic_guard/schemas.py",
+    "sha256": "6a475f591550d5cbc2ee67b7b1194fd94c8903871b3daca1213479ac241e5943"
+   },
+   {
+    "path": "src/epistemic_guard/store.py",
+    "sha256": "22d61f8f21f4595220814959932c9f61e654c3fddf1bb0fb4da50c39701782f0"
+   },
+   {
+    "path": "src/epistemic_guard/supervision.py",
+    "sha256": "ae5bc131f822de0b37ff59ad564eb7aa116f5a89c433b21a714042fca476b3bc"
+   },
+   {
+    "path": "src/epistemic_guard/web_filters.py",
+    "sha256": "f2ea3ee82cdb4cfc21e69d1bfa904173d6e74b7221b9f8eee8759dcd0851323f"
+   }
+  ],
+  "commit": "772141acd156e68e397d219358796f1920e5fd62",
+  "now": "2026-11-18T04:29:17+00:00",
+  "osaudit": "0.7.0"
+ }
+}

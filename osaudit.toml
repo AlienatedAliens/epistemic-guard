@@ -1,0 +1,69 @@
+schema = "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/audit-v1.json"
+
+[paper]
+tex = ["paper/epistemic_guard.tex"]
+
+[results]
+files = [
+  "results/table1_architecture.json",
+  "results/table2_conformance.json",
+  "results/table3_heldout_supervision.json",
+]
+instruments = [
+  "experiments/scripts/collect_architecture_metrics.py",
+  "experiments/scripts/run_protocol_conformance.py",
+  "experiments/scripts/summarize_heldout_benchmark.py",
+]
+
+[[numbers.allow]]
+value = "2026"
+reason = "manuscript publication year"
+
+[[numbers.allow]]
+value = "256"
+reason = "SHA-256 cryptographic digest bit length"
+
+[[numbers.allow]]
+value = "6962"
+reason = "IETF RFC 6962 Certificate Transparency specification number"
+cite = "laurie2013rfc6962"
+
+[[numbers.allow]]
+value = "5869"
+reason = "IETF RFC 5869 HKDF specification number"
+cite = "krawczyk2010rfc5869"
+
+[[numbers.allow]]
+value = "95%"
+reason = "two-sided Wilson score binomial confidence interval level"
+cite = "wilson1927probable"
+
+[[numbers.allow]]
+value = "2024"
+reason = "MCP protocol revision identifier 2024-11-05"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "11"
+reason = "MCP protocol revision identifier 2024-11-05"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "2025"
+reason = "MCP protocol revision identifiers 2025-03-26 and 2025-06-18"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "26"
+reason = "MCP protocol revision identifier 2025-03-26"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "06"
+reason = "MCP protocol revision identifier 2025-06-18"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "18"
+reason = "MCP protocol revision identifier 2025-06-18"
+cite = "mcp2025spec"

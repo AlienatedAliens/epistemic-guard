@@ -1,0 +1,96 @@
+{
+ "comparisons": {
+  "delta_accuracy_vs_deberta_pp": 41.6,
+  "delta_accuracy_vs_nemo_pp": 7.6,
+  "delta_accuracy_vs_phi4_pp": 8.0,
+  "speedup_p50_vs_nemo_x": 2.84,
+  "speedup_p50_vs_phi4_x": 2.74
+ },
+ "deberta_v3_xsmall_nli_cpu": {
+  "accuracy_pct": 52.8,
+  "ci95_high": 58.9,
+  "ci95_low": 46.62,
+  "correct": 132,
+  "fpr_pct": 20.31,
+  "gpu_vram_mib": 0,
+  "latency_p50_ms": 27.45,
+  "latency_p95_ms": 55.4,
+  "organic_h100_accuracy_pct": 51.0,
+  "organic_h100_correct": 51,
+  "recall_pct": 24.59
+ },
+ "epistemic_guard_int8_cpu": {
+  "accuracy_pct": 94.4,
+  "blind42_coh_100_accuracy_pct": 95.0,
+  "blind42_coh_100_correct": 95,
+  "ci95_high": 96.64,
+  "ci95_low": 90.82,
+  "correct": 236,
+  "fn": 4,
+  "fp": 10,
+  "fpr_pct": 7.81,
+  "gpu_vram_mib": 0,
+  "latency_mean_ms": 29.43,
+  "latency_p50_ms": 27.38,
+  "latency_p95_ms": 56.35,
+  "locked_coh_50_accuracy_pct": 100.0,
+  "locked_coh_50_correct": 50,
+  "organic_h100_accuracy_pct": 91.0,
+  "organic_h100_correct": 91,
+  "recall_pct": 96.72,
+  "tn": 118,
+  "tp": 118
+ },
+ "mistral_nemo_12b_gpu": {
+  "accuracy_pct": 86.8,
+  "ci95_high": 90.44,
+  "ci95_low": 82.04,
+  "correct": 217,
+  "fpr_pct": 14.06,
+  "gpu_vram_mib": 8844,
+  "latency_p50_ms": 77.85,
+  "latency_p95_ms": 103.48,
+  "organic_h100_accuracy_pct": 84.0,
+  "organic_h100_correct": 84,
+  "recall_pct": 87.7
+ },
+ "n_negative_grounded_or_benign": 128,
+ "n_positive_ungrounded": 122,
+ "n_total": 250,
+ "phi_4_14b_gpu": {
+  "accuracy_pct": 86.4,
+  "ci95_high": 90.1,
+  "ci95_low": 81.6,
+  "correct": 216,
+  "fpr_pct": 26.56,
+  "gpu_vram_mib": 12214,
+  "latency_p50_ms": 75.08,
+  "latency_p95_ms": 99.78,
+  "organic_h100_accuracy_pct": 79.0,
+  "organic_h100_correct": 79,
+  "recall_pct": 100.0
+ },
+ "split_counts": {
+  "blind42_coh_100": 100,
+  "locked_coh_50": 50,
+  "organic_heldout_h100": 100
+ },
+ "provenance": {
+  "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
+  "command": [
+   "python",
+   "experiments/scripts/summarize_heldout_benchmark.py",
+   "benchmarks/external_baselines_benchmark.json"
+  ],
+  "cwd": ".",
+  "inputs": [
+   {
+    "path": "benchmarks/external_baselines_benchmark.json",
+    "sha256": "69ab88c0477ce2890aff799a2447fca83ea4c05d91ed030aa494c6e03848074d"
+   }
+  ],
+  "commit": "772141acd156e68e397d219358796f1920e5fd62",
+  "now": "2026-11-18T04:29:24+00:00",
+  "osaudit": "0.7.0"
+ }
+}
