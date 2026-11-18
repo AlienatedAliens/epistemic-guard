@@ -11,6 +11,7 @@ from epistemic_guard.corroboration import corroborate_sources
 from epistemic_guard.exceptions import EpistemicGuardError
 from epistemic_guard.mcp_proxy import verify_receipt_log_file
 from epistemic_guard.schemas import ToolReceipt
+from epistemic_guard.store import MerkleReceiptLog
 from epistemic_guard.supervision import ReceiptSupervisor
 
 _DEFAULT_PROTOCOL_VERSION: Final[str] = "2024-11-05"
@@ -23,8 +24,10 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
         "name": "verify_narration",
         "description": (
-            "Verify an assistant reply clause-by-clause against executed or failed tool "
-            "receipts to detect phantom action claims and generate a corrective retry prompt."
+            "Audit an assistant reply clause-by-clause against structured in-memory tool "
+            "execution receipts (or AER-1 envelopes) on local CPU encoders to detect fabricated "
+            "action claims and generate a corrective retry prompt. Use this solely for semantic "
+            "prose supervision; use verify_receipt_log for cryptographic JSONL file verification."
         ),
         "annotations": {
             "title": "Verify Assistant Narration Against Tool Receipts",
@@ -96,9 +99,11 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
         "name": "verify_receipt_log",
         "description": (
-            "Verify Ed25519 signatures, sequential SHA-256 chain hashes, and RFC 6962 Merkle "
-            "roots in a JSONL receipt log produced by `epistemic-guard mcp-proxy`, with "
-            "optional assistant narration checking."
+            "Cryptographically verify an entire on-disk JSONL receipt log produced by "
+            "`epistemic-guard mcp-proxy`: validates detached Ed25519 signatures, pinned public "
+            "keys, sequential SHA-256 chain hashes, and the aggregate RFC 6962 Merkle root. "
+            "Receipt signing occurs strictly inside the isolated mcp-proxy parent process so "
+            "untrusted agents cannot mint receipts; use inspect_receipt to query single entries."
         ),
         "annotations": {
             "title": "Verify Signed MCP Merkle Receipt Log",
@@ -122,13 +127,66 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                     "type": "string",
                     "description": "Optional path to a pinned public key JSON or hex file.",
                 },
-                "narration": {
+            },
+            "required": ["log_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "inspect_receipt",
+        "description": (
+            "Query a cryptographically verified JSONL receipt log by zero-based sequence index "
+            "(`seq`), tool invocation ID (`call_id`), or tool name (`tool`), returning matching "
+            "signed ToolReceipt records alongside standalone O(log N) RFC 6962 Merkle inclusion "
+            "proofs and optional canonical AER-1 interoperable receipt envelopes."
+        ),
+        "annotations": {
+            "title": "Inspect Signed Receipt and Merkle Inclusion Proof",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "log_path": {
                     "type": "string",
-                    "description": "Optional assistant reply to verify against the log receipts.",
+                    "description": "Filesystem path to the JSONL receipt log file.",
                 },
-                "user_prompt": {
+                "seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional exact zero-based log sequence index to retrieve.",
+                },
+                "call_id": {
                     "type": "string",
-                    "description": "Optional user prompt when `narration` is supplied.",
+                    "description": "Optional exact tool call identifier to filter by.",
+                },
+                "tool": {
+                    "type": "string",
+                    "description": "Optional canonical tool name to filter receipts by.",
+                },
+                "expected_pubkey_hex": {
+                    "type": "string",
+                    "description": "Optional pinned 64-character hex Ed25519 public key.",
+                },
+                "pubkey_file": {
+                    "type": "string",
+                    "description": "Optional path to a pinned public key JSON or hex file.",
+                },
+                "include_aer1": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, attach the canonical AER-1 interoperable receipt envelope "
+                        "to each matched entry (default: false)."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Maximum number of matched entries to return (default: 20).",
                 },
             },
             "required": ["log_path"],
@@ -138,8 +196,9 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
         "name": "corroborate_sources",
         "description": (
-            "Deduplicate syndicated wire-copy snippets across retrieved RAG URLs, check "
-            "cross-domain NLI contradictions, and evaluate hazard-scaled evidentiary burden."
+            "Collapse syndicated wire-copy mirrors across retrieved RAG or web URLs via "
+            "word-shingle MinHash/SimHash clustering, check cross-domain NLI contradictions, "
+            "and evaluate whether independent sources meet hazard-scaled evidentiary burden."
         ),
         "annotations": {
             "title": "Corroborate and Deduplicate RAG Sources",
@@ -361,6 +420,8 @@ class EpistemicGuardMcpServer:
                 return self._call_verify_narration(args)
             if name == "verify_receipt_log":
                 return self._call_verify_receipt_log(args)
+            if name == "inspect_receipt":
+                return self._call_inspect_receipt(args)
             if name == "corroborate_sources":
                 return self._call_corroborate_sources(args)
         except (EpistemicGuardError, OSError, ValueError) as exc:
@@ -416,29 +477,109 @@ class EpistemicGuardMcpServer:
             expected_pubkey_hex=pubkey_hex,
             pubkey_file=pubkey_file,
         )
-        out: dict[str, object] = {
-            "log_valid": True,
-            "entry_count": verified.entry_count,
-            "merkle_root": verified.merkle_root,
-            "head_chain_hash": verified.head_chain_hash,
-            "public_key_hex": verified.public_key_hex,
-            "key_pinned": verified.key_pinned,
-        }
-        narration_raw = args.get("narration")
-        if isinstance(narration_raw, str):
-            prompt_raw = args.get("user_prompt", "")
-            user_prompt = prompt_raw if isinstance(prompt_raw, str) else ""
-            verdict = self._get_supervisor().verify_narration(
-                narration_raw,
-                receipts=verified.receipts,
-                user_prompt=user_prompt,
+        return _tool_result(
+            {
+                "log_valid": True,
+                "entry_count": verified.entry_count,
+                "merkle_root": verified.merkle_root,
+                "head_chain_hash": verified.head_chain_hash,
+                "public_key_hex": verified.public_key_hex,
+                "key_pinned": verified.key_pinned,
+            }
+        )
+
+    def _call_inspect_receipt(self, args: Mapping[str, object]) -> dict[str, object]:
+        log_path = args.get("log_path")
+        if not isinstance(log_path, str) or not log_path.strip():
+            raise ValueError("Missing required string argument 'log_path'.")
+
+        seq_raw = args.get("seq")
+        seq_filter: int | None = None
+        if seq_raw is not None:
+            if isinstance(seq_raw, bool) or not isinstance(seq_raw, int) or seq_raw < 0:
+                raise ValueError("'seq' must be a non-negative integer.")
+            seq_filter = seq_raw
+
+        limit_raw = args.get("limit", 20)
+        if (
+            isinstance(limit_raw, bool)
+            or not isinstance(limit_raw, int)
+            or not (1 <= limit_raw <= 100)
+        ):
+            raise ValueError("'limit' must be an integer between 1 and 100.")
+        limit = limit_raw
+
+        call_id_raw = args.get("call_id")
+        call_id_filter = (
+            call_id_raw if isinstance(call_id_raw, str) and call_id_raw.strip() else None
+        )
+        tool_raw = args.get("tool")
+        tool_filter = tool_raw if isinstance(tool_raw, str) and tool_raw.strip() else None
+        include_aer1 = bool(args.get("include_aer1", False))
+
+        pubkey_raw = args.get("expected_pubkey_hex")
+        pubkey_hex = pubkey_raw if isinstance(pubkey_raw, str) and pubkey_raw else None
+        pubkey_file_raw = args.get("pubkey_file")
+        pubkey_file = (
+            pubkey_file_raw if isinstance(pubkey_file_raw, str) and pubkey_file_raw else None
+        )
+
+        verified = verify_receipt_log_file(
+            log_path,
+            expected_pubkey_hex=pubkey_hex,
+            pubkey_file=pubkey_file,
+        )
+        if seq_filter is not None and seq_filter >= verified.entry_count:
+            raise ValueError(
+                f"Receipt seq={seq_filter} out of range for log with "
+                f"{verified.entry_count} entries."
             )
-            out["narration_valid"] = verdict.is_valid
-            out["unsupported_claims"] = list(verdict.unsupported_claims)
-            out["retry_prompt"] = (
-                "" if verdict.is_valid else verdict.to_retry_prompt(verified.receipts)
-            )
-        return _tool_result(out)
+
+        merkle = MerkleReceiptLog()
+        for rcpt in verified.receipts:
+            merkle.append(rcpt)
+
+        candidate_indices = (
+            [seq_filter] if seq_filter is not None else list(range(verified.entry_count))
+        )
+        entries_out: list[dict[str, object]] = []
+        for idx in candidate_indices:
+            rcpt = verified.receipts[idx]
+            if call_id_filter is not None and rcpt.call_id != call_id_filter:
+                continue
+            if tool_filter is not None and rcpt.tool != tool_filter:
+                continue
+            proof = merkle.inclusion_proof(idx)
+            item: dict[str, object] = {
+                "seq": idx,
+                "receipt": rcpt.model_dump(),
+                "merkle_inclusion_proof": {
+                    "leaf_index": proof.leaf_index,
+                    "tree_size": proof.tree_size,
+                    "leaf_sha256": proof.leaf_sha256,
+                    "siblings": [
+                        {"side": side, "sha256": digest} for side, digest in proof.siblings
+                    ],
+                    "root_sha256": proof.root_sha256,
+                },
+            }
+            if include_aer1:
+                item["aer1"] = rcpt.to_aer1()
+            entries_out.append(item)
+            if len(entries_out) >= limit:
+                break
+
+        return _tool_result(
+            {
+                "log_valid": True,
+                "entry_count": verified.entry_count,
+                "merkle_root": verified.merkle_root,
+                "public_key_hex": verified.public_key_hex,
+                "key_pinned": verified.key_pinned,
+                "match_count": len(entries_out),
+                "entries": entries_out,
+            }
+        )
 
     def _call_corroborate_sources(self, args: Mapping[str, object]) -> dict[str, object]:
         query = args.get("query")

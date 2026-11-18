@@ -9,6 +9,7 @@ from pathlib import Path
 from epistemic_guard.mcp_proxy import ReceiptLogWriter, load_or_create_mcp_signer
 from epistemic_guard.mcp_server import MCP_TOOLS, EpistemicGuardMcpServer, run_mcp_stdio_server
 from epistemic_guard.schemas import ToolReceipt
+from epistemic_guard.store import MerkleInclusionProof, MerkleReceiptLog
 
 
 def test_mcp_server_introspection_handshake() -> None:
@@ -44,10 +45,11 @@ def test_mcp_server_introspection_handshake() -> None:
     assert [r["id"] for r in responses] == [1, 2, 3, 4, 5]
     assert responses[0]["result"]["serverInfo"]["name"] == "epistemic-guard"
     tools = responses[1]["result"]["tools"]
-    assert len(tools) == len(MCP_TOOLS) == 3
+    assert len(tools) == len(MCP_TOOLS) == 4
     assert {t["name"] for t in tools} == {
         "verify_narration",
         "verify_receipt_log",
+        "inspect_receipt",
         "corroborate_sources",
     }
     for tool_def in tools:
@@ -165,3 +167,101 @@ def test_mcp_server_verify_receipt_log_and_errors(tmp_path: Path) -> None:
     )
     assert isinstance(bad_resp, dict)
     assert bad_resp["result"]["isError"] is True
+
+
+def test_mcp_server_inspect_receipt_and_merkle_proof(tmp_path: Path) -> None:
+    log_path = tmp_path / "receipts.jsonl"
+    pub_path = tmp_path / "mcp.pub.json"
+    signer = load_or_create_mcp_signer(pubkey_out=pub_path)
+    writer = ReceiptLogWriter(log_path, signer)
+    for call_id, tool_name, path_val in (
+        ("c-0", "write_file", "a.txt"),
+        ("c-1", "send_email", "ops@example.com"),
+        ("c-2", "write_file", "b.txt"),
+    ):
+        writer.append(
+            ToolReceipt(
+                call_id=call_id,
+                tool=tool_name,
+                ok=True,
+                executed=True,
+                args={"target": path_val},
+                output="done",
+            )
+        )
+
+    srv = EpistemicGuardMcpServer()
+    single_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect_receipt",
+                "arguments": {
+                    "log_path": str(log_path),
+                    "pubkey_file": str(pub_path),
+                    "seq": 1,
+                    "include_aer1": True,
+                },
+            },
+        }
+    )
+    assert isinstance(single_resp, dict)
+    single_res = single_resp["result"]
+    assert single_res["isError"] is False
+    body = json.loads(single_res["content"][0]["text"])
+    assert body["log_valid"] is True
+    assert body["entry_count"] == 3
+    assert body["match_count"] == 1
+    entry = body["entries"][0]
+    assert entry["seq"] == 1
+    assert entry["receipt"]["call_id"] == "c-1"
+    assert entry["receipt"]["tool"] == "send_email"
+
+    restored_aer1 = ToolReceipt.from_aer1(entry["aer1"])
+    assert restored_aer1.tool == "send_email"
+
+    proof_raw = entry["merkle_inclusion_proof"]
+    proof = MerkleInclusionProof(
+        leaf_index=proof_raw["leaf_index"],
+        tree_size=proof_raw["tree_size"],
+        leaf_sha256=proof_raw["leaf_sha256"],
+        siblings=tuple((s["side"], s["sha256"]) for s in proof_raw["siblings"]),
+        root_sha256=proof_raw["root_sha256"],
+    )
+    rcpt_obj = ToolReceipt.model_validate(entry["receipt"])
+    assert MerkleReceiptLog.verify_inclusion_proof(rcpt_obj, proof) is True
+
+    filtered_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect_receipt",
+                "arguments": {
+                    "log_path": str(log_path),
+                    "tool": "write_file",
+                },
+            },
+        }
+    )
+    assert isinstance(filtered_resp, dict)
+    filtered_body = json.loads(filtered_resp["result"]["content"][0]["text"])
+    assert filtered_body["match_count"] == 2
+    assert [e["seq"] for e in filtered_body["entries"]] == [0, 2]
+
+    oob_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect_receipt",
+                "arguments": {"log_path": str(log_path), "seq": 99},
+            },
+        }
+    )
+    assert isinstance(oob_resp, dict)
+    assert oob_resp["result"]["isError"] is True

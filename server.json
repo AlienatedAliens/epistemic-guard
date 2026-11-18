@@ -21,7 +21,7 @@
         {
           "type": "positional",
           "value": "mcp-server",
-          "description": "Launch the stdio MCP verification server (verify_narration, verify_receipt_log, corroborate_sources)."
+          "description": "Launch the stdio MCP verification server (verify_narration, verify_receipt_log, inspect_receipt, corroborate_sources)."
         }
       ],
       "transport": {

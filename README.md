@@ -71,7 +71,7 @@ epistemic-guard verify-log /var/log/agent/receipts.jsonl \
 
 **Security boundary note:** If the untrusted agent process has filesystem write access to `--log`, always pass `--pubkey-file` (stored outside the agent's writable directory) when running `verify-log` so an attacker cannot replace the entire log file under a newly generated keypair.
 
-You can also run `epistemic-guard` itself as a standalone stdio MCP verification server (`verify_narration`, `verify_receipt_log`, `corroborate_sources`):
+You can also run `epistemic-guard` itself as a standalone stdio MCP verification server (`verify_narration`, `verify_receipt_log`, `inspect_receipt`, `corroborate_sources`):
 
 ```json
 {
