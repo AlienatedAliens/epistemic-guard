@@ -8,7 +8,7 @@
  "hkdf_signer_count": 5,
  "import_linter_contracts": 1,
  "int8_model_count": 4,
- "mcp_tool_count": 3,
+ "mcp_tool_count": 4,
  "model_sizes_mb": {
   "action_claim": 82.67,
   "hazard": 82.65,
@@ -24,7 +24,7 @@
  "source_module_count": 15,
  "supported_mcp_protocols": 3,
  "test_file_count": 4,
- "test_function_count": 23,
+ "test_function_count": 24,
  "total_int8_unpacked_mb": 279.48,
  "provenance": {
   "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
@@ -68,7 +68,7 @@
    },
    {
     "path": "src/epistemic_guard/mcp_server.py",
-    "sha256": "26c6a296876575bf285277b6c82728139f23f807e645f19898c3d5e0f8e1b9c9"
+    "sha256": "dc2e67925e926556fac33a500d06716f3894570cf3fa4d2bd440770f6a5bd388"
    },
    {
     "path": "src/epistemic_guard/models.py",
@@ -112,11 +112,11 @@
    },
    {
     "path": "tests/test_mcp_server.py",
-    "sha256": "d1dffccb71a690feef575895734d26922cd3c9bebf32b83757ea63a9577c5fda"
+    "sha256": "8ef0efb066f1b090a38332cd2bcc4c2da09d0282ce39877a4c5ea92f037b7314"
    }
   ],
-  "commit": "772141acd156e68e397d219358796f1920e5fd62",
-  "now": "2026-11-18T04:29:03+00:00",
+  "commit": "a22906b7a900742bc527e55346cf07021c8bc874",
+  "now": "2026-11-18T17:39:54+00:00",
   "osaudit": "0.7.0"
  }
 }
