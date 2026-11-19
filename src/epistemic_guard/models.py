@@ -25,7 +25,7 @@ DEFAULT_RELEASE_BASE_URL: Final[str] = (
     "https://github.com/AlienatedAliens/epistemic-guard/releases/download/"
     f"epistemic-guard-models-{MODEL_PACK_VERSION}"
 )
-_HTTP_HEADERS: Final[dict[str, str]] = {"User-Agent": "epistemic-guard/0.5.0 (openvino)"}
+_HTTP_HEADERS: Final[dict[str, str]] = {"User-Agent": "epistemic-guard/0.5.1 (openvino)"}
 
 
 @dataclass(frozen=True)

@@ -512,3 +512,53 @@ def test_multiprocess_concurrent_receipt_log_writer_and_key_rotation(
     )
     assert rc_fresh == 0
     capsys.readouterr()
+
+
+def test_mcp_proxy_scrubs_master_and_secret_env_vars_and_handles_duplicate_rpc_ids(
+    tmp_path: Path,
+) -> None:
+    from epistemic_guard.mcp_proxy import McpStdioProxy, _scrub_child_env
+
+    raw_env = {
+        "PATH": "/usr/bin",
+        "EPISTEMIC_GUARD_MCP_KEY_HEX": "aa" * 32,
+        "EPISTEMIC_GUARD_MASTER_KEY": "bb" * 32,
+        "epistemic_guard_signing_secret": "cc" * 32,
+        "EPISTEMIC_GUARD_SESSION_ID": "sess-keep",
+        "EPISTEMIC_GUARD_CACHE_DIR": str(tmp_path / "eg_cache"),
+    }
+    scrubbed = _scrub_child_env(raw_env)
+    assert "EPISTEMIC_GUARD_MCP_KEY_HEX" not in scrubbed
+    assert "EPISTEMIC_GUARD_MASTER_KEY" not in scrubbed
+    assert "epistemic_guard_signing_secret" not in scrubbed
+    assert scrubbed["EPISTEMIC_GUARD_SESSION_ID"] == "sess-keep"
+    assert scrubbed["EPISTEMIC_GUARD_CACHE_DIR"] == str(tmp_path / "eg_cache")
+
+    # Duplicate in-flight JSON-RPC IDs are matched FIFO instead of overwriting
+    log_path = tmp_path / "dup_ids.jsonl"
+    signer = load_or_create_mcp_signer()
+    writer = ReceiptLogWriter(log_path, signer)
+    proxy = McpStdioProxy(writer)
+
+    proxy.observe_client_line(
+        b'{"jsonrpc":"2.0","id":7,"method":"tools/call",'
+        b'"params":{"name":"write_a","arguments":{"p":"a.txt"}}}\n'
+    )
+    proxy.observe_client_line(
+        b'{"jsonrpc":"2.0","id":7,"method":"tools/call",'
+        b'"params":{"name":"write_b","arguments":{"p":"b.txt"}}}\n'
+    )
+    proxy.observe_server_line(
+        b'{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"done-a"}]}}\n'
+    )
+    proxy.observe_server_line(
+        b'{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"done-b"}]}}\n'
+    )
+
+    verified = verify_receipt_log_file(log_path)
+    assert verified.entry_count == 2
+    assert verified.receipts[0].tool == "write_a"
+    assert verified.receipts[0].output == "done-a"
+    assert verified.receipts[1].tool == "write_b"
+    assert verified.receipts[1].output == "done-b"
+

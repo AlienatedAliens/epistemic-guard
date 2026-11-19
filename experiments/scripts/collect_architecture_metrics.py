@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 import epistemic_guard  # noqa: E402
-from epistemic_guard.corroboration import POLICY_TABLE_2D  # noqa: E402
+from epistemic_guard.corroboration import DEFAULT_SHINGLE_WINDOW, POLICY_TABLE_2D  # noqa: E402
 from epistemic_guard.mcp_server import _SUPPORTED_PROTOCOLS, MCP_TOOLS  # noqa: E402
 from epistemic_guard.models import MODEL_SPECS  # noqa: E402
 from epistemic_guard.schemas import (  # noqa: E402
@@ -55,7 +55,7 @@ def main() -> None:
         "total_int8_unpacked_mb": total_int8_mb,
         "ed25519_key_bytes": 32,
         "ed25519_signature_bytes": 64,
-        "shingle_window_words": 5,
+        "shingle_window_words": DEFAULT_SHINGLE_WINDOW,
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
 

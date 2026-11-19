@@ -34,8 +34,27 @@ _MCP_VALIDATION_MARKERS: Final[tuple[str, ...]] = (
     "missing required property",
 )
 _ENV_SIGNING_KEY_HEX: Final[str] = "EPISTEMIC_GUARD_MCP_KEY_HEX"
+_ENV_MASTER_KEY: Final[str] = "EPISTEMIC_GUARD_MASTER_KEY"
 _ENV_SESSION_ID: Final[str] = "EPISTEMIC_GUARD_SESSION_ID"
+_SCRUBBED_EXACT_ENV_KEYS: Final[frozenset[str]] = frozenset(
+    {_ENV_SIGNING_KEY_HEX, _ENV_MASTER_KEY}
+)
 _GENESIS_CHAIN_HEX: Final[str] = "0" * 64
+
+
+def _scrub_child_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Strip proxy signing keys and master secrets (case-insensitively) from child env."""
+    cleaned: dict[str, str] = {}
+    for key, val in env.items():
+        ku = key.upper()
+        if ku in _SCRUBBED_EXACT_ENV_KEYS:
+            continue
+        if ku.startswith("EPISTEMIC_GUARD_") and any(
+            tok in ku for tok in ("KEY", "SECRET", "SEED", "TOKEN")
+        ):
+            continue
+        cleaned[key] = val
+    return cleaned
 
 
 @contextlib.contextmanager
@@ -515,7 +534,7 @@ class McpStdioProxy:
 
     def __init__(self, writer: ReceiptLogWriter) -> None:
         self._writer = writer
-        self._pending: dict[tuple[str, str], _PendingToolCall] = {}
+        self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
         self._lock = threading.Lock()
 
     def observe_client_line(self, raw_line: bytes) -> None:
@@ -554,10 +573,12 @@ class McpStdioProxy:
                 args_map = {"_raw_params": _coerce_scalar(params)}
 
             with self._lock:
-                self._pending[id_key] = _PendingToolCall(
-                    call_id=f"mcp-{id_key[1]}",
-                    tool=tool_name,
-                    args=args_map,
+                self._pending.setdefault(id_key, []).append(
+                    _PendingToolCall(
+                        call_id=f"mcp-{id_key[1]}",
+                        tool=tool_name,
+                        args=args_map,
+                    )
                 )
 
     def observe_server_line(self, raw_line: bytes) -> None:
@@ -577,7 +598,10 @@ class McpStdioProxy:
             if id_key is None:
                 continue
             with self._lock:
-                pending = self._pending.pop(id_key, None)
+                queue = self._pending.get(id_key)
+                pending = queue.pop(0) if queue else None
+                if queue is not None and not queue:
+                    self._pending.pop(id_key, None)
             if pending is None:
                 continue
             receipt = self._build_receipt_from_response(pending, item)
@@ -586,7 +610,7 @@ class McpStdioProxy:
     def flush_abandoned_calls(self, exit_code: int) -> None:
         """Record `ok=False` receipts for in-flight calls if the MCP server exits early."""
         with self._lock:
-            remaining = list(self._pending.values())
+            remaining = [p for q in self._pending.values() for p in q]
             self._pending.clear()
         for pending in remaining:
             self._writer.append(
@@ -680,8 +704,7 @@ def run_mcp_stdio_proxy(
     )
     proxy = McpStdioProxy(writer)
 
-    child_env = dict(os.environ)
-    child_env.pop(_ENV_SIGNING_KEY_HEX, None)
+    child_env = _scrub_child_env(os.environ)
 
     in_stream = client_in if client_in is not None else sys.stdin.buffer
     out_stream = client_out if client_out is not None else sys.stdout.buffer

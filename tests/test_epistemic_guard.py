@@ -859,3 +859,136 @@ def test_otel_span_evidence_export_and_recorder_hook() -> None:
     rcpt_attrs = receipt_to_otel_attributes(recorder.receipts[0])
     assert rcpt_attrs["epistemic_guard.receipt.call_id"] == recorder.receipts[0].call_id
 
+
+def test_zero_arg_receipt_cannot_wildcard_concrete_targets() -> None:
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    zero_arg_delete = ToolReceipt(
+        tool="clear_temp_cache",
+        ok=True,
+        executed=True,
+        args={},
+        output="cleared 12 cache entries",
+    )
+    # Legitimate targetless narration grounded by zero-arg tool passes
+    v_ok = sup.verify_narration(
+        "I cleared the temporary cache.",
+        receipts=[zero_arg_delete],
+        user_prompt="Clear the temporary cache.",
+    )
+    assert v_ok.is_valid is True
+
+    # Fabricated concrete target (prod.db) must NOT be wildcard-approved by args={}
+    v_bad = sup.verify_narration(
+        "I cleared the temporary cache and deleted prod.db.",
+        receipts=[zero_arg_delete],
+        user_prompt="Clear cache and delete prod.db.",
+    )
+    assert v_bad.is_valid is False
+    assert any("prod.db" in c for c in v_bad.unsupported_claims)
+
+    soac_bad = sup.verify_narration(
+        "[ACTION: delete prod.db] Done.",
+        receipts=[zero_arg_delete],
+    )
+    assert soac_bad.is_valid is False
+    assert soac_bad.structured_actions[0].grounded is False
+
+
+def test_aer1_executed_ok_roundtrip_signing_and_input_spoof_resistance() -> None:
+    factory = SignerFactory.from_master_key(os.urandom(32))
+    signer = factory.tool_verified()
+    gate = ProvenanceGate(factory.public_keys())
+
+    orig = ToolReceipt(
+        call_id="call-ok-77",
+        tool="write_file",
+        ok=True,
+        executed=True,
+        args={"path": "safe_notes.txt", "bytes": 42},
+        output="wrote 42 bytes",
+        session_id="sess-aer1-rt",
+    )
+    aer1_doc = orig.to_aer1()
+    restored = ToolReceipt.from_aer1(aer1_doc)
+    assert restored.call_id == "call-ok-77"
+    assert restored.tool == "write_file"
+    assert restored.ok is True and restored.executed is True
+    assert restored.args == {"path": "safe_notes.txt", "bytes": 42}
+    assert restored.session_id == "sess-aer1-rt"
+    assert restored.output_sha256 == hashlib.sha256(b"wrote 42 bytes").hexdigest()
+
+    signed_restored = signer.sign_receipt(restored)
+    assert gate.verify_receipt(signed_restored) is True
+
+    # Uncommitted outer provenance.request must NOT override hash-committed inputs
+    spoofed = {
+        **aer1_doc,
+        "provenance": {"request": {"path": "prod.db", "bytes": 9999}},
+    }
+    parsed_spoofed = ToolReceipt.from_aer1(spoofed)
+    assert parsed_spoofed.args == {"path": "safe_notes.txt", "bytes": 42}
+
+
+def test_merkle_proof_geometry_and_concurrent_sqlite_provenance_store(tmp_path: Path) -> None:
+    import threading
+    from dataclasses import replace
+
+    factory = SignerFactory.from_master_key(os.urandom(32))
+    gate = ProvenanceGate(factory.public_keys())
+    signer = factory.tool_verified()
+    log = MerkleReceiptLog(gate=gate)
+
+    receipts = [
+        signer.sign_receipt(ToolReceipt(tool=f"t_{i}", ok=True, args={"i": i}, output=f"out-{i}"))
+        for i in range(4)
+    ]
+    for r in receipts:
+        log.append(r)
+
+    proof0 = log.inclusion_proof(0)
+    assert MerkleReceiptLog.verify_inclusion_proof(receipts[0], proof0) is True
+
+    # Claiming leaf_index=1 with leaf 0's proof must fail path-side geometry check
+    with pytest.raises(MerkleTamperError):
+        MerkleReceiptLog.verify_inclusion_proof(receipts[0], replace(proof0, leaf_index=1))
+
+    # Out-of-bounds leaf_index or wrong tree_size must fail
+    with pytest.raises(MerkleTamperError):
+        MerkleReceiptLog.verify_inclusion_proof(receipts[0], replace(proof0, tree_size=2))
+    with pytest.raises(MerkleTamperError):
+        MerkleReceiptLog.verify_inclusion_proof(receipts[0], replace(proof0, leaf_index=-1))
+
+    # Invalid sibling side label or non-32-byte sibling digest must fail
+    bad_side_sibs = (("X", proof0.siblings[0][1]), *proof0.siblings[1:])
+    with pytest.raises(MerkleTamperError):
+        MerkleReceiptLog.verify_inclusion_proof(
+            receipts[0], replace(proof0, siblings=bad_side_sibs)
+        )
+    short_sibs = (("R", "abcd"), *proof0.siblings[1:])
+    with pytest.raises(MerkleTamperError):
+        MerkleReceiptLog.verify_inclusion_proof(receipts[0], replace(proof0, siblings=short_sibs))
+
+    # Multi-threaded concurrent SQLiteProvenanceStore appends preserve unbroken chain
+    db_path = tmp_path / "concurrent_prov.sqlite"
+    store = SQLiteProvenanceStore(db_path, gate)
+    errors: list[Exception] = []
+
+    def _worker(tid: int) -> None:
+        try:
+            for j in range(25):
+                env = signer.sign(f"fact-{tid}-{j}", trace_id=f"tr-{tid}-{j}")
+                store.append(env, expected_provenance=Provenance.TOOL_VERIFIED)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(t,)) for t in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert errors == []
+    assert store.verify_chain() == 150
+    store.close()
+
+

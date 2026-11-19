@@ -45,7 +45,9 @@ def canonical_envelope_bytes(payload: UnsignedPayload) -> bytes:
         "created_at_utc": payload.created_at_utc,
         "metadata": payload.metadata,
     }
-    return json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
 
 
 def canonical_receipt_bytes(receipt: ToolReceipt) -> bytes:
@@ -63,7 +65,9 @@ def canonical_receipt_bytes(receipt: ToolReceipt) -> bytes:
     }
     if receipt.session_id:
         canonical["session_id"] = receipt.session_id
-    return json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
 
 
 def _derive_domain_seed(master_key: bytes, provenance: Provenance, purpose: bytes) -> bytes:
@@ -138,8 +142,10 @@ class DomainSigner:
 
     def sign_receipt(self, receipt: ToolReceipt) -> ToolReceipt:
         """Attach an Ed25519 signature and SHA-256 output digest to a `ToolReceipt`."""
-        out_sha = receipt.output_sha256 or hashlib.sha256(receipt.output.encode()).hexdigest()
-        populated = receipt.model_copy(update={"output_sha256": out_sha})
+        actual_sha = hashlib.sha256(receipt.output.encode("utf-8")).hexdigest()
+        if receipt.output_sha256 and receipt.output_sha256 != actual_sha:
+            raise SignatureTamperError("ToolReceipt output SHA-256 mismatch.")
+        populated = receipt.model_copy(update={"output_sha256": actual_sha})
         raw_sig = self._private_key.sign(canonical_receipt_bytes(populated))
         sig_b64 = base64.b64encode(raw_sig).decode("ascii")
         return populated.model_copy(update={"signature": f"{ED25519_PREFIX}{sig_b64}"})
@@ -289,7 +295,9 @@ class OperatorApprovalToken:
             "approved_by": self.approved_by,
             "issued_at_utc": self.issued_at_utc,
         }
-        return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
 
 
 def generate_operator_keypair() -> tuple[bytes, bytes]:

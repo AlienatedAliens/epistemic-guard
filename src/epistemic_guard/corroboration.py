@@ -49,6 +49,7 @@ from epistemic_guard.web_filters import (
 
 WEB_EVIDENCE_SEQ_LEN: Final[int] = 192
 WEB_EVIDENCE_CLASSES: Final[tuple[str, ...]] = ("CORROBORATES", "IRRELEVANT", "DISPUTES")
+DEFAULT_SHINGLE_WINDOW: Final[int] = 4
 
 POLICY_TABLE_2D: Final[dict[tuple[str, Hazard], ProofStandard]] = {
     ("casual_mention", Hazard.LOW): ProofStandard.BALANCE_OF_PROBABILITIES,
@@ -207,7 +208,9 @@ def _word_tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
-def shingle_jaccard_similarity(text_a: str, text_b: str, k: int = 4) -> float:
+def shingle_jaccard_similarity(
+    text_a: str, text_b: str, k: int = DEFAULT_SHINGLE_WINDOW
+) -> float:
     """Compute word `k`-shingle Jaccard similarity to collapse verbatim and wire-syndicated text."""
     toks_a = _word_tokens(text_a)
     toks_b = _word_tokens(text_b)

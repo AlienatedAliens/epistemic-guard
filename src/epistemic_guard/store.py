@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -141,14 +142,55 @@ class MerkleReceiptLog:
         )
 
     @staticmethod
+    def _expected_sibling_sides(leaf_index: int, tree_size: int) -> tuple[str, ...]:
+        sides: list[str] = []
+        idx = leaf_index
+        width = tree_size
+        while width > 1:
+            if idx % 2 == 0:
+                if idx + 1 < width:
+                    sides.append("R")
+            else:
+                sides.append("L")
+            idx //= 2
+            width = (width + 1) // 2
+        return tuple(sides)
+
+    @staticmethod
     def verify_inclusion_proof(receipt: ToolReceipt, proof: MerkleInclusionProof) -> bool:
         """Verify that `receipt` hashes to `proof.root_sha256` without needing the full log."""
+        if proof.tree_size < 1 or proof.leaf_index < 0 or proof.leaf_index >= proof.tree_size:
+            raise MerkleTamperError(
+                f"Invalid Merkle proof bounds: leaf_index={proof.leaf_index}, "
+                f"tree_size={proof.tree_size}."
+            )
+        expected_sides = MerkleReceiptLog._expected_sibling_sides(
+            proof.leaf_index, proof.tree_size
+        )
+        if len(proof.siblings) != len(expected_sides):
+            raise MerkleTamperError(
+                f"Merkle sibling count {len(proof.siblings)} does not match expected "
+                f"{len(expected_sides)} for leaf_index={proof.leaf_index}, "
+                f"tree_size={proof.tree_size}."
+            )
         raw = canonical_receipt_bytes(receipt) + b"|" + receipt.signature.encode("utf-8")
         cur = _leaf_hash(raw)
         if cur.hex() != proof.leaf_sha256:
             raise MerkleTamperError("Receipt bytes do not match proof leaf SHA-256.")
-        for side, hex_sib in proof.siblings:
-            sib = bytes.fromhex(hex_sib)
+        for (side, hex_sib), exp_side in zip(proof.siblings, expected_sides, strict=True):
+            if side not in ("L", "R") or side != exp_side:
+                raise MerkleTamperError(
+                    f"Merkle sibling side {side!r} does not match expected {exp_side!r} "
+                    f"for leaf_index={proof.leaf_index}."
+                )
+            try:
+                sib = bytes.fromhex(hex_sib)
+            except ValueError as exc:
+                raise MerkleTamperError("Merkle sibling is not valid hex.") from exc
+            if len(sib) != 32 or hex_sib != sib.hex():
+                raise MerkleTamperError(
+                    "Merkle sibling must be a canonical 64-char lowercase SHA-256 hex digest."
+                )
             cur = _node_hash(sib, cur) if side == "L" else _node_hash(cur, sib)
         if cur.hex() != proof.root_sha256:
             raise MerkleTamperError("Merkle inclusion path does not match expected root.")
@@ -182,12 +224,14 @@ class SQLiteProvenanceStore:
     def __init__(self, db_path: Path | str, gate: ProvenanceGate) -> None:
         self.db_path = str(db_path)
         self.gate = gate
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
     def _init_schema(self) -> None:
-        with self._conn:
+        with self._lock, self._conn:
+            self._conn.execute("PRAGMA trusted_schema=OFF;")
             if self.db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute(
@@ -227,7 +271,8 @@ class SQLiteProvenanceStore:
             )
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def append(
         self,
@@ -237,49 +282,68 @@ class SQLiteProvenanceStore:
     ) -> str:
         """Verify `envelope` via `ProvenanceGate` and append it to the hash-chained SQLite log."""
         self.gate.verify(envelope, expected_provenance=expected_provenance)
-        row = self._conn.execute(
-            "SELECT chain_sha256 FROM provenance_envelopes ORDER BY seq DESC LIMIT 1"
-        ).fetchone()
-        prev_chain = str(row["chain_sha256"]) if row is not None else _GENESIS_CHAIN
-        chain_input = f"{prev_chain}:{envelope.payload_id}:{envelope.signature}".encode()
-        chain_sha = hashlib.sha256(chain_input).hexdigest()
+        meta_json = json.dumps(
+            envelope.metadata, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
 
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO provenance_envelopes (
-                    payload_id, content, provenance, confidence, trace_id,
-                    created_at_utc, metadata_json, signature, signer_domain, chain_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    envelope.payload_id,
-                    envelope.content,
-                    envelope.provenance.value,
-                    float(envelope.confidence),
-                    envelope.trace_id,
-                    envelope.created_at_utc,
-                    json.dumps(envelope.metadata, sort_keys=True, separators=(",", ":")),
-                    envelope.signature,
-                    envelope.signer_domain,
-                    chain_sha,
-                ),
-            )
+        with self._lock:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT chain_sha256 FROM provenance_envelopes ORDER BY seq DESC LIMIT 1"
+                ).fetchone()
+                prev_chain = str(row["chain_sha256"]) if row is not None else _GENESIS_CHAIN
+                chain_input = f"{prev_chain}:{envelope.payload_id}:{envelope.signature}".encode()
+                chain_sha = hashlib.sha256(chain_input).hexdigest()
+                self._conn.execute(
+                    """
+                    INSERT INTO provenance_envelopes (
+                        payload_id, content, provenance, confidence, trace_id,
+                        created_at_utc, metadata_json, signature, signer_domain, chain_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        envelope.payload_id,
+                        envelope.content,
+                        envelope.provenance.value,
+                        float(envelope.confidence),
+                        envelope.trace_id,
+                        envelope.created_at_utc,
+                        meta_json,
+                        envelope.signature,
+                        envelope.signer_domain,
+                        chain_sha,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
         return chain_sha
 
     @staticmethod
     def _row_to_envelope(row: sqlite3.Row) -> SignedPayload:
-        return SignedPayload(
-            payload_id=str(row["payload_id"]),
-            content=str(row["content"]),
-            provenance=Provenance(str(row["provenance"])),
-            confidence=float(row["confidence"]),
-            trace_id=str(row["trace_id"]),
-            created_at_utc=str(row["created_at_utc"]),
-            metadata=json.loads(str(row["metadata_json"])),
-            signature=str(row["signature"]),
-            signer_domain=str(row["signer_domain"]),
-        )
+        try:
+            raw_meta = json.loads(str(row["metadata_json"]))
+            if not isinstance(raw_meta, dict):
+                raise ValueError("metadata_json must decode to an object")
+            return SignedPayload(
+                payload_id=str(row["payload_id"]),
+                content=str(row["content"]),
+                provenance=Provenance(str(row["provenance"])),
+                confidence=float(row["confidence"]),
+                trace_id=str(row["trace_id"]),
+                created_at_utc=str(row["created_at_utc"]),
+                metadata=raw_meta,
+                signature=str(row["signature"]),
+                signer_domain=str(row["signer_domain"]),
+            )
+        except Exception as exc:
+            raise SignatureTamperError(
+                "Corrupted provenance envelope row in SQLite store."
+            ) from exc
 
     def list_verified(
         self,
@@ -288,16 +352,18 @@ class SQLiteProvenanceStore:
         limit: int = 100,
     ) -> list[SignedPayload]:
         """Read envelopes and re-verify every Ed25519 signature before returning."""
-        if provenance is not None:
-            rows = self._conn.execute(
-                "SELECT * FROM provenance_envelopes WHERE provenance = ? ORDER BY seq ASC LIMIT ?",
-                (provenance.value, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM provenance_envelopes ORDER BY seq ASC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        with self._lock:
+            if provenance is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM provenance_envelopes "
+                    "WHERE provenance = ? ORDER BY seq ASC LIMIT ?",
+                    (provenance.value, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM provenance_envelopes ORDER BY seq ASC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         verified: list[SignedPayload] = []
         for r in rows:
             env = self._row_to_envelope(r)
@@ -306,10 +372,18 @@ class SQLiteProvenanceStore:
         return verified
 
     def verify_chain(self) -> int:
-        """Verify every stored Ed25519 signature and sequential SHA-256 chain link."""
-        rows = self._conn.execute(
-            "SELECT * FROM provenance_envelopes ORDER BY seq ASC"
-        ).fetchall()
+        """Verify immutability triggers, Ed25519 signatures, and sequential SHA-256 chain links."""
+        with self._lock:
+            trig_rows = self._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'provenance_envelopes'"
+            ).fetchall()
+            rows = self._conn.execute(
+                "SELECT * FROM provenance_envelopes ORDER BY seq ASC"
+            ).fetchall()
+        trig_names = {str(tr["name"]) for tr in trig_rows}
+        if not {"prevent_provenance_update", "prevent_provenance_delete"}.issubset(trig_names):
+            raise SignatureTamperError("SQLite immutability triggers missing from schema.")
         prev_chain = _GENESIS_CHAIN
         for r in rows:
             env = self._row_to_envelope(r)

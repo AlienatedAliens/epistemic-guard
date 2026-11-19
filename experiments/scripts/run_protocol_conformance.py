@@ -72,6 +72,9 @@ def _bench_merkle_and_tamper() -> dict[str, int | float]:
 
 
 def _bench_aer1_interop() -> dict[str, int | float]:
+    factory = SignerFactory.from_master_key(_deterministic_key("aer1-interop"))
+    signer = factory.tool_verified()
+    gate = ProvenanceGate(factory.public_keys())
     n_cases = 50
     valid_roundtrips = 0
     tampered_rejected = 0
@@ -90,7 +93,15 @@ def _bench_aer1_interop() -> dict[str, int | float]:
         )
         aer1_doc = rec.to_aer1()
         restored = ToolReceipt.from_aer1(aer1_doc)
-        if restored.tool == rec.tool and restored.executed == rec.executed and restored.ok == rec.ok:
+        signed_restored = signer.sign_receipt(restored)
+        if (
+            restored.tool == rec.tool
+            and restored.call_id == rec.call_id
+            and restored.args == rec.args
+            and restored.executed == rec.executed
+            and restored.ok == rec.ok
+            and gate.verify_receipt(signed_restored)
+        ):
             valid_roundtrips += 1
 
         bad_doc = json.loads(json.dumps(aer1_doc))
@@ -116,7 +127,7 @@ def _bench_mcp_proxy_wire() -> dict[str, int | float]:
 
     child_code = """
 import json, os, sys
-leaked = 1 if "EPISTEMIC_GUARD_MCP_KEY_HEX" in os.environ else 0
+leaked = 1 if any(k.upper() in ("EPISTEMIC_GUARD_MCP_KEY_HEX", "EPISTEMIC_GUARD_MASTER_KEY") for k in os.environ) else 0
 for raw in sys.stdin:
     line = raw.strip()
     if not line:
@@ -152,7 +163,9 @@ for raw in sys.stdin:
         pub_path = tmp_dir / "mcp.pub.json"
 
         old_env = os.environ.get("EPISTEMIC_GUARD_MCP_KEY_HEX")
+        old_master = os.environ.get("EPISTEMIC_GUARD_MASTER_KEY")
         os.environ["EPISTEMIC_GUARD_MCP_KEY_HEX"] = master_hex
+        os.environ["EPISTEMIC_GUARD_MASTER_KEY"] = master_hex
         try:
             # Batch the 30 non-crash calls into one stdio session
             steady_reqs = []
@@ -211,6 +224,10 @@ for raw in sys.stdin:
                 os.environ.pop("EPISTEMIC_GUARD_MCP_KEY_HEX", None)
             else:
                 os.environ["EPISTEMIC_GUARD_MCP_KEY_HEX"] = old_env
+            if old_master is None:
+                os.environ.pop("EPISTEMIC_GUARD_MASTER_KEY", None)
+            else:
+                os.environ["EPISTEMIC_GUARD_MASTER_KEY"] = old_master
 
         ver = verify_receipt_log_file(log_path, pubkey_file=pub_path)
         total_calls = n_per_mode * len(modes)

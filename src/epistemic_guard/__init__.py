@@ -3,6 +3,7 @@ and RAG source deduplication for autonomous agents (MIT License, local CPU/GPU/N
 """
 
 from epistemic_guard.corroboration import (
+    DEFAULT_SHINGLE_WINDOW,
     POLICY_TABLE_2D,
     OpenVINOWebEvidenceClassifier,
     corroborate_sources,
@@ -102,9 +103,10 @@ from epistemic_guard.supervision import (
     parse_structured_action_tags,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
+    "DEFAULT_SHINGLE_WINDOW",
     "ELIGIBLE_PROVENANCE",
     "MCP_TOOLS",
     "MODEL_PACK_VERSION",

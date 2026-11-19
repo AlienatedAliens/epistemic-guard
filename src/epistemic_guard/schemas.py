@@ -502,13 +502,13 @@ class ToolReceipt(BaseModel):
         args_map: dict[str, str | int | float | bool] = {}
 
         prov_obj = rec.get("provenance")
-        if isinstance(prov_obj, Mapping) and isinstance(prov_obj.get("request"), Mapping):
-            args_map = {
-                str(k): _coerce_receipt_arg(v) for k, v in prov_obj["request"].items()
-            }
-        elif isinstance(canon_obj.get("inputs"), Mapping):
+        if isinstance(canon_obj.get("inputs"), Mapping):
             args_map = {
                 str(k): _coerce_receipt_arg(v) for k, v in canon_obj["inputs"].items()
+            }
+        elif isinstance(prov_obj, Mapping) and isinstance(prov_obj.get("request"), Mapping):
+            args_map = {
+                str(k): _coerce_receipt_arg(v) for k, v in prov_obj["request"].items()
             }
 
         if isinstance(out_obj, Mapping):
@@ -544,16 +544,25 @@ class ToolReceipt(BaseModel):
             if isinstance(caller_obj, Mapping) and caller_obj.get("session_id")
             else ""
         )
+        restored_call_id = (
+            str(caller_obj["id"])
+            if isinstance(caller_obj, Mapping)
+            and caller_obj.get("type") == "call"
+            and isinstance(caller_obj.get("id"), str)
+            and caller_obj["id"]
+            else str(rec["id"])
+        )
         created_str = str(rec["timestamp"] if legacy_prod else rec["created_at"])
+        output_digest = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
         return cls(
             tool=tool_name,
             ok=ok,
             executed=executed,
             error_code=error_code,
-            call_id=str(rec["id"]),
+            call_id=restored_call_id,
             args=args_map,
             output=output_text,
-            output_sha256=computed_hex,
+            output_sha256=output_digest,
             timestamp_utc=created_str,
             session_id=restored_session_id,
         )
@@ -601,24 +610,33 @@ class ToolReceipt(BaseModel):
         caller_block: dict[str, str] = {"id": self.call_id, "type": "call"}
         if self.session_id:
             caller_block["session_id"] = self.session_id
-        canon_payload = {
+        inputs_dict = dict(self.args)
+        inputs_raw = json.dumps(
+            inputs_dict, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        canon_payload: dict[str, Any] = {
             "caller": caller_block,
+            "inputs": inputs_dict,
             "issuer_claims": {"provenance_class": prov_cls},
             "output": out_block,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.5.0"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.5.1"},
         }
-        canon_raw = json.dumps(canon_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        canon_raw = json.dumps(
+            canon_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
         canon_sha = hashlib.sha256(canon_raw).hexdigest()
+        inputs_sha = hashlib.sha256(inputs_raw).hexdigest()
         aer1_id = _derive_aer1_uuid(self.call_id, canon_sha)
         created_at = _normalize_aer1_timestamp(self.timestamp_utc)
         return {
             "id": aer1_id,
             "created_at": created_at,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.5.0"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.5.1"},
             "provenance_class": prov_cls,
             "canonical_bytes": base64.b64encode(canon_raw).decode("ascii"),
+            "input_hash": f"sha256:{inputs_sha}",
             "output_hash": f"sha256:{canon_sha}",
             "verification_status": "verified",
             "steps": [

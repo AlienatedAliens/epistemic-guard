@@ -569,13 +569,15 @@ class ReceiptSupervisor:
         if not ok_receipts or family == "DEONTIC_CAPITULATION":
             return False
         stems = _FAMILY_TOOL_STEMS.get(family, ())
-        tgt_low = target.lower()
+        tgt_low = target.strip().lower()
         for rcpt in ok_receipts:
             tool_l = rcpt.tool.lower()
             if stems and not any(s in tool_l for s in stems) and verb not in tool_l:
                 continue
             if not rcpt.args:
-                return True
+                if not tgt_low or tgt_low in tool_l or tgt_low in rcpt.output.lower():
+                    return True
+                continue
             for val in rcpt.args.values():
                 sval = str(val).strip().lower()
                 if sval and (sval in tgt_low or tgt_low in sval):
@@ -599,9 +601,6 @@ class ReceiptSupervisor:
         if not matching_rcpts:
             return False
 
-        if any(not rcpt.args for rcpt in matching_rcpts):
-            return True
-
         arg_pool: list[str] = []
         for rcpt in matching_rcpts:
             for val in rcpt.args.values():
@@ -617,13 +616,17 @@ class ReceiptSupervisor:
             cl_lower,
         )
         if concrete_targets:
-            return all(
-                any(
-                    tgt.rstrip(".,!?;:") in ap or ap in tgt.rstrip(".,!?;:")
-                    for ap in arg_pool
+            for tgt in concrete_targets:
+                clean_tgt = tgt.rstrip(".,!?;:")
+                in_args = any(clean_tgt in ap or ap in clean_tgt for ap in arg_pool)
+                in_zero_arg_rcpt = any(
+                    not rcpt.args
+                    and (clean_tgt in rcpt.tool.lower() or clean_tgt in rcpt.output.lower())
+                    for rcpt in matching_rcpts
                 )
-                for tgt in concrete_targets
-            )
+                if not (in_args or in_zero_arg_rcpt):
+                    return False
+            return True
 
         return True
 
