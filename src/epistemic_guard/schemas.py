@@ -420,6 +420,7 @@ class ToolReceipt(BaseModel):
     output: str = ""
     output_sha256: str = ""
     timestamp_utc: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    session_id: str = ""
     signature: str = ""
 
     @classmethod
@@ -537,6 +538,12 @@ class ToolReceipt(BaseModel):
         elif step_status in {"failed", "error"}:
             ok = False
 
+        caller_obj = canon_obj.get("caller")
+        restored_session_id = (
+            str(caller_obj.get("session_id", ""))
+            if isinstance(caller_obj, Mapping) and caller_obj.get("session_id")
+            else ""
+        )
         created_str = str(rec["timestamp"] if legacy_prod else rec["created_at"])
         return cls(
             tool=tool_name,
@@ -548,6 +555,7 @@ class ToolReceipt(BaseModel):
             output=output_text,
             output_sha256=computed_hex,
             timestamp_utc=created_str,
+            session_id=restored_session_id,
         )
 
     def to_aer1(
@@ -590,12 +598,15 @@ class ToolReceipt(BaseModel):
             out_block = {"text": self.output}
             step_status = "success"
 
+        caller_block: dict[str, str] = {"id": self.call_id, "type": "call"}
+        if self.session_id:
+            caller_block["session_id"] = self.session_id
         canon_payload = {
-            "caller": {"id": self.call_id, "type": "call"},
+            "caller": caller_block,
             "issuer_claims": {"provenance_class": prov_cls},
             "output": out_block,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.4.3"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.5.0"},
         }
         canon_raw = json.dumps(canon_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         canon_sha = hashlib.sha256(canon_raw).hexdigest()
@@ -605,7 +616,7 @@ class ToolReceipt(BaseModel):
             "id": aer1_id,
             "created_at": created_at,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.4.3"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.5.0"},
             "provenance_class": prov_cls,
             "canonical_bytes": base64.b64encode(canon_raw).decode("ascii"),
             "output_hash": f"sha256:{canon_sha}",

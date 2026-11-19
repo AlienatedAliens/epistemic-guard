@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -369,3 +370,145 @@ def test_log_resumption_tamper_detection_and_verify_log_cli(
     )
     with pytest.raises(SignatureTamperError):
         verify_receipt_log_file(tampered_log, pubkey_file=pub_file)
+
+
+def test_multiprocess_concurrent_receipt_log_writer_and_key_rotation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key_file = tmp_path / "shared.key"
+    pub_file = tmp_path / "shared.pub.json"
+    shared_log = tmp_path / "concurrent.jsonl"
+    load_or_create_mcp_signer(key_file=key_file, pubkey_out=pub_file)
+
+    worker_script = tmp_path / "worker_append.py"
+    worker_script.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from epistemic_guard import ReceiptLogWriter, ToolReceipt, load_or_create_mcp_signer\n"
+        "log_p, key_p, worker_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]\n"
+        "signer = load_or_create_mcp_signer(key_file=key_p)\n"
+        "writer = ReceiptLogWriter(log_p, signer, session_id='sess-shared-1')\n"
+        "for idx in range(8):\n"
+        "    writer.append(ToolReceipt(\n"
+        "        call_id=f'{worker_id}-{idx}',\n"
+        "        tool='write_file',\n"
+        "        ok=True,\n"
+        "        args={'worker': worker_id, 'idx': idx},\n"
+        "        output=f'ok-{worker_id}-{idx}',\n"
+        "    ))\n",
+        encoding="utf-8",
+    )
+
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(worker_script), str(shared_log), str(key_file), f"w{w}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for w in range(3)
+    ]
+    for proc in procs:
+        out, err = proc.communicate(timeout=30)
+        assert proc.returncode == 0, f"worker failed: {out}\n{err}"
+
+    verified_shared = verify_receipt_log_file(
+        shared_log,
+        pubkey_file=pub_file,
+        expected_session_id="sess-shared-1",
+    )
+    assert verified_shared.entry_count == 24
+    assert verified_shared.session_id == "sess-shared-1"
+    assert verified_shared.prev_chain_sha256 == "0" * 64
+
+    # Key rotation: rotate to a new Ed25519 key while cryptographically chaining to shared_log tip
+    rot_key = tmp_path / "rotated.key"
+    rot_pub = tmp_path / "rotated.pub.json"
+    rot_log = tmp_path / "rotated.jsonl"
+    rot_signer = load_or_create_mcp_signer(key_file=rot_key, pubkey_out=rot_pub)
+    rot_writer = ReceiptLogWriter(
+        rot_log,
+        rot_signer,
+        session_id="sess-rotated-2",
+        prev_log_path=shared_log,
+    )
+    rot_writer.append(
+        ToolReceipt(
+            call_id="turn0-del",
+            tool="delete_file",
+            ok=True,
+            args={"path": "old_cache.db"},
+            output="deleted old_cache.db",
+        )
+    )
+    rot_writer.append(
+        ToolReceipt(
+            call_id="turn1-write",
+            tool="write_file",
+            ok=True,
+            args={"path": "summary.md"},
+            output="wrote summary.md",
+        )
+    )
+
+    verified_rot = verify_receipt_log_file(
+        rot_log,
+        pubkey_file=rot_pub,
+        expected_session_id="sess-rotated-2",
+        prev_log_path=shared_log,
+    )
+    assert rot_writer.merkle_log.verify_integrity() is True
+    assert verified_rot.entry_count == 2
+    assert verified_rot.prev_chain_sha256 == verified_shared.head_chain_hash
+
+    # Tampering or swapping predecessor log breaks rotation chain continuity
+    fake_prev = tmp_path / "fake_prev.jsonl"
+    fake_signer = load_or_create_mcp_signer()
+    ReceiptLogWriter(fake_prev, fake_signer).append(
+        ToolReceipt(tool="ping", ok=True, output="pong")
+    )
+    with pytest.raises(MerkleTamperError):
+        verify_receipt_log_file(rot_log, pubkey_file=rot_pub, prev_log_path=fake_prev)
+
+    # CLI verify-log with --prev-log, --session-id, and --since-seq blocks stale Turn-0 claim
+    rc_stale = cli_main(
+        [
+            "verify-log",
+            str(rot_log),
+            "--pubkey-file",
+            str(rot_pub),
+            "--prev-log",
+            str(shared_log),
+            "--session-id",
+            "sess-rotated-2",
+            "--since-seq",
+            "1",
+            "--narration",
+            "I wrote summary.md; I also deleted old_cache.db.",
+            "--json",
+        ]
+    )
+    assert rc_stale == 1
+    stale_out = json.loads(capsys.readouterr().out)
+    assert stale_out["log_valid"] is True
+    assert stale_out["narration_valid"] is False
+
+    # Current-turn narration (seq >= 1) passes cleanly
+    rc_fresh = cli_main(
+        [
+            "verify-log",
+            str(rot_log),
+            "--pubkey-file",
+            str(rot_pub),
+            "--prev-log",
+            str(shared_log),
+            "--session-id",
+            "sess-rotated-2",
+            "--since-seq",
+            "1",
+            "--narration",
+            "I wrote summary.md.",
+        ]
+    )
+    assert rc_fresh == 0
+    capsys.readouterr()

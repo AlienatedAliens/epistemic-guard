@@ -29,7 +29,11 @@ from epistemic_guard.hazard import (
 )
 from epistemic_guard.integrations import (
     ReceiptRecorder,
+    SupportsOtelSpan,
+    attach_otel_evidence,
+    receipt_to_otel_attributes,
     signed_tool,
+    verdict_to_otel_attributes,
     verify_chat_turn,
 )
 from epistemic_guard.mcp_proxy import (
@@ -98,7 +102,7 @@ from epistemic_guard.supervision import (
     parse_structured_action_tags,
 )
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 
 __all__ = [
     "ELIGIBLE_PROVENANCE",
@@ -144,11 +148,13 @@ __all__ = [
     "StreamingReceiptSupervisor",
     "StructuredActionTag",
     "SupervisionVerdict",
+    "SupportsOtelSpan",
     "ToolReceipt",
     "UnsignedPayload",
     "UnsupportedClaimSpan",
     "WebEvidentiaryBurden",
     "__version__",
+    "attach_otel_evidence",
     "corroborate_sources",
     "deduplicate_syndicated_sources",
     "default_cache_root",
@@ -162,6 +168,7 @@ __all__ = [
     "meets_standard",
     "parse_structured_action_tags",
     "read_public_key_file",
+    "receipt_to_otel_attributes",
     "required_standard",
     "run_mcp_stdio_proxy",
     "run_mcp_stdio_server",
@@ -171,6 +178,7 @@ __all__ = [
     "split_into_clauses",
     "split_into_clauses_with_spans",
     "standard_for_confidence",
+    "verdict_to_otel_attributes",
     "verify_chat_turn",
     "verify_model_dir",
     "verify_receipt_log_file",

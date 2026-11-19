@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any, ParamSpec, TypeVar, overload
+from typing import Any, ParamSpec, Protocol, TypeVar, overload, runtime_checkable
 
 from epistemic_guard.provenance import DomainSigner
 from epistemic_guard.schemas import SupervisionVerdict, ToolReceipt
@@ -44,6 +45,110 @@ def _extract_bound_args(
         return {k: _coerce_arg_scalar(v) for k, v in kwargs.items()}
 
 
+@runtime_checkable
+class SupportsOtelSpan(Protocol):
+    """Structural protocol matching OpenTelemetry `Span` / Langfuse observation objects."""
+
+    def set_attribute(self, key: str, value: str | int | float | bool) -> object: ...
+
+
+def receipt_to_otel_attributes(
+    receipt: ToolReceipt,
+    *,
+    prefix: str = "epistemic_guard",
+) -> dict[str, str | int | float | bool]:
+    """Export a `ToolReceipt` into flat OpenTelemetry / Langfuse span event attributes."""
+    out_sha = receipt.output_sha256 or hashlib.sha256(receipt.output.encode("utf-8")).hexdigest()
+    aer1 = receipt.to_aer1()
+    attrs: dict[str, str | int | float | bool] = {
+        f"{prefix}.receipt.call_id": receipt.call_id,
+        f"{prefix}.receipt.tool": receipt.tool,
+        f"{prefix}.receipt.executed": receipt.executed,
+        f"{prefix}.receipt.ok": receipt.ok,
+        f"{prefix}.receipt.output_sha256": out_sha,
+        f"{prefix}.receipt.aer1_id": str(aer1["id"]),
+        f"{prefix}.receipt.aer1_output_hash": str(aer1["output_hash"]),
+        f"{prefix}.receipt.signed": receipt.signature.startswith("ed25519:"),
+    }
+    if receipt.error_code:
+        attrs[f"{prefix}.receipt.error_code"] = receipt.error_code
+    if receipt.session_id:
+        attrs[f"{prefix}.receipt.session_id"] = receipt.session_id
+    if receipt.signature:
+        attrs[f"{prefix}.receipt.signature"] = receipt.signature
+    return attrs
+
+
+def verdict_to_otel_attributes(
+    verdict: SupervisionVerdict,
+    *,
+    merkle_root: str = "",
+    session_id: str = "",
+    prefix: str = "epistemic_guard",
+) -> dict[str, str | int | float | bool]:
+    """Export a `SupervisionVerdict` into flat OpenTelemetry / Langfuse span attributes."""
+    attrs: dict[str, str | int | float | bool] = {
+        f"{prefix}.narration.is_valid": verdict.is_valid,
+        f"{prefix}.narration.device": verdict.device,
+        f"{prefix}.narration.latency_ms": round(float(verdict.latency_ms), 3),
+        f"{prefix}.narration.clauses_checked": verdict.clauses_checked,
+        f"{prefix}.narration.unsupported_count": len(verdict.unsupported_claims),
+    }
+    if verdict.unsupported_claims:
+        attrs[f"{prefix}.narration.unsupported_claims_json"] = json.dumps(
+            list(verdict.unsupported_claims), separators=(",", ":")
+        )
+    if merkle_root:
+        attrs[f"{prefix}.merkle_root"] = merkle_root
+    if session_id:
+        attrs[f"{prefix}.session_id"] = session_id
+    return attrs
+
+
+def attach_otel_evidence(
+    span: SupportsOtelSpan,
+    *,
+    receipts: Sequence[ToolReceipt] = (),
+    verdict: SupervisionVerdict | None = None,
+    merkle_root: str = "",
+    session_id: str = "",
+    prefix: str = "epistemic_guard",
+    record_events: bool = True,
+) -> dict[str, str | int | float | bool]:
+    """Stamp tamper-evident receipt digests and supervision verdicts onto an OTel/Langfuse span."""
+    applied: dict[str, str | int | float | bool] = {
+        f"{prefix}.receipt_count": len(receipts),
+        f"{prefix}.signed_receipt_count": sum(
+            1 for r in receipts if r.signature.startswith("ed25519:")
+        ),
+    }
+    if merkle_root:
+        applied[f"{prefix}.merkle_root"] = merkle_root
+    active_sess = session_id or next((r.session_id for r in receipts if r.session_id), "")
+    if active_sess:
+        applied[f"{prefix}.session_id"] = active_sess
+    if verdict is not None:
+        applied.update(
+            verdict_to_otel_attributes(
+                verdict,
+                merkle_root=merkle_root,
+                session_id=active_sess,
+                prefix=prefix,
+            )
+        )
+    for key, val in applied.items():
+        span.set_attribute(key, val)
+
+    add_event_fn = getattr(span, "add_event", None)
+    if record_events and callable(add_event_fn):
+        for rcpt in receipts:
+            add_event_fn(
+                f"{prefix}.receipt",
+                receipt_to_otel_attributes(rcpt, prefix=prefix),
+            )
+    return applied
+
+
 class ReceiptRecorder:
     """Collects signed or unsigned `ToolReceipt` records across a single agent turn."""
 
@@ -52,10 +157,18 @@ class ReceiptRecorder:
         *,
         signer: DomainSigner | None = None,
         merkle_log: MerkleReceiptLog | None = None,
+        session_id: str = "",
+        otel_span: SupportsOtelSpan | None = None,
     ) -> None:
         self._signer = signer
         self._merkle_log = merkle_log
+        self._session_id = session_id
+        self._otel_span = otel_span
         self._turn_receipts: list[ToolReceipt] = []
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
     @property
     def receipts(self) -> list[ToolReceipt]:
@@ -86,11 +199,17 @@ class ReceiptRecorder:
         }
         if call_id is not None:
             kwargs["call_id"] = call_id
+        if self._session_id:
+            kwargs["session_id"] = self._session_id
         raw = ToolReceipt(**kwargs)
         final = self._signer.sign_receipt(raw) if self._signer is not None else raw
         self._turn_receipts.append(final)
         if self._merkle_log is not None:
             self._merkle_log.append(final)
+        if self._otel_span is not None:
+            add_ev = getattr(self._otel_span, "add_event", None)
+            if callable(add_ev):
+                add_ev("epistemic_guard.receipt", receipt_to_otel_attributes(final))
         return final
 
     def record_rejection(

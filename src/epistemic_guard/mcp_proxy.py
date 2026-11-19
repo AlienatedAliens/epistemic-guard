@@ -8,10 +8,12 @@ import os
 import subprocess
 import sys
 import threading
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Final
+from uuid import uuid4
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import BaseModel, Field
@@ -32,6 +34,59 @@ _MCP_VALIDATION_MARKERS: Final[tuple[str, ...]] = (
     "missing required property",
 )
 _ENV_SIGNING_KEY_HEX: Final[str] = "EPISTEMIC_GUARD_MCP_KEY_HEX"
+_ENV_SESSION_ID: Final[str] = "EPISTEMIC_GUARD_SESSION_ID"
+_GENESIS_CHAIN_HEX: Final[str] = "0" * 64
+
+
+@contextlib.contextmanager
+def _exclusive_log_lock(log_path: Path, *, timeout_s: float = 10.0) -> Iterator[None]:
+    """Acquire an OS-level exclusive lock on `<log_path>.lock` across worker processes."""
+    lock_file = log_path.parent / f"{log_path.name}.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_file.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\x00")
+            handle.flush()
+        deadline = time.monotonic() + timeout_s
+        locked = False
+        while True:
+            try:
+                handle.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt  # noqa: PLC0415
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl  # noqa: PLC0415
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise ProvenanceError(
+                        f"Timed out waiting for exclusive lock on receipt log '{log_path}'."
+                    ) from exc
+                time.sleep(0.005)
+        try:
+            yield
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    handle.seek(0)
+                    if sys.platform == "win32":
+                        import msvcrt  # noqa: PLC0415
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl  # noqa: PLC0415
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            handle.close()
 
 
 class ReceiptLogEntry(BaseModel):
@@ -43,6 +98,7 @@ class ReceiptLogEntry(BaseModel):
     leaf_sha256: str
     chain_sha256: str
     merkle_root: str
+    prev_chain_sha256: str | None = None
     aer1: dict[str, object] | None = None
 
 
@@ -56,6 +112,8 @@ class ReceiptLogVerification:
     public_key_hex: str
     key_pinned: bool
     receipts: tuple[ToolReceipt, ...]
+    session_id: str = ""
+    prev_chain_sha256: str = _GENESIS_CHAIN_HEX
 
 
 @dataclass(frozen=True)
@@ -167,6 +225,8 @@ class ReceiptLogWriter:
         *,
         truncate: bool = False,
         include_aer1: bool = False,
+        session_id: str | None = None,
+        prev_log_path: Path | str | None = None,
     ) -> None:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,23 +235,56 @@ class ReceiptLogWriter:
         self._include_aer1 = include_aer1
         self._lock = threading.Lock()
         self._gate = ProvenanceGate({Provenance.TOOL_VERIFIED: signer.public_key_bytes})
-        self._merkle = MerkleReceiptLog(gate=self._gate)
+        self._explicit_session_id = (
+            session_id.strip() if session_id is not None and session_id.strip() else None
+        )
+        env_session = os.environ.get(_ENV_SESSION_ID, "").strip()
+        self._session_id = (
+            self._explicit_session_id or env_session or f"sess-{uuid4().hex[:12]}"
+        )
+        self._initial_chain_hash = _GENESIS_CHAIN_HEX
+        if prev_log_path is not None:
+            prev_ver = verify_receipt_log_file(prev_log_path)
+            if prev_ver.entry_count == 0:
+                raise ProvenanceError("prev_log_path cannot be an empty receipt log.")
+            self._initial_chain_hash = prev_ver.head_chain_hash
 
-        if truncate and self.log_path.exists():
-            self.log_path.unlink()
-        elif self.log_path.exists() and self.log_path.stat().st_size > 0:
-            self._replay_existing()
+        self._merkle = MerkleReceiptLog(
+            gate=self._gate,
+            initial_chain_hash=self._initial_chain_hash,
+        )
+        self._synced_lines = 0
+
+        with _exclusive_log_lock(self.log_path):
+            if truncate and self.log_path.exists():
+                self.log_path.unlink()
+            elif self.log_path.exists() and self.log_path.stat().st_size > 0:
+                self._sync_from_disk_locked(prev_log_requested=prev_log_path is not None)
 
     @property
     def merkle_log(self) -> MerkleReceiptLog:
         return self._merkle
 
-    def _replay_existing(self) -> None:
-        lines = self.log_path.read_text(encoding="utf-8").splitlines()
-        for idx, line in enumerate(lines):
-            if not line.strip():
-                continue
-            entry = ReceiptLogEntry.model_validate_json(line)
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def prev_chain_sha256(self) -> str:
+        return self._initial_chain_hash
+
+    def _sync_from_disk_locked(self, *, prev_log_requested: bool = False) -> None:
+        if not self.log_path.exists() or self.log_path.stat().st_size == 0:
+            if self._synced_lines > 0:
+                raise MerkleTamperError("Active receipt log was truncated or deleted externally.")
+            return
+        raw_lines = [
+            ln for ln in self.log_path.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+        if len(raw_lines) < self._synced_lines:
+            raise MerkleTamperError("Active receipt log shrank on disk; tamper detected.")
+        for idx in range(self._synced_lines, len(raw_lines)):
+            entry = ReceiptLogEntry.model_validate_json(raw_lines[idx])
             if entry.seq != idx:
                 raise MerkleTamperError(
                     f"Existing log sequence mismatch at line {idx}: "
@@ -200,24 +293,57 @@ class ReceiptLogWriter:
             if entry.public_key_hex != self._pubkey_hex:
                 raise ProvenanceError(
                     "Existing receipt log was signed by a different Ed25519 key. "
-                    "Pass matching --key-file or --truncate."
+                    "Pass matching --key-file, --prev-log to a new log file, or --truncate."
                 )
+            if idx == 0:
+                disk_prev = entry.prev_chain_sha256 or _GENESIS_CHAIN_HEX
+                if prev_log_requested and disk_prev != self._initial_chain_hash:
+                    raise MerkleTamperError(
+                        "Existing log prev_chain_sha256 does not match supplied prev_log_path."
+                    )
+                if disk_prev != self._initial_chain_hash:
+                    self._initial_chain_hash = disk_prev
+                    self._merkle = MerkleReceiptLog(
+                        gate=self._gate,
+                        initial_chain_hash=self._initial_chain_hash,
+                    )
+                existing_sess = entry.receipt.session_id
+                if self._explicit_session_id is not None:
+                    if existing_sess != self._explicit_session_id:
+                        raise ProvenanceError(
+                            f"Existing receipt log session_id={existing_sess!r} conflicts with "
+                            f"requested session_id={self._explicit_session_id!r}."
+                        )
+                elif existing_sess:
+                    self._session_id = existing_sess
+
             chain_sha = self._merkle.append(entry.receipt)
             proof = self._merkle.inclusion_proof(idx)
             if chain_sha != entry.chain_sha256 or proof.root_sha256 != entry.merkle_root:
                 raise MerkleTamperError(f"Existing receipt log failed Merkle check at seq={idx}.")
+        self._synced_lines = len(raw_lines)
 
     def append(self, receipt: ToolReceipt) -> ReceiptLogEntry:
-        """Sign `receipt`, update the Merkle log, and flush one JSONL line to disk."""
-        with self._lock:
-            signed = (
-                receipt
-                if receipt.signature.startswith("ed25519:")
-                else self._signer.sign_receipt(receipt)
-            )
+        """Sign `receipt`, update the Merkle log, and atomically flush one JSONL line to disk."""
+        with self._lock, _exclusive_log_lock(self.log_path):
+            self._sync_from_disk_locked()
+            if receipt.signature.startswith("ed25519:"):
+                signed = receipt
+            else:
+                prepared = (
+                    receipt
+                    if receipt.session_id
+                    else receipt.model_copy(update={"session_id": self._session_id})
+                )
+                signed = self._signer.sign_receipt(prepared)
             seq = len(self._merkle)
             chain_sha = self._merkle.append(signed)
             proof = self._merkle.inclusion_proof(seq)
+            prev_anchor = (
+                self._initial_chain_hash
+                if seq == 0 and self._initial_chain_hash != _GENESIS_CHAIN_HEX
+                else None
+            )
             entry = ReceiptLogEntry(
                 seq=seq,
                 receipt=signed,
@@ -225,6 +351,7 @@ class ReceiptLogWriter:
                 leaf_sha256=proof.leaf_sha256,
                 chain_sha256=chain_sha,
                 merkle_root=proof.root_sha256,
+                prev_chain_sha256=prev_anchor,
                 aer1=signed.to_aer1() if self._include_aer1 else None,
             )
             serialized = json.dumps(
@@ -235,6 +362,9 @@ class ReceiptLogWriter:
             with self.log_path.open("a", encoding="utf-8") as handle:
                 handle.write(serialized + "\n")
                 handle.flush()
+                with contextlib.suppress(OSError):
+                    os.fsync(handle.fileno())
+            self._synced_lines += 1
             return entry
 
 
@@ -243,6 +373,8 @@ def verify_receipt_log_file(
     *,
     expected_pubkey_hex: str | None = None,
     pubkey_file: Path | str | None = None,
+    expected_session_id: str | None = None,
+    prev_log_path: Path | str | None = None,
 ) -> ReceiptLogVerification:
     """Verify Ed25519 signatures, sequential hash links, and Merkle roots in a JSONL log."""
     pinned_hex: str | None = None
@@ -256,9 +388,22 @@ def verify_receipt_log_file(
             raise ProvenanceError("Conflicting expected_pubkey_hex and pubkey_file values.")
         pinned_hex = norm
 
+    expected_prev_chain: str | None = None
+    if prev_log_path is not None:
+        prev_verified = verify_receipt_log_file(prev_log_path)
+        if prev_verified.entry_count == 0:
+            raise MerkleTamperError("prev_log_path cannot be empty when verifying rotation link.")
+        expected_prev_chain = prev_verified.head_chain_hash
+
     path = Path(log_path)
     raw_lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     if not raw_lines:
+        if expected_prev_chain is not None:
+            raise MerkleTamperError("Rotated receipt log is empty and lacks prev_chain_sha256.")
+        if expected_session_id is not None:
+            raise ProvenanceError(
+                f"Receipt log is empty; expected session_id={expected_session_id!r}."
+            )
         empty_log = MerkleReceiptLog()
         return ReceiptLogVerification(
             entry_count=0,
@@ -267,6 +412,8 @@ def verify_receipt_log_file(
             public_key_hex=pinned_hex or "",
             key_pinned=pinned_hex is not None,
             receipts=(),
+            session_id="",
+            prev_chain_sha256=_GENESIS_CHAIN_HEX,
         )
 
     entries: list[ReceiptLogEntry] = []
@@ -284,18 +431,35 @@ def verify_receipt_log_file(
     if len(pub_bytes) != 32:
         raise SignatureTamperError("Ed25519 public key must be 32 bytes.")
 
+    init_chain = entries[0].prev_chain_sha256 or _GENESIS_CHAIN_HEX
+    if expected_prev_chain is not None and init_chain != expected_prev_chain:
+        raise MerkleTamperError(
+            f"Rotation chain link mismatch: log prev_chain_sha256={init_chain!r} "
+            f"!= predecessor head_chain_hash={expected_prev_chain!r}."
+        )
+
     gate = ProvenanceGate({Provenance.TOOL_VERIFIED: pub_bytes})
-    merkle = MerkleReceiptLog(gate=gate)
+    merkle = MerkleReceiptLog(gate=gate, initial_chain_hash=init_chain)
+    log_session_id = entries[0].receipt.session_id
 
     for idx, entry in enumerate(entries):
         if entry.seq != idx:
             raise MerkleTamperError(
                 f"Receipt sequence gap or reordering at index {idx}: found seq={entry.seq}."
             )
+        if idx > 0 and entry.prev_chain_sha256 is not None:
+            raise MerkleTamperError(
+                f"Unexpected prev_chain_sha256 on non-initial entry at seq={idx}."
+            )
         if entry.public_key_hex.strip().lower() != active_pub_hex:
             raise SignatureTamperError(
                 f"Public key mismatch at seq={idx}: expected {active_pub_hex}, "
                 f"got {entry.public_key_hex}."
+            )
+        if expected_session_id is not None and entry.receipt.session_id != expected_session_id:
+            raise ProvenanceError(
+                f"Session mismatch at seq={idx}: expected {expected_session_id!r}, "
+                f"got {entry.receipt.session_id!r}."
             )
         chain_sha = merkle.append(entry.receipt)
         proof = merkle.inclusion_proof(idx)
@@ -313,6 +477,8 @@ def verify_receipt_log_file(
         public_key_hex=active_pub_hex,
         key_pinned=pinned_hex is not None,
         receipts=merkle.receipts,
+        session_id=log_session_id,
+        prev_chain_sha256=init_chain,
     )
 
 
@@ -494,6 +660,8 @@ def run_mcp_stdio_proxy(
     pubkey_out: Path | str | None = None,
     truncate_log: bool = False,
     include_aer1: bool = False,
+    session_id: str | None = None,
+    prev_log_path: Path | str | None = None,
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -507,6 +675,8 @@ def run_mcp_stdio_proxy(
         signer,
         truncate=truncate_log,
         include_aer1=include_aer1,
+        session_id=session_id,
+        prev_log_path=prev_log_path,
     )
     proxy = McpStdioProxy(writer)
 

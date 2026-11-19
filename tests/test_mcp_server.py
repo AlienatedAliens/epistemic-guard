@@ -269,3 +269,148 @@ def test_mcp_server_inspect_receipt_and_merkle_proof(tmp_path: Path) -> None:
     assert isinstance(oob_resp, dict)
     assert oob_resp["result"]["isError"] is True
     assert "structuredContent" not in oob_resp["result"]
+
+
+def test_mcp_server_verify_narration_signature_pinning_session_and_freshness(
+    tmp_path: Path,
+) -> None:
+    pub_path = tmp_path / "pinned.pub.json"
+    signer = load_or_create_mcp_signer(pubkey_out=pub_path)
+    pub_hex = signer.public_key_bytes.hex()
+
+    signed_rcpt = signer.sign_receipt(
+        ToolReceipt(
+            call_id="c-live-1",
+            tool="write_file",
+            ok=True,
+            executed=True,
+            args={"path": "report.md"},
+            output="wrote report.md",
+            session_id="sess-live-1",
+        )
+    )
+
+    srv = EpistemicGuardMcpServer()
+
+    # 1. Validly signed, matching session, fresh timestamp -> is_valid=True, signature_verified=True
+    ok_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_narration",
+                "arguments": {
+                    "narration": "I saved the report to report.md.",
+                    "receipts": [signed_rcpt.model_dump(mode="json")],
+                    "expected_pubkey_hex": pub_hex,
+                    "expected_session_id": "sess-live-1",
+                    "max_receipt_age_seconds": 300,
+                },
+            },
+        }
+    )
+    assert isinstance(ok_resp, dict)
+    assert ok_resp["result"]["isError"] is False
+    ok_body = ok_resp["result"]["structuredContent"]
+    assert ok_body["is_valid"] is True
+    assert ok_body["signature_verified"] is True
+
+    # 2. Unsigned receipt when expected_pubkey_hex is pinned -> isError=True
+    unsigned_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_narration",
+                "arguments": {
+                    "narration": "I saved the report to report.md.",
+                    "receipts": [{"tool": "write_file", "ok": True, "args": {"path": "report.md"}}],
+                    "expected_pubkey_hex": pub_hex,
+                },
+            },
+        }
+    )
+    assert isinstance(unsigned_resp, dict)
+    assert unsigned_resp["result"]["isError"] is True
+
+    # 3. Wrong session_id -> isError=True
+    wrong_sess_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_narration",
+                "arguments": {
+                    "narration": "I saved the report to report.md.",
+                    "receipts": [signed_rcpt.model_dump(mode="json")],
+                    "expected_pubkey_hex": pub_hex,
+                    "expected_session_id": "sess-other",
+                },
+            },
+        }
+    )
+    assert isinstance(wrong_sess_resp, dict)
+    assert wrong_sess_resp["result"]["isError"] is True
+
+    # 4. Stale replayed receipt (expired timestamp_utc) -> isError=True
+    stale_rcpt = signer.sign_receipt(
+        ToolReceipt(
+            call_id="c-old",
+            tool="write_file",
+            ok=True,
+            args={"path": "report.md"},
+            output="ok",
+            session_id="sess-live-1",
+            timestamp_utc="2020-01-01T00:00:00+00:00",
+        )
+    )
+    stale_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_narration",
+                "arguments": {
+                    "narration": "I saved the report to report.md.",
+                    "receipts": [stale_rcpt.model_dump(mode="json")],
+                    "expected_pubkey_hex": pub_hex,
+                    "max_receipt_age_seconds": 60,
+                },
+            },
+        }
+    )
+    assert isinstance(stale_resp, dict)
+    assert stale_resp["result"]["isError"] is True
+
+    # 5. inspect_receipt with since_seq + expected_session_id slices only current turn
+    turn_log = tmp_path / "turns.jsonl"
+    writer = ReceiptLogWriter(turn_log, signer, session_id="sess-turns")
+    writer.append(ToolReceipt(call_id="t0", tool="delete_file", ok=True, output="deleted"))
+    writer.append(ToolReceipt(call_id="t1", tool="write_file", ok=True, output="wrote"))
+
+    slice_resp = srv.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 34,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect_receipt",
+                "arguments": {
+                    "log_path": str(turn_log),
+                    "pubkey_file": str(pub_path),
+                    "expected_session_id": "sess-turns",
+                    "since_seq": 1,
+                },
+            },
+        }
+    )
+    assert isinstance(slice_resp, dict)
+    assert slice_resp["result"]["isError"] is False
+    slice_body = slice_resp["result"]["structuredContent"]
+    assert slice_body["match_count"] == 1
+    assert slice_body["entries"][0]["seq"] == 1
+    assert slice_body["entries"][0]["receipt"]["call_id"] == "t1"

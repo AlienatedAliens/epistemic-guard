@@ -51,7 +51,7 @@ def canonical_envelope_bytes(payload: UnsignedPayload) -> bytes:
 def canonical_receipt_bytes(receipt: ToolReceipt) -> bytes:
     """Serialize a `ToolReceipt` (excluding `signature`) deterministically for signing."""
     live_out_sha = hashlib.sha256(receipt.output.encode("utf-8")).hexdigest()
-    canonical = {
+    canonical: dict[str, object] = {
         "call_id": receipt.call_id,
         "tool": receipt.tool,
         "ok": receipt.ok,
@@ -61,6 +61,8 @@ def canonical_receipt_bytes(receipt: ToolReceipt) -> bytes:
         "output_sha256": live_out_sha,
         "timestamp_utc": receipt.timestamp_utc,
     }
+    if receipt.session_id:
+        canonical["session_id"] = receipt.session_id
     return json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 

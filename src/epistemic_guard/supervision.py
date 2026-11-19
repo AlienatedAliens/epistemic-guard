@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
@@ -15,8 +16,10 @@ import numpy as np
 import openvino as ov
 from tokenizers import Tokenizer
 
+from epistemic_guard.exceptions import ProvenanceError
 from epistemic_guard.hazard import split_into_clauses_with_spans
 from epistemic_guard.models import resolve_managed_model_dir
+from epistemic_guard.provenance import ProvenanceGate
 from epistemic_guard.schemas import (
     StructuredActionTag,
     SupervisionVerdict,
@@ -400,6 +403,44 @@ def parse_structured_action_tags(
     return tags
 
 
+def _validate_receipt_authenticity(
+    receipts: Sequence[ToolReceipt],
+    *,
+    gate: ProvenanceGate | None,
+    expected_session_id: str | None,
+    max_receipt_age_seconds: float | None,
+) -> None:
+    if gate is None and expected_session_id is None and max_receipt_age_seconds is None:
+        return
+    now_utc = datetime.now(UTC)
+    for idx, rcpt in enumerate(receipts):
+        if gate is not None:
+            gate.verify_receipt(rcpt)
+        if expected_session_id is not None and rcpt.session_id != expected_session_id:
+            raise ProvenanceError(
+                f"Receipt[{idx}] ('{rcpt.tool}') session_id={rcpt.session_id!r} "
+                f"does not match expected_session_id={expected_session_id!r}."
+            )
+        if max_receipt_age_seconds is not None:
+            if max_receipt_age_seconds <= 0:
+                raise ValueError("max_receipt_age_seconds must be positive.")
+            try:
+                parsed_ts = datetime.fromisoformat(rcpt.timestamp_utc.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ProvenanceError(
+                    f"Receipt[{idx}] ('{rcpt.tool}') has invalid timestamp_utc: "
+                    f"{rcpt.timestamp_utc!r}."
+                ) from exc
+            if parsed_ts.tzinfo is None:
+                parsed_ts = parsed_ts.replace(tzinfo=UTC)
+            age_s = (now_utc - parsed_ts.astimezone(UTC)).total_seconds()
+            if age_s > max_receipt_age_seconds or age_s < -30.0:
+                raise ProvenanceError(
+                    f"Receipt[{idx}] ('{rcpt.tool}') age {age_s:.1f}s outside allowed window "
+                    f"[-30.0s, {max_receipt_age_seconds:.1f}s]."
+                )
+
+
 class ReceiptSupervisor:
     """Verifies assistant clauses against `ToolReceipt` records on CPU/GPU/NPU."""
 
@@ -414,11 +455,17 @@ class ReceiptSupervisor:
         verify_hashes: bool = False,
         require_neural: bool = False,
         warn_on_missing: bool = True,
+        gate: ProvenanceGate | None = None,
+        expected_session_id: str | None = None,
+        max_receipt_age_seconds: float | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self.claim_threshold = claim_threshold
         self.flag_unfulfilled_promises = flag_unfulfilled_promises
         self.allow_creative_context = allow_creative_context
+        self.gate = gate
+        self.expected_session_id = expected_session_id
+        self.max_receipt_age_seconds = max_receipt_age_seconds
         self.available = False
         self.active_device = "DETERMINISTIC_CPU"
         self._tokenizer: Tokenizer | None = None
@@ -588,9 +635,27 @@ class ReceiptSupervisor:
         user_prompt: str = "",
         base_char_offset: int = 0,
         allow_creative_context: bool | None = None,
+        gate: ProvenanceGate | None = None,
+        expected_session_id: str | None = None,
+        max_receipt_age_seconds: float | None = None,
     ) -> SupervisionVerdict:
         """Verify an assistant message against executed `ToolReceipt` records."""
         t0 = time.perf_counter()
+        active_gate = self.gate if gate is None else gate
+        active_session = (
+            self.expected_session_id if expected_session_id is None else expected_session_id
+        )
+        active_max_age = (
+            self.max_receipt_age_seconds
+            if max_receipt_age_seconds is None
+            else max_receipt_age_seconds
+        )
+        _validate_receipt_authenticity(
+            receipts,
+            gate=active_gate,
+            expected_session_id=active_session,
+            max_receipt_age_seconds=active_max_age,
+        )
         structured = parse_structured_action_tags(narration, receipts)
         unsupported_claims: list[str] = []
         unsupported_spans: list[UnsupportedClaimSpan] = []

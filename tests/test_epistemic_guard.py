@@ -777,3 +777,85 @@ def test_pre_dispatch_rejections_retry_audit_and_aer1_interop() -> None:
     assert roundtrip_rej.error_code == "invalid_tool_arguments"
     assert roundtrip_rej.args == {"content": "the old staging database was deleted"}
 
+
+def test_otel_span_evidence_export_and_recorder_hook() -> None:
+    from epistemic_guard import (
+        SupportsOtelSpan,
+        attach_otel_evidence,
+        load_or_create_mcp_signer,
+        receipt_to_otel_attributes,
+    )
+
+    class DummyOtelSpan:
+        def __init__(self) -> None:
+            self.attributes: dict[str, str | int | float | bool] = {}
+            self.events: list[tuple[str, dict[str, str | int | float | bool]]] = []
+
+        def set_attribute(self, key: str, value: str | int | float | bool) -> None:
+            self.attributes[key] = value
+
+        def add_event(
+            self,
+            name: str,
+            attributes: dict[str, str | int | float | bool] | None = None,
+        ) -> None:
+            self.events.append((name, dict(attributes or {})))
+
+    span = DummyOtelSpan()
+    assert isinstance(span, SupportsOtelSpan)
+
+    signer = load_or_create_mcp_signer()
+    gate = ProvenanceGate({Provenance.TOOL_VERIFIED: signer.public_key_bytes})
+    merkle = MerkleReceiptLog(gate=gate)
+    recorder = ReceiptRecorder(
+        signer=signer,
+        merkle_log=merkle,
+        session_id="sess-otel-9",
+        otel_span=span,
+    )
+
+    @recorder.tool
+    def write_file(path: str, content: str) -> str:
+        return f"wrote {len(content)} chars to {path}"
+
+    res = write_file("audit.txt", "hello")
+    assert "wrote 5 chars" in res
+    assert len(recorder.receipts) == 1
+    assert recorder.receipts[0].session_id == "sess-otel-9"
+    assert len(span.events) == 1
+    ev_name, ev_attrs = span.events[0]
+    assert ev_name == "epistemic_guard.receipt"
+    assert ev_attrs["epistemic_guard.receipt.tool"] == "write_file"
+    assert ev_attrs["epistemic_guard.receipt.signed"] is True
+    assert ev_attrs["epistemic_guard.receipt.session_id"] == "sess-otel-9"
+    assert str(ev_attrs["epistemic_guard.receipt.aer1_output_hash"]).startswith("sha256:")
+
+    sup = ReceiptSupervisor(
+        device="CPU",
+        warn_on_missing=False,
+        gate=gate,
+        expected_session_id="sess-otel-9",
+        max_receipt_age_seconds=120.0,
+    )
+    verdict = sup.verify_narration(
+        "I saved hello to audit.txt.",
+        receipts=recorder.receipts,
+    )
+    assert verdict.is_valid is True
+
+    stamped = attach_otel_evidence(
+        span,
+        receipts=recorder.receipts,
+        verdict=verdict,
+        merkle_root=merkle.merkle_root(),
+        session_id=recorder.session_id,
+        record_events=False,
+    )
+    assert stamped["epistemic_guard.narration.is_valid"] is True
+    assert span.attributes["epistemic_guard.merkle_root"] == merkle.merkle_root()
+    assert span.attributes["epistemic_guard.session_id"] == "sess-otel-9"
+    assert span.attributes["epistemic_guard.receipt_count"] == 1
+    assert span.attributes["epistemic_guard.signed_receipt_count"] == 1
+    rcpt_attrs = receipt_to_otel_attributes(recorder.receipts[0])
+    assert rcpt_attrs["epistemic_guard.receipt.call_id"] == recorder.receipts[0].call_id
+

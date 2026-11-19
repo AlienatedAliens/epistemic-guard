@@ -59,7 +59,7 @@ def _cmd_doctor() -> int:
 
 
 def _cmd_demo() -> int:
-    print("epistemic-guard v0.4.3 — Live Verification Demo")
+    print("epistemic-guard v0.5.0 — Live Verification Demo")
     print("=" * 68)
 
     master_key = os.urandom(32)
@@ -202,6 +202,8 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             pubkey_out=args.pubkey_out,
             truncate_log=args.truncate,
             include_aer1=args.aer1,
+            session_id=args.session_id,
+            prev_log_path=args.prev_log,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
@@ -214,6 +216,8 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             args.log_path,
             expected_pubkey_hex=args.pubkey,
             pubkey_file=args.pubkey_file,
+            expected_session_id=args.session_id,
+            prev_log_path=args.prev_log,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         if args.json:
@@ -235,6 +239,8 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                         "entry_count": verified.entry_count,
                         "merkle_root": verified.merkle_root,
                         "head_chain_hash": verified.head_chain_hash,
+                        "prev_chain_sha256": verified.prev_chain_sha256,
+                        "session_id": verified.session_id,
                         "public_key_hex": verified.public_key_hex,
                         "key_pinned": verified.key_pinned,
                     },
@@ -249,10 +255,12 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             )
         return 0
 
+    since_seq = max(0, int(args.since_seq))
+    active_receipts = verified.receipts[since_seq:]
     sup = ReceiptSupervisor(device=args.device, warn_on_missing=False)
     verdict = sup.verify_narration(
         narration_text,
-        receipts=verified.receipts,
+        receipts=active_receipts,
         user_prompt=args.prompt or "",
     )
     if args.json:
@@ -267,7 +275,7 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                     "device": verdict.device,
                     "unsupported_claims": list(verdict.unsupported_claims),
                     "retry_prompt": (
-                        "" if verdict.is_valid else verdict.to_retry_prompt(verified.receipts)
+                        "" if verdict.is_valid else verdict.to_retry_prompt(active_receipts)
                     ),
                 },
                 sort_keys=True,
@@ -275,7 +283,7 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
         )
     elif verdict.is_valid:
         print(
-            f"OK: {verified.entry_count} receipt(s) verified; assistant narration grounded "
+            f"OK: {len(active_receipts)} receipt(s) verified; assistant narration grounded "
             f"(device={verdict.device})."
         )
     else:
@@ -283,7 +291,7 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             f"NARRATION UNGROUNDED ({len(verdict.unsupported_spans)} span(s) flagged):",
             file=sys.stderr,
         )
-        print(verdict.to_retry_prompt(verified.receipts), file=sys.stderr)
+        print(verdict.to_retry_prompt(active_receipts), file=sys.stderr)
     return 0 if verdict.is_valid else 1
 
 
@@ -341,6 +349,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Include an exported AER-1 envelope alongside each native ToolReceipt",
     )
     mp.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional session identifier bound into each signed ToolReceipt",
+    )
+    mp.add_argument(
+        "--prev-log",
+        default=None,
+        help="Optional predecessor JSONL log path to chain-link across key rotation",
+    )
+    mp.add_argument(
         "server_cmd",
         nargs=argparse.REMAINDER,
         help="Target MCP server command and arguments (place after '--')",
@@ -353,6 +371,22 @@ def main(argv: list[str] | None = None) -> int:
     vl.add_argument("log_path", help="Path to JSONL receipt log produced by mcp-proxy")
     vl.add_argument("--pubkey", default=None, help="Expected 64-char hex Ed25519 public key")
     vl.add_argument("--pubkey-file", default=None, help="Path to public key file (--pubkey-out)")
+    vl.add_argument(
+        "--session-id",
+        default=None,
+        help="Expected session_id bound inside every signed receipt",
+    )
+    vl.add_argument(
+        "--prev-log",
+        default=None,
+        help="Predecessor JSONL log path to verify key-rotation hash-chain continuity",
+    )
+    vl.add_argument(
+        "--since-seq",
+        type=int,
+        default=0,
+        help="Minimum receipt sequence index (inclusive) allowed to ground --narration",
+    )
     vl.add_argument(
         "--narration",
         default=None,

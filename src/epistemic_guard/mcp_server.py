@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Mapping, Sequence
-from typing import BinaryIO, Final
+from typing import Any, BinaryIO, Final
 
 from epistemic_guard.corroboration import corroborate_sources
-from epistemic_guard.exceptions import EpistemicGuardError
-from epistemic_guard.mcp_proxy import verify_receipt_log_file
-from epistemic_guard.schemas import ToolReceipt
+from epistemic_guard.exceptions import EpistemicGuardError, ProvenanceError
+from epistemic_guard.mcp_proxy import read_public_key_file, verify_receipt_log_file
+from epistemic_guard.provenance import ProvenanceGate
+from epistemic_guard.schemas import Provenance, ToolReceipt
 from epistemic_guard.store import MerkleReceiptLog
 from epistemic_guard.supervision import ReceiptSupervisor
 
@@ -18,7 +19,7 @@ _DEFAULT_PROTOCOL_VERSION: Final[str] = "2024-11-05"
 _SUPPORTED_PROTOCOLS: Final[frozenset[str]] = frozenset(
     {"2024-11-05", "2025-03-26", "2025-06-18"}
 )
-_SERVER_VERSION: Final[str] = "0.4.3"
+_SERVER_VERSION: Final[str] = "0.5.0"
 
 MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
@@ -27,11 +28,12 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
             "Audit an assistant draft reply clause-by-clause against in-memory turn receipts "
             "to flag fabricated tool-action claims, unlike verify_receipt_log and inspect_receipt "
             "which read on-disk JSONL logs. Call before sending a tool-using reply (pass "
-            "receipts=[] when zero tools ran to reject any claimed side effects); do not use for "
-            "RAG citation checking (use corroborate_sources) or log-file cryptography. Runs "
-            "offline with zero network calls: ungrounded claims return is_valid=false with "
-            "character offsets and retry_prompt rather than raising an error, whereas malformed "
-            "receipt objects return isError=true."
+            "receipts=[] when zero tools ran, and pass expected_pubkey_hex or expected_session_id "
+            "to reject unsigned or replayed receipts); do not use for RAG citation checking (use "
+            "corroborate_sources) or log-file cryptography. Runs offline with zero network calls: "
+            "ungrounded claims return is_valid=false with character offsets and retry_prompt "
+            "rather than raising an error, whereas malformed, forged, or expired receipts return "
+            "isError=true."
         ),
         "annotations": {
             "title": "Verify Assistant Narration Against Tool Receipts",
@@ -86,6 +88,34 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                                 "type": "string",
                                 "description": "Short summary or return payload from the tool.",
                             },
+                            "output_sha256": {
+                                "type": "string",
+                                "description": (
+                                    "Optional 64-char hex SHA-256 digest of output (auto-computed "
+                                    "if omitted)."
+                                ),
+                            },
+                            "timestamp_utc": {
+                                "type": "string",
+                                "description": (
+                                    "Optional ISO-8601 UTC mint timestamp checked by "
+                                    "max_receipt_age_seconds."
+                                ),
+                            },
+                            "session_id": {
+                                "type": "string",
+                                "description": (
+                                    "Optional proxy session identifier checked by "
+                                    "expected_session_id."
+                                ),
+                            },
+                            "signature": {
+                                "type": "string",
+                                "description": (
+                                    "Optional 128-char hex Ed25519 signature checked when "
+                                    "expected_pubkey_hex or pubkey_file is supplied."
+                                ),
+                            },
                         },
                         "required": ["tool"],
                         "additionalProperties": True,
@@ -94,6 +124,30 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 "user_prompt": {
                     "type": "string",
                     "description": "Optional user prompt for conversational context.",
+                },
+                "expected_pubkey_hex": {
+                    "type": "string",
+                    "description": (
+                        "Optional pinned 64-char hex Ed25519 public key; when set, every receipt "
+                        "must carry a valid Ed25519 signature."
+                    ),
+                },
+                "pubkey_file": {
+                    "type": "string",
+                    "description": "Optional path to a pinned Ed25519 public key JSON or hex file.",
+                },
+                "expected_session_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional proxy session identifier; rejects receipts from other sessions."
+                    ),
+                },
+                "max_receipt_age_seconds": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": (
+                        "Optional freshness window in seconds; rejects stale or replayed receipts."
+                    ),
                 },
             },
             "required": ["narration", "receipts"],
@@ -105,6 +159,10 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 "is_valid": {
                     "type": "boolean",
                     "description": "True when every action claim is backed by a receipt.",
+                },
+                "signature_verified": {
+                    "type": "boolean",
+                    "description": "True when receipts were verified against a pinned Ed25519 key.",
                 },
                 "device": {
                     "type": "string",
@@ -152,6 +210,7 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
             },
             "required": [
                 "is_valid",
+                "signature_verified",
                 "device",
                 "latency_ms",
                 "unsupported_claims",
@@ -165,14 +224,13 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
         "name": "verify_receipt_log",
         "description": (
             "Validate whole-file cryptographic integrity of an on-disk JSONL receipt log written "
-            "by epistemic-guard mcp-proxy, returning aggregate chain and Merkle root status "
-            "rather than individual entries (use inspect_receipt to fetch entries). Call in CI "
-            "gates or post-session audits; do not use to check assistant prose (use "
+            "by epistemic-guard mcp-proxy, returning aggregate chain, session, and Merkle root "
+            "status rather than individual entries (use inspect_receipt to fetch entries). Call "
+            "in CI gates or post-session audits; do not use to check assistant prose (use "
             "verify_narration) or mint receipts (signing is confined to the isolated mcp-proxy "
-            "parent process). Passing both pubkey_file and expected_pubkey_hex requires them to "
-            "encode the identical 32-byte key (omitting both checks self-consistency against "
-            "entry 0), and any missing file, key conflict, sequence gap, or tampered digest "
-            "returns isError=true naming the failing seq."
+            "parent process). Passing both pubkey_file and expected_pubkey_hex requires identical "
+            "32-byte keys (prev_log_path verifies key-rotation chain continuity), and any missing "
+            "file, key/session mismatch, sequence gap, or tampered digest returns isError=true."
         ),
         "annotations": {
             "title": "Verify Signed MCP Merkle Receipt Log",
@@ -195,6 +253,17 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 "pubkey_file": {
                     "type": "string",
                     "description": "Optional path to a pinned public key JSON or hex file.",
+                },
+                "expected_session_id": {
+                    "type": "string",
+                    "description": "Optional expected session_id bound into each signed receipt.",
+                },
+                "prev_log_path": {
+                    "type": "string",
+                    "description": (
+                        "Optional predecessor JSONL log path to verify key-rotation hash-chain "
+                        "continuity."
+                    ),
                 },
             },
             "required": ["log_path"],
@@ -219,6 +288,16 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                     "type": "string",
                     "description": "Hex-encoded cumulative sequential SHA-256 chain tip.",
                 },
+                "prev_chain_sha256": {
+                    "type": "string",
+                    "description": (
+                        "Initial 64-char chain anchor (0*64 or rotated predecessor tip)."
+                    ),
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Session identifier bound inside the verified receipts.",
+                },
                 "public_key_hex": {
                     "type": "string",
                     "description": (
@@ -235,6 +314,8 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 "entry_count",
                 "merkle_root",
                 "head_chain_hash",
+                "prev_chain_sha256",
+                "session_id",
                 "public_key_hex",
                 "key_pinned",
             ],
@@ -246,13 +327,13 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
         "description": (
             "Retrieve individual signed receipt records, standalone RFC 6962 Merkle inclusion "
             "proofs, and optional AER-1 envelopes from an on-disk JSONL receipt log, whereas "
-            "verify_receipt_log returns only a whole-log summary. Call when auditing a specific "
-            "tool invocation or exporting portable inclusion proofs; do not use for a fast "
-            "whole-file pass/fail check (use verify_receipt_log) or assistant reply checking (use "
-            "verify_narration). Cryptographically verifies the entire log before returning data: "
-            "filters seq, call_id, and tool combine via logical AND (omitting all three lists "
-            "from seq=0 truncated to limit), while a missing/tampered file, key mismatch, or "
-            "out-of-range seq returns isError=true."
+            "verify_receipt_log returns only a whole-log summary. Call when auditing specific "
+            "tool invocations, slicing current-turn receipts via since_seq, or exporting portable "
+            "proofs; do not use for a fast whole-file summary (use verify_receipt_log) or prose "
+            "checking (use verify_narration). Cryptographically verifies the entire log before "
+            "returning data: filters seq, since_seq, call_id, and tool combine via logical AND, "
+            "while a missing/tampered file, key/session mismatch, or out-of-range seq returns "
+            "isError=true."
         ),
         "annotations": {
             "title": "Inspect Signed Receipt and Merkle Inclusion Proof",
@@ -273,6 +354,13 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                     "minimum": 0,
                     "description": "Optional exact zero-based log sequence index to retrieve.",
                 },
+                "since_seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional minimum zero-based sequence index (inclusive) for turn slicing."
+                    ),
+                },
                 "call_id": {
                     "type": "string",
                     "description": "Optional exact tool call identifier to filter by.",
@@ -288,6 +376,16 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 "pubkey_file": {
                     "type": "string",
                     "description": "Optional path to a pinned public key JSON or hex file.",
+                },
+                "expected_session_id": {
+                    "type": "string",
+                    "description": "Optional expected session_id bound inside each signed receipt.",
+                },
+                "prev_log_path": {
+                    "type": "string",
+                    "description": (
+                        "Optional predecessor JSONL log path to verify key-rotation continuity."
+                    ),
                 },
                 "include_aer1": {
                     "type": "boolean",
@@ -574,18 +672,47 @@ def _parse_receipts(raw_items: object) -> list[ToolReceipt]:
         exec_raw = item.get("executed", True)
         err_raw = item.get("error_code", "")
         out_raw = item.get("output", "")
-        parsed.append(
-            ToolReceipt(
-                call_id=call_id,
-                tool=tool_name,
-                ok=bool(ok_raw),
-                executed=bool(exec_raw),
-                error_code=str(err_raw) if err_raw is not None else "",
-                args=_coerce_receipt_args(item.get("args")),
-                output=str(out_raw) if out_raw is not None else "",
-            )
-        )
+        out_sha_raw = item.get("output_sha256", "")
+        sig_raw = item.get("signature", "")
+        sess_raw = item.get("session_id", "")
+        ts_raw = item.get("timestamp_utc")
+        rcpt_kwargs: dict[str, Any] = {
+            "call_id": call_id,
+            "tool": tool_name,
+            "ok": bool(ok_raw),
+            "executed": bool(exec_raw),
+            "error_code": str(err_raw) if err_raw is not None else "",
+            "args": _coerce_receipt_args(item.get("args")),
+            "output": str(out_raw) if out_raw is not None else "",
+            "output_sha256": str(out_sha_raw) if out_sha_raw is not None else "",
+            "session_id": str(sess_raw) if sess_raw is not None else "",
+            "signature": str(sig_raw) if sig_raw is not None else "",
+        }
+        if isinstance(ts_raw, str) and ts_raw.strip():
+            rcpt_kwargs["timestamp_utc"] = ts_raw
+        parsed.append(ToolReceipt(**rcpt_kwargs))
     return parsed
+
+
+def _resolve_pinned_gate(args: Mapping[str, object]) -> ProvenanceGate | None:
+    pubkey_raw = args.get("expected_pubkey_hex")
+    pubkey_hex = pubkey_raw.strip().lower() if isinstance(pubkey_raw, str) and pubkey_raw else None
+    pubkey_file_raw = args.get("pubkey_file")
+    file_hex = (
+        read_public_key_file(pubkey_file_raw)
+        if isinstance(pubkey_file_raw, str) and pubkey_file_raw.strip()
+        else None
+    )
+    if pubkey_hex is not None:
+        raw_bytes = bytes.fromhex(pubkey_hex)
+        if len(raw_bytes) != 32:
+            raise ProvenanceError("expected_pubkey_hex must decode to 32 bytes.")
+        if file_hex is not None and file_hex != pubkey_hex:
+            raise ProvenanceError("Conflicting expected_pubkey_hex and pubkey_file values.")
+        return ProvenanceGate({Provenance.TOOL_VERIFIED: raw_bytes})
+    if file_hex is not None:
+        return ProvenanceGate({Provenance.TOOL_VERIFIED: bytes.fromhex(file_hex)})
+    return None
 
 
 def _tool_result(payload: Mapping[str, object], *, is_error: bool = False) -> dict[str, object]:
@@ -736,15 +863,28 @@ class EpistemicGuardMcpServer:
         receipts = _parse_receipts(args.get("receipts", []))
         prompt_raw = args.get("user_prompt", "")
         user_prompt = prompt_raw if isinstance(prompt_raw, str) else ""
+        pinned_gate = _resolve_pinned_gate(args)
+        sess_raw = args.get("expected_session_id")
+        expected_sess = sess_raw if isinstance(sess_raw, str) and sess_raw.strip() else None
+        age_raw = args.get("max_receipt_age_seconds")
+        max_age: float | None = None
+        if age_raw is not None:
+            if isinstance(age_raw, bool) or not isinstance(age_raw, (int, float)) or age_raw <= 0:
+                raise ValueError("'max_receipt_age_seconds' must be a positive number.")
+            max_age = float(age_raw)
 
         verdict = self._get_supervisor().verify_narration(
             narration,
             receipts=receipts,
             user_prompt=user_prompt,
+            gate=pinned_gate,
+            expected_session_id=expected_sess,
+            max_receipt_age_seconds=max_age,
         )
         return _tool_result(
             {
                 "is_valid": verdict.is_valid,
+                "signature_verified": pinned_gate is not None,
                 "device": verdict.device,
                 "latency_ms": round(verdict.latency_ms, 3),
                 "unsupported_claims": list(verdict.unsupported_claims),
@@ -771,11 +911,17 @@ class EpistemicGuardMcpServer:
         pubkey_file = (
             pubkey_file_raw if isinstance(pubkey_file_raw, str) and pubkey_file_raw else None
         )
+        sess_raw = args.get("expected_session_id")
+        expected_sess = sess_raw if isinstance(sess_raw, str) and sess_raw.strip() else None
+        prev_raw = args.get("prev_log_path")
+        prev_log = prev_raw if isinstance(prev_raw, str) and prev_raw.strip() else None
 
         verified = verify_receipt_log_file(
             log_path,
             expected_pubkey_hex=pubkey_hex,
             pubkey_file=pubkey_file,
+            expected_session_id=expected_sess,
+            prev_log_path=prev_log,
         )
         return _tool_result(
             {
@@ -783,6 +929,8 @@ class EpistemicGuardMcpServer:
                 "entry_count": verified.entry_count,
                 "merkle_root": verified.merkle_root,
                 "head_chain_hash": verified.head_chain_hash,
+                "prev_chain_sha256": verified.prev_chain_sha256,
+                "session_id": verified.session_id,
                 "public_key_hex": verified.public_key_hex,
                 "key_pinned": verified.key_pinned,
             }
@@ -799,6 +947,13 @@ class EpistemicGuardMcpServer:
             if isinstance(seq_raw, bool) or not isinstance(seq_raw, int) or seq_raw < 0:
                 raise ValueError("'seq' must be a non-negative integer.")
             seq_filter = seq_raw
+
+        since_raw = args.get("since_seq")
+        since_filter = 0
+        if since_raw is not None:
+            if isinstance(since_raw, bool) or not isinstance(since_raw, int) or since_raw < 0:
+                raise ValueError("'since_seq' must be a non-negative integer.")
+            since_filter = since_raw
 
         limit_raw = args.get("limit", 20)
         if (
@@ -823,11 +978,17 @@ class EpistemicGuardMcpServer:
         pubkey_file = (
             pubkey_file_raw if isinstance(pubkey_file_raw, str) and pubkey_file_raw else None
         )
+        sess_raw = args.get("expected_session_id")
+        expected_sess = sess_raw if isinstance(sess_raw, str) and sess_raw.strip() else None
+        prev_raw = args.get("prev_log_path")
+        prev_log = prev_raw if isinstance(prev_raw, str) and prev_raw.strip() else None
 
         verified = verify_receipt_log_file(
             log_path,
             expected_pubkey_hex=pubkey_hex,
             pubkey_file=pubkey_file,
+            expected_session_id=expected_sess,
+            prev_log_path=prev_log,
         )
         if seq_filter is not None and seq_filter >= verified.entry_count:
             raise ValueError(
@@ -835,15 +996,19 @@ class EpistemicGuardMcpServer:
                 f"{verified.entry_count} entries."
             )
 
-        merkle = MerkleReceiptLog()
+        merkle = MerkleReceiptLog(initial_chain_hash=verified.prev_chain_sha256)
         for rcpt in verified.receipts:
             merkle.append(rcpt)
 
         candidate_indices = (
-            [seq_filter] if seq_filter is not None else list(range(verified.entry_count))
+            [seq_filter]
+            if seq_filter is not None
+            else list(range(since_filter, verified.entry_count))
         )
         entries_out: list[dict[str, object]] = []
         for idx in candidate_indices:
+            if idx < since_filter:
+                continue
             rcpt = verified.receipts[idx]
             if call_id_filter is not None and rcpt.call_id != call_id_filter:
                 continue

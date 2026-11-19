@@ -61,13 +61,16 @@ Verify the receipt log and check an assistant reply from any language or CI job:
 epistemic-guard verify-log /var/log/agent/receipts.jsonl \
   --pubkey-file /etc/agent-keys/mcp.pub.json
 
-# Also verify an assistant reply against those verified receipts (exit code 1 = ungrounded claim)
+# Also verify an assistant reply against current-turn receipts (exit code 1 = ungrounded claim)
 epistemic-guard verify-log /var/log/agent/receipts.jsonl \
   --pubkey-file /etc/agent-keys/mcp.pub.json \
+  --since-seq 12 \
   --narration "I saved the checklist to notes.txt; I also deleted staging.db." \
   --prompt "Save notes.txt and delete staging.db." \
   --json
 ```
+
+- **Multi-worker locking & key rotation:** Concurrent `mcp-proxy` workers sharing a `--log` file coordinate appends via OS-level exclusive file locks. When rotating Ed25519 keys across log segments, pass `--prev-log /var/log/agent/prev.jsonl` (and optional `--session-id`) on both `mcp-proxy` and `verify-log` to anchor the new log's genesis chain hash to the predecessor log tip.
 
 **Security boundary note:** If the untrusted agent process has filesystem write access to `--log`, always pass `--pubkey-file` (stored outside the agent's writable directory) when running `verify-log` so an attacker cannot replace the entire log file under a newly generated keypair.
 
@@ -126,6 +129,8 @@ print(verdict.unsupported_spans[0])
 print(verdict.to_retry_prompt(recorder.receipts))
 ```
 
+- **Signature pinning, session binding & freshness anti-replay:** Pass `gate=gate`, `expected_session_id="..."`, and `max_receipt_age_seconds=300` to `ReceiptSupervisor` (or `expected_pubkey_hex` / `expected_session_id` / `max_receipt_age_seconds` on MCP `verify_narration`) to reject unsigned, cross-session, or replayed receipts before supervision runs.
+- **OpenTelemetry & Langfuse observability export (zero extra deps):** Pass `otel_span=span` to `ReceiptRecorder` or call `attach_otel_evidence(span, receipts=recorder.receipts, verdict=verdict, merkle_root=merkle.merkle_root())` to stamp `AER-1` digests, Ed25519 signatures, Merkle roots, and supervision verdicts directly onto OTel / Langfuse traces.
 - **Streaming SSE / voice pipelines:** `sup.stream(receipts=...)` checks each clause as `.`, `!`, `?`, `;`, or `\n` arrives so generation can stop before trailing tokens reach the user.
 - **Router dispatch & AER-1 interop:** `recorder.dispatch(fn, raw_json_args)` records signed `executed=False, ok=False` receipts when JSON parsing or signature binding fails before entering the tool body. `ToolReceipt.from_aer1(...)` and `receipt.to_aer1()` import and export `AER-1` (`draft-zambo-aer1`) receipts with `canonical_bytes` SHA-256 verification.
 - **Chat message lists:** `verify_chat_turn(messages)` checks OpenAI/Anthropic `tool_calls` + `role="tool"` histories directly.

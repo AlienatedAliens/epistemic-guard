@@ -42,8 +42,25 @@ class MerkleInclusionProof:
 class MerkleReceiptLog:
     """Tamper-evident append-only `ToolReceipt` log with hash chaining and Merkle proofs."""
 
-    def __init__(self, gate: ProvenanceGate | None = None) -> None:
+    def __init__(
+        self,
+        gate: ProvenanceGate | None = None,
+        *,
+        initial_chain_hash: str | None = None,
+    ) -> None:
+        if initial_chain_hash is None:
+            init_chain = _GENESIS_CHAIN
+        else:
+            norm = initial_chain_hash.strip().lower()
+            if len(norm) != 64:
+                raise MerkleTamperError("initial_chain_hash must be a 64-character hex SHA-256.")
+            try:
+                bytes.fromhex(norm)
+            except ValueError as exc:
+                raise MerkleTamperError("initial_chain_hash must be valid hexadecimal.") from exc
+            init_chain = norm
         self._gate = gate
+        self._initial_chain_hash = init_chain
         self._receipts: list[ToolReceipt] = []
         self._leaf_hashes: list[bytes] = []
         self._chain_hashes: list[str] = []
@@ -56,8 +73,12 @@ class MerkleReceiptLog:
         return tuple(self._receipts)
 
     @property
+    def initial_chain_hash(self) -> str:
+        return self._initial_chain_hash
+
+    @property
     def head_chain_hash(self) -> str:
-        return self._chain_hashes[-1] if self._chain_hashes else _GENESIS_CHAIN
+        return self._chain_hashes[-1] if self._chain_hashes else self._initial_chain_hash
 
     def append(self, receipt: ToolReceipt) -> str:
         """Append a receipt (verifying its Ed25519 signature if a `ProvenanceGate` is attached)."""
@@ -135,7 +156,7 @@ class MerkleReceiptLog:
 
     def verify_integrity(self) -> bool:
         """Re-compute all leaf, chain, and signature invariants across the entire log."""
-        prev = _GENESIS_CHAIN.encode("ascii")
+        prev = self._initial_chain_hash.encode("ascii")
         for idx, rcpt in enumerate(self._receipts):
             if self._gate is not None:
                 self._gate.verify_receipt(rcpt)

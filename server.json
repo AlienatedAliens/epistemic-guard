@@ -3,7 +3,7 @@
   "name": "io.github.AlienatedAliens/epistemic-guard",
   "title": "epistemic-guard: Signed Tool Receipts & Verification",
   "description": "Verify agent tool claims against Ed25519 receipts and collapse syndicated RAG copies locally.",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "websiteUrl": "https://rollsolo.app/epistemic-guard",
   "repository": {
     "url": "https://github.com/AlienatedAliens/epistemic-guard",
@@ -15,7 +15,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "epistemic-guard",
-      "version": "0.4.3",
+      "version": "0.5.0",
       "runtimeHint": "uvx",
       "packageArguments": [
         {
