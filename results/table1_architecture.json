@@ -15,16 +15,16 @@
   "nli": 91.1,
   "web_evidence": 23.06
  },
- "package_version": "0.5.0",
+ "package_version": "0.5.1",
  "pinned_artifact_files": 16,
  "policy_table_cells": 12,
  "proof_standard_count": 4,
  "provenance_domain_count": 7,
- "shingle_window_words": 5,
+ "shingle_window_words": 4,
  "source_module_count": 15,
  "supported_mcp_protocols": 3,
  "test_file_count": 4,
- "test_function_count": 27,
+ "test_function_count": 31,
  "total_int8_unpacked_mb": 279.48,
  "provenance": {
   "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
@@ -36,19 +36,19 @@
   "inputs": [
    {
     "path": "pyproject.toml",
-    "sha256": "dc97456fcc1ea506caf63529d598e3919f96b74db83fb7613a5c5f06fae4d75e"
+    "sha256": "c24dc9cd0dab245df2c4b724765963623728050f2fe8534876cb31996281cef4"
    },
    {
     "path": "src/epistemic_guard/__init__.py",
-    "sha256": "e2f8b311d876dd15c5b710a66f8595448787ab05a945aa39a6cd79f097dca59b"
+    "sha256": "fa57bbcbf3e4dcd9b874dad4e42ffcb3fed66ee598e8a0a5c23bc0a2d61fc20e"
    },
    {
     "path": "src/epistemic_guard/cli.py",
-    "sha256": "c098ee78404dd57ebdf1c9bdb0937d6b6b55557073966abb5f15a86cd9cae580"
+    "sha256": "fac41dfed8801f2dd72544ec1c355a475c86cf3a16f113f27ed7b6092c28ccc4"
    },
    {
     "path": "src/epistemic_guard/corroboration.py",
-    "sha256": "01822bd0889da8fd931e87f8878660e98db3e1d0600ddc6cbdf713599a87eab0"
+    "sha256": "0269389a6cb9cf15b9a5138fabbaa458ff17207fafe4482fd949ec7d43e9ebf9"
    },
    {
     "path": "src/epistemic_guard/exceptions.py",
@@ -64,15 +64,15 @@
    },
    {
     "path": "src/epistemic_guard/mcp_proxy.py",
-    "sha256": "d1fd8b2ef351b7d38f5bf4f6e9cef251969ed45d0163ac68ad58f606ddd324e1"
+    "sha256": "1bf5f61ab95218472839c94715d4a3565ef032f541daf4c01c1297e91254d0e8"
    },
    {
     "path": "src/epistemic_guard/mcp_server.py",
-    "sha256": "dfd1cc8188b6120e1beb150e9d3dfd8b70887e85ca5e17acac45a79c8bcae593"
+    "sha256": "091bc2bc9e219375fb62f3b7fa6dc6e8708834d32ff48876cb21e39917703213"
    },
    {
     "path": "src/epistemic_guard/models.py",
-    "sha256": "04a909b7daf0f252c776b8754c5053ceb03d43a0d00b0222134032d89b15e625"
+    "sha256": "197630ab9b9725fd3f9f4a45f875145a5fba900dc8a9bf7d817c30e2015d282c"
    },
    {
     "path": "src/epistemic_guard/nli.py",
@@ -80,19 +80,19 @@
    },
    {
     "path": "src/epistemic_guard/provenance.py",
-    "sha256": "a4af607d14a7fec35cfad88a01cbebd3777768f6d89f2d5178dc3581f046ebaf"
+    "sha256": "472d967ac4542976fe0fb38481fb21d0d54b659af9bf375b61d0e41e356d9e81"
    },
    {
     "path": "src/epistemic_guard/schemas.py",
-    "sha256": "348904efe61c084c20c0dd5360c7baa262c3f782956fcbc598cd603dcf14bdbd"
+    "sha256": "1b3ea1ae3d2a9900611fa907c9e2e47f638b7db599deed1f4bf7892ca9fd67a3"
    },
    {
     "path": "src/epistemic_guard/store.py",
-    "sha256": "013e95ea8dc8ef9e82aaf9a98d03bd60c6eb8cc9ecc801d6e2e45d47f59dbff3"
+    "sha256": "0a63ce0263a92806a6e108aaf8a9e228c5ddca0be193ecaa1d58f89c6c80ba22"
    },
    {
     "path": "src/epistemic_guard/supervision.py",
-    "sha256": "c3429555b665c8e91c9900a7372f1c914202a8bbeca0fb724d574434e4698d98"
+    "sha256": "1dc7beefad0ade2a80d80674094a87fefae34dc3e1628892c3ae5c5fb231c222"
    },
    {
     "path": "src/epistemic_guard/web_filters.py",
@@ -104,19 +104,19 @@
    },
    {
     "path": "tests/test_epistemic_guard.py",
-    "sha256": "351d41927165cb4eae80a8572069f9a8e8a65906613745d75d1ea1678ce9ec90"
+    "sha256": "466f97ffef85d248b8ef40edb5b1ffb2eff0a291b293ca24ff743aff4190e2b8"
    },
    {
     "path": "tests/test_mcp_proxy.py",
-    "sha256": "4fca3110a3966042b8e601d2d180e5aa5f4363aeb950b22e73cf1ebdf553f4de"
+    "sha256": "3bbd7170812ca7c1d7a9943e0fb5a3127e33ba61bcb4d72a6b81fab459fa2c45"
    },
    {
     "path": "tests/test_mcp_server.py",
     "sha256": "89a87d36745b5c5f5984a67f72f4435cdb7b085bf65dc73a90fd91873f693ce5"
    }
   ],
-  "commit": "13ac202048ede5b1ce605b0d7ae31a0cc72b08a5",
-  "now": "2026-11-19T04:13:33+00:00",
+  "commit": "9ee2bdcba629a62b3740d1fea6cfbf9a22adb867",
+  "now": "2026-11-19T07:22:20+00:00",
   "osaudit": "0.7.0"
  }
 }
