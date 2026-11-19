@@ -282,6 +282,7 @@ for raw in sys.stdin:
         "executed_false_count": executed_false,
         "succeeded_ok_count": ok_true,
         "child_env_key_leaks": key_leaks,
+        "tampered_log_trials": 1,
         "tampered_log_rejected": tampered_rejected,
     }
 
@@ -428,12 +429,24 @@ def _bench_adversarial_replay_and_concurrency() -> dict[str, int | float]:
         except (ProvenanceError, SignatureTamperError, MerkleTamperError):
             replay_rejected = 1
 
-        # 2. Entry reordering / sequence swap attack
+        # 2. Active entry reordering + public SHA-256 chain/Merkle rehash attack
         raw_lines = log_path.read_text(encoding="utf-8").splitlines()
         reordered_path = tmp_dir / "reordered.jsonl"
-        swapped = list(raw_lines)
-        swapped[1], swapped[2] = swapped[2], swapped[1]
-        reordered_path.write_text("\n".join(swapped) + "\n", encoding="utf-8")
+        parsed_entries = [json.loads(ln) for ln in raw_lines if ln.strip()]
+        parsed_entries[1], parsed_entries[2] = parsed_entries[2], parsed_entries[1]
+        rehash_merkle = MerkleReceiptLog()
+        rebuilt: list[str] = []
+        for new_seq, item in enumerate(parsed_entries):
+            rcpt = ToolReceipt.model_validate(item["receipt"])
+            new_chain = rehash_merkle.append(rcpt)
+            proof = rehash_merkle.inclusion_proof(new_seq)
+            item["seq"] = new_seq
+            item["leaf_sha256"] = proof.leaf_sha256
+            item["chain_sha256"] = new_chain
+            item["merkle_root"] = proof.root_sha256
+            item.pop("prev_chain_sha256", None)
+            rebuilt.append(json.dumps(item, sort_keys=True, separators=(",", ":")))
+        reordered_path.write_text("\n".join(rebuilt) + "\n", encoding="utf-8")
         reorder_rejected = 0
         try:
             verify_receipt_log_file(reordered_path, pubkey_file=pub_path)

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -117,6 +119,7 @@ class ReceiptLogEntry(BaseModel):
     leaf_sha256: str
     chain_sha256: str
     merkle_root: str
+    entry_signature: str = ""
     prev_chain_sha256: str | None = None
     aer1: dict[str, object] | None = None
 
@@ -143,11 +146,13 @@ class _PendingToolCall:
 
 
 def _coerce_scalar(val: object) -> str | int | float | bool:
-    if isinstance(val, (str, int, float, bool)):
+    if isinstance(val, bool) or isinstance(val, (str, int)):
         return val
+    if isinstance(val, float):
+        return val if math.isfinite(val) else str(val)
     try:
-        return json.dumps(val, sort_keys=True, separators=(",", ":"))
-    except TypeError:
+        return json.dumps(val, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
         return str(val)
 
 
@@ -159,7 +164,7 @@ def _rpc_id_key(raw_id: object) -> tuple[str, str] | None:
     if isinstance(raw_id, str):
         return ("str", raw_id)
     if isinstance(raw_id, float):
-        return ("float", repr(raw_id))
+        return ("float", repr(raw_id)) if math.isfinite(raw_id) else None
     return None
 
 
@@ -185,6 +190,8 @@ def load_or_create_mcp_signer(
     """Load or create an isolated `TOOL_VERIFIED` Ed25519 signer for `mcp-proxy`."""
     if key_file is not None:
         kpath = Path(key_file)
+        if kpath.is_symlink():
+            raise ProvenanceError(f"Refusing symlinked key_file: {kpath}")
         if kpath.exists():
             seed = _decode_seed_bytes(kpath.read_bytes(), source=str(kpath))
         else:
@@ -198,6 +205,8 @@ def load_or_create_mcp_signer(
                 with contextlib.suppress(OSError):
                     os.chmod(kpath, 0o600)
             except FileExistsError:
+                if kpath.is_symlink():
+                    raise ProvenanceError(f"Refusing symlinked key_file: {kpath}") from None
                 seed = _decode_seed_bytes(kpath.read_bytes(), source=str(kpath))
     elif os.environ.get(_ENV_SIGNING_KEY_HEX):
         env_val = os.environ[_ENV_SIGNING_KEY_HEX].encode("ascii")
@@ -210,12 +219,25 @@ def load_or_create_mcp_signer(
 
     if pubkey_out is not None:
         ppath = Path(pubkey_out)
+        if ppath.is_symlink():
+            raise ProvenanceError(f"Refusing symlinked pubkey_out: {ppath}")
         ppath.parent.mkdir(parents=True, exist_ok=True)
         doc = {
             "provenance": Provenance.TOOL_VERIFIED.value,
             "public_key_hex": signer.public_key_bytes.hex(),
         }
-        ppath.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{ppath.name}.", suffix=".tmp", dir=str(ppath.parent)
+        )
+        tmp_p = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(doc, indent=2, allow_nan=False) + "\n")
+            os.replace(tmp_p, ppath)
+        except Exception:
+            with contextlib.suppress(OSError):
+                tmp_p.unlink()
+            raise
 
     return signer
 
@@ -240,6 +262,29 @@ def read_public_key_file(pubkey_file: Path | str) -> str:
     return key_bytes.hex()
 
 
+def _verify_embedded_aer1(aer1_doc: Mapping[str, object], receipt: ToolReceipt, seq: int) -> None:
+    parsed = ToolReceipt.from_aer1(aer1_doc)
+    expected_err = receipt.error_code or (
+        "invalid_tool_arguments"
+        if not receipt.executed
+        else ("execution_error" if not receipt.ok else "")
+    )
+    if (
+        parsed.tool != receipt.tool
+        or parsed.call_id != receipt.call_id
+        or parsed.ok != receipt.ok
+        or parsed.executed != receipt.executed
+        or parsed.error_code != expected_err
+        or parsed.args != receipt.args
+        or parsed.output != receipt.output
+        or parsed.output_sha256 != receipt.output_sha256
+        or parsed.session_id != receipt.session_id
+    ):
+        raise SignatureTamperError(
+            f"Embedded AER-1 envelope disagrees with signed ToolReceipt at seq={seq}."
+        )
+
+
 class ReceiptLogWriter:
     """Append-only JSONL writer maintaining an Ed25519 + RFC 6962 Merkle chain on disk."""
 
@@ -252,6 +297,7 @@ class ReceiptLogWriter:
         include_aer1: bool = False,
         session_id: str | None = None,
         prev_log_path: Path | str | None = None,
+        prev_pubkey_file: Path | str | None = None,
     ) -> None:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,7 +315,7 @@ class ReceiptLogWriter:
         )
         self._initial_chain_hash = _GENESIS_CHAIN_HEX
         if prev_log_path is not None:
-            prev_ver = verify_receipt_log_file(prev_log_path)
+            prev_ver = verify_receipt_log_file(prev_log_path, pubkey_file=prev_pubkey_file)
             if prev_ver.entry_count == 0:
                 raise ProvenanceError("prev_log_path cannot be an empty receipt log.")
             self._initial_chain_hash = prev_ver.head_chain_hash
@@ -278,6 +324,7 @@ class ReceiptLogWriter:
             gate=self._gate,
             initial_chain_hash=self._initial_chain_hash,
         )
+        self._seen_call_ids: set[str] = set()
         self._synced_lines = 0
 
         with _exclusive_log_lock(self.log_path):
@@ -339,19 +386,54 @@ class ReceiptLogWriter:
                             f"Existing receipt log session_id={existing_sess!r} conflicts with "
                             f"requested session_id={self._explicit_session_id!r}."
                         )
-                elif existing_sess:
+                else:
                     self._session_id = existing_sess
+            else:
+                if entry.prev_chain_sha256 is not None:
+                    raise MerkleTamperError(
+                        f"Unexpected prev_chain_sha256 on non-initial entry at seq={idx}."
+                    )
+                if entry.receipt.session_id != self._session_id:
+                    raise ProvenanceError(
+                        f"Session mismatch inside existing receipt log at seq={idx}: "
+                        f"expected {self._session_id!r}, got {entry.receipt.session_id!r}."
+                    )
 
+            if entry.receipt.call_id in self._seen_call_ids:
+                raise MerkleTamperError(
+                    f"Duplicate receipt call_id {entry.receipt.call_id!r} at seq={idx}."
+                )
+            if entry.aer1 is not None:
+                _verify_embedded_aer1(entry.aer1, entry.receipt, idx)
+            self._gate.verify_log_entry(
+                seq=idx,
+                session_id=entry.receipt.session_id,
+                leaf_sha256=entry.leaf_sha256,
+                prev_chain_sha256=entry.prev_chain_sha256 or _GENESIS_CHAIN_HEX,
+                chain_sha256=entry.chain_sha256,
+                merkle_root=entry.merkle_root,
+                entry_signature=entry.entry_signature,
+            )
             chain_sha = self._merkle.append(entry.receipt)
             proof = self._merkle.inclusion_proof(idx)
-            if chain_sha != entry.chain_sha256 or proof.root_sha256 != entry.merkle_root:
+            if (
+                proof.leaf_sha256 != entry.leaf_sha256
+                or chain_sha != entry.chain_sha256
+                or proof.root_sha256 != entry.merkle_root
+            ):
                 raise MerkleTamperError(f"Existing receipt log failed Merkle check at seq={idx}.")
+            self._seen_call_ids.add(entry.receipt.call_id)
         self._synced_lines = len(raw_lines)
 
     def append(self, receipt: ToolReceipt) -> ReceiptLogEntry:
         """Sign `receipt`, update the Merkle log, and atomically flush one JSONL line to disk."""
         with self._lock, _exclusive_log_lock(self.log_path):
             self._sync_from_disk_locked()
+            if receipt.session_id and receipt.session_id != self._session_id:
+                raise ProvenanceError(
+                    f"Receipt session_id={receipt.session_id!r} conflicts with writer "
+                    f"session_id={self._session_id!r}."
+                )
             if receipt.signature.startswith("ed25519:"):
                 signed = receipt
             else:
@@ -361,13 +443,26 @@ class ReceiptLogWriter:
                     else receipt.model_copy(update={"session_id": self._session_id})
                 )
                 signed = self._signer.sign_receipt(prepared)
+            if signed.call_id in self._seen_call_ids:
+                raise MerkleTamperError(
+                    f"Duplicate receipt call_id {signed.call_id!r} in active receipt log."
+                )
             seq = len(self._merkle)
             chain_sha = self._merkle.append(signed)
+            self._seen_call_ids.add(signed.call_id)
             proof = self._merkle.inclusion_proof(seq)
             prev_anchor = (
                 self._initial_chain_hash
                 if seq == 0 and self._initial_chain_hash != _GENESIS_CHAIN_HEX
                 else None
+            )
+            entry_sig = self._signer.sign_log_entry(
+                seq=seq,
+                session_id=signed.session_id,
+                leaf_sha256=proof.leaf_sha256,
+                prev_chain_sha256=prev_anchor or _GENESIS_CHAIN_HEX,
+                chain_sha256=chain_sha,
+                merkle_root=proof.root_sha256,
             )
             entry = ReceiptLogEntry(
                 seq=seq,
@@ -376,6 +471,7 @@ class ReceiptLogWriter:
                 leaf_sha256=proof.leaf_sha256,
                 chain_sha256=chain_sha,
                 merkle_root=proof.root_sha256,
+                entry_signature=entry_sig,
                 prev_chain_sha256=prev_anchor,
                 aer1=signed.to_aer1() if self._include_aer1 else None,
             )
@@ -383,6 +479,7 @@ class ReceiptLogWriter:
                 entry.model_dump(exclude_none=True),
                 sort_keys=True,
                 separators=(",", ":"),
+                allow_nan=False,
             )
             with self.log_path.open("a", encoding="utf-8") as handle:
                 handle.write(serialized + "\n")
@@ -400,6 +497,8 @@ def verify_receipt_log_file(
     pubkey_file: Path | str | None = None,
     expected_session_id: str | None = None,
     prev_log_path: Path | str | None = None,
+    prev_expected_pubkey_hex: str | None = None,
+    prev_pubkey_file: Path | str | None = None,
 ) -> ReceiptLogVerification:
     """Verify Ed25519 signatures, sequential hash links, and Merkle roots in a JSONL log."""
     pinned_hex: str | None = None
@@ -415,7 +514,11 @@ def verify_receipt_log_file(
 
     expected_prev_chain: str | None = None
     if prev_log_path is not None:
-        prev_verified = verify_receipt_log_file(prev_log_path)
+        prev_verified = verify_receipt_log_file(
+            prev_log_path,
+            expected_pubkey_hex=prev_expected_pubkey_hex,
+            pubkey_file=prev_pubkey_file,
+        )
         if prev_verified.entry_count == 0:
             raise MerkleTamperError("prev_log_path cannot be empty when verifying rotation link.")
         expected_prev_chain = prev_verified.head_chain_hash
@@ -466,6 +569,7 @@ def verify_receipt_log_file(
     gate = ProvenanceGate({Provenance.TOOL_VERIFIED: pub_bytes})
     merkle = MerkleReceiptLog(gate=gate, initial_chain_hash=init_chain)
     log_session_id = entries[0].receipt.session_id
+    seen_call_ids: set[str] = set()
 
     for idx, entry in enumerate(entries):
         if entry.seq != idx:
@@ -481,12 +585,33 @@ def verify_receipt_log_file(
                 f"Public key mismatch at seq={idx}: expected {active_pub_hex}, "
                 f"got {entry.public_key_hex}."
             )
+        if entry.receipt.session_id != log_session_id:
+            raise ProvenanceError(
+                f"Mixed session_id values inside receipt log at seq={idx}: "
+                f"expected {log_session_id!r}, got {entry.receipt.session_id!r}."
+            )
         if expected_session_id is not None and entry.receipt.session_id != expected_session_id:
             raise ProvenanceError(
                 f"Session mismatch at seq={idx}: expected {expected_session_id!r}, "
                 f"got {entry.receipt.session_id!r}."
             )
+        if entry.receipt.call_id in seen_call_ids:
+            raise MerkleTamperError(
+                f"Duplicate receipt call_id {entry.receipt.call_id!r} at seq={idx}."
+            )
+        if entry.aer1 is not None:
+            _verify_embedded_aer1(entry.aer1, entry.receipt, idx)
+        gate.verify_log_entry(
+            seq=idx,
+            session_id=entry.receipt.session_id,
+            leaf_sha256=entry.leaf_sha256,
+            prev_chain_sha256=entry.prev_chain_sha256 or _GENESIS_CHAIN_HEX,
+            chain_sha256=entry.chain_sha256,
+            merkle_root=entry.merkle_root,
+            entry_signature=entry.entry_signature,
+        )
         chain_sha = merkle.append(entry.receipt)
+        seen_call_ids.add(entry.receipt.call_id)
         proof = merkle.inclusion_proof(idx)
         if proof.leaf_sha256 != entry.leaf_sha256:
             raise MerkleTamperError(f"Leaf SHA-256 mismatch at seq={idx}.")
@@ -541,6 +666,7 @@ class McpStdioProxy:
     def __init__(self, writer: ReceiptLogWriter) -> None:
         self._writer = writer
         self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
+        self._seen_rpc_counts: dict[tuple[str, str], int] = {}
         self._lock = threading.Lock()
 
     def observe_client_line(self, raw_line: bytes) -> None:
@@ -579,9 +705,12 @@ class McpStdioProxy:
                 args_map = {"_raw_params": _coerce_scalar(params)}
 
             with self._lock:
+                occ = self._seen_rpc_counts.get(id_key, 0) + 1
+                self._seen_rpc_counts[id_key] = occ
+                cid = f"mcp-{id_key[1]}" if occ == 1 else f"mcp-{id_key[1]}#{occ}"
                 self._pending.setdefault(id_key, []).append(
                     _PendingToolCall(
-                        call_id=f"mcp-{id_key[1]}",
+                        call_id=cid,
                         tool=tool_name,
                         args=args_map,
                     )
@@ -692,6 +821,7 @@ def run_mcp_stdio_proxy(
     include_aer1: bool = False,
     session_id: str | None = None,
     prev_log_path: Path | str | None = None,
+    prev_pubkey_file: Path | str | None = None,
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -707,6 +837,7 @@ def run_mcp_stdio_proxy(
         include_aer1=include_aer1,
         session_id=session_id,
         prev_log_path=prev_log_path,
+        prev_pubkey_file=prev_pubkey_file,
     )
     proxy = McpStdioProxy(writer)
 

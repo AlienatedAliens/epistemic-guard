@@ -70,9 +70,9 @@ epistemic-guard verify-log /var/log/agent/receipts.jsonl \
   --json
 ```
 
-- **Multi-worker locking & key rotation:** Concurrent `mcp-proxy` workers sharing a `--log` file coordinate appends via OS-level exclusive file locks. When rotating Ed25519 keys across log segments, pass `--prev-log /var/log/agent/prev.jsonl` (and optional `--session-id`) on both `mcp-proxy` and `verify-log` to anchor the new log's genesis chain hash to the predecessor log tip.
+- **Multi-worker locking, signed sequence links, & key rotation:** Each `ReceiptLogEntry` carries both an inner Ed25519 `ToolReceipt` signature and a domain-separated Ed25519 `entry_signature` over `(seq, session_id, leaf_sha256, prev_chain_sha256, chain_sha256, merkle_root)`, defeating active reorder-and-rehash attacks even when an attacker has write access to `receipts.jsonl`. Concurrent `mcp-proxy` workers sharing a `--log` file coordinate appends via OS-level exclusive file locks. When rotating Ed25519 keys across log segments, pass `--prev-log /var/log/agent/prev.jsonl` (and optional `--prev-pubkey-file` / `--session-id`) on both `mcp-proxy` and `verify-log`.
 
-**Security boundary note:** Parent-injected `EPISTEMIC_GUARD_MCP_KEY_HEX` secrets stay in memory and are scrubbed from child environments; when using `--key-file` on disk (created atomically with `0o600` permissions), run `mcp-proxy` under a dedicated OS user or container if the untrusted agent or child MCP server runs on the same host, so same-UID processes cannot read `--key-file` directly. Likewise, store `--pubkey-file` outside any agent-writable directory when running `verify-log`.
+**Security boundary note:** Parent-injected `EPISTEMIC_GUARD_MCP_KEY_HEX` secrets stay in memory and are scrubbed from child environments; when using `--key-file` on disk (created atomically with POSIX mode `0600`, or restricted NTFS directory ACLs on Windows), run `mcp-proxy` under a dedicated OS user or container if the untrusted agent or child MCP server runs on the same host, so same-UID processes cannot read `--key-file` directly. Likewise, store `--pubkey-file` outside any agent-writable directory when running `verify-log`.
 
 You can also run `epistemic-guard` itself as a standalone stdio MCP verification server (`verify_narration`, `verify_receipt_log`, `inspect_receipt`, `corroborate_sources`):
 
@@ -210,7 +210,7 @@ Evaluated across `LOCKED_COH_50` (`50`), `BLIND42_COH_100` (`100`), and `Organic
 | **Off-the-shelf `DeBERTa-v3-xsmall` NLI** | CPU (`0 MiB` VRAM, `91.1 MB` RAM) | `132/250 (52.8% [46.6%, 58.9%])` | `24.6%` / `20.3%` | `22.4 ms` | `51/100 (51.0%)` |
 
 - **Why off-the-shelf SNLI/MNLI (`52.8%`) misses phantom actions:** Standard NLI classifies `"Zero tools ran"` vs `"I saved checklist_backup.md"` as `NEUTRAL` rather than `CONTRADICTION` on `73/92` (`79.3%`) of its false negatives.
-- **Tradeoff vs local LLM judges:** Paired two-sided exact McNemar tests confirm higher overall accuracy than `Mistral-NeMo-12B` ($p = 0.0259$) and `Phi-4-14B` ($p = 0.0095$; $p = 0.0169$ on `Organic_Heldout_H100`). `Phi-4-14B` reached `100.0%` recall (`0` false negatives vs `4` for `epistemic-guard`) at the cost of `12.2 GiB` VRAM, `4.3x` latency, and a `26.6%` false-positive rate on offers and idioms. Cloud frontier judges (`GPT-4o`, `Claude`) were not benchmarked here.
+- **Tradeoff vs local LLM judges:** Paired two-sided exact McNemar tests confirm higher overall accuracy than `Mistral-NeMo-12B` ($p = 0.0259$) and `Phi-4-14B` ($p = 0.0095$; $p = 0.0169$ on `Organic_Heldout_H100`). `Phi-4-14B` reached `100.0%` recall (`0` false negatives vs `4` for `epistemic-guard`) at the cost of `12,214 MiB` (`11.9 GiB`) VRAM, `4.3x` latency, and a `26.6%` false-positive rate on offers and idioms. Cloud frontier judges (`GPT-4o`, `Claude`) were not benchmarked here.
 
 ---
 

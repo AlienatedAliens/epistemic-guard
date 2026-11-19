@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.client
 import os
 import platform
 import shutil
@@ -14,7 +15,7 @@ import urllib.request
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Final, cast
+from typing import IO, BinaryIO, Final, cast
 
 from epistemic_guard.exceptions import EpistemicModelUnavailableWarning, ModelIntegrityError
 
@@ -37,7 +38,6 @@ class ModelSpec:
     subdir: str
     archive_name: str
     env_var: str
-    legacy_subdirs: tuple[str, ...]
     upstream_base_model: str
     upstream_license: str
     total_size_mb: float
@@ -50,7 +50,6 @@ MODEL_SPECS: Final[dict[str, ModelSpec]] = {
         subdir="action_claim_int8",
         archive_name="action_claim_int8.tar.gz",
         env_var="EPISTEMIC_GUARD_ACTION_CLAIM_DIR",
-        legacy_subdirs=("action_claim_verifier_ov",),
         upstream_base_model="cross-encoder/nli-MiniLM2-L6-H768",
         upstream_license="Apache-2.0",
         total_size_mb=82.67,
@@ -70,7 +69,6 @@ MODEL_SPECS: Final[dict[str, ModelSpec]] = {
         subdir="hazard_int8",
         archive_name="hazard_int8.tar.gz",
         env_var="EPISTEMIC_GUARD_HAZARD_DIR",
-        legacy_subdirs=("proof_policy_hazard_v3_ov", "proof_policy_hazard_ov"),
         upstream_base_model="cross-encoder/nli-MiniLM2-L6-H768",
         upstream_license="Apache-2.0",
         total_size_mb=82.65,
@@ -90,7 +88,6 @@ MODEL_SPECS: Final[dict[str, ModelSpec]] = {
         subdir="web_evidence_int8",
         archive_name="web_evidence_int8.tar.gz",
         env_var="EPISTEMIC_GUARD_WEB_EVIDENCE_DIR",
-        legacy_subdirs=(),
         upstream_base_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
         upstream_license="Apache-2.0",
         total_size_mb=23.06,
@@ -110,7 +107,6 @@ MODEL_SPECS: Final[dict[str, ModelSpec]] = {
         subdir="nli_int8",
         archive_name="nli_int8.tar.gz",
         env_var="EPISTEMIC_GUARD_NLI_DIR",
-        legacy_subdirs=("verifier_deberta_v3_xsmall_ov",),
         upstream_base_model="cross-encoder/nli-deberta-v3-xsmall",
         upstream_license="Apache-2.0",
         total_size_mb=91.10,
@@ -230,10 +226,14 @@ def _safe_extract_tar(tar: tarfile.TarFile, dest: Path) -> None:
         member_target = (dest / member.name).resolve()
         if not member_target.is_relative_to(dest_resolved):
             raise ModelIntegrityError(f"Unsafe path in model archive: {member.name}")
-    tar.extractall(path=dest, filter="data")
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(path=dest, filter="data")
+    else:
+        safe_members = [m for m in tar.getmembers() if m.isfile() or m.isdir()]
+        tar.extractall(path=dest, members=safe_members)  # noqa: S202
 
 
-def _url_open(url: str, timeout: int = 120) -> BinaryIO:
+def _validate_download_url(url: str) -> None:
     parsed = urllib.parse.urlparse(url)
     is_https = parsed.scheme == "https" and bool(parsed.netloc)
     is_loopback_http = parsed.scheme == "http" and parsed.hostname in {
@@ -245,8 +245,30 @@ def _url_open(url: str, timeout: int = 120) -> BinaryIO:
         raise ModelIntegrityError(
             f"Refusing insecure or non-HTTPS model download URL: {url!r}"
         )
-    req = urllib.request.Request(url, headers=_HTTP_HEADERS)  # noqa: S310
-    return cast(BinaryIO, urllib.request.urlopen(req, timeout=timeout))  # noqa: S310
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Verify every HTTP redirect target preserves HTTPS (or loopback HTTP)."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        resolved_target = urllib.parse.urljoin(req.full_url, newurl)
+        _validate_download_url(resolved_target)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _url_open(url: str, timeout: int = 120) -> BinaryIO:
+    _validate_download_url(url)
+    req = urllib.request.Request(url, headers=_HTTP_HEADERS)
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    return cast(BinaryIO, opener.open(req, timeout=timeout))
 
 
 def _download_hf_subdir(base_url: str, spec: ModelSpec, tmp_path: Path) -> Path:

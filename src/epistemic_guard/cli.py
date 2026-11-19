@@ -31,7 +31,11 @@ from epistemic_guard.supervision import ReceiptSupervisor
 
 
 def _cmd_doctor() -> int:
-    core = ov.Core()
+    try:
+        core = ov.Core()
+    except (EpistemicGuardError, OSError, RuntimeError, ValueError) as exc:
+        print(f"epistemic-guard doctor error: {exc}", file=sys.stderr)
+        return 2
     print("epistemic-guard doctor")
     print("=" * 60)
     print(f"Python           : {sys.version.split()[0]} ({platform.platform()})")
@@ -171,12 +175,16 @@ def _cmd_download(args: argparse.Namespace) -> int:
         else ("action_claim", "hazard", "web_evidence", "nli")
     )
     print(f"Downloading epistemic-guard INT8 models: {', '.join(selected)} ...")
-    paths = download_models(
-        list(selected),
-        cache_dir=args.cache_dir,
-        base_url=args.base_url,
-        force=args.force,
-    )
+    try:
+        paths = download_models(
+            list(selected),
+            cache_dir=args.cache_dir,
+            base_url=args.base_url,
+            force=args.force,
+        )
+    except (EpistemicGuardError, OSError, ValueError) as exc:
+        print(f"epistemic-guard download-models error: {exc}", file=sys.stderr)
+        return 2
     for k, p in paths.items():
         print(f"  [OK] {k}: {p}")
     return 0
@@ -202,6 +210,7 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             include_aer1=args.aer1,
             session_id=args.session_id,
             prev_log_path=args.prev_log,
+            prev_pubkey_file=args.prev_pubkey_file,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
@@ -216,17 +225,22 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             pubkey_file=args.pubkey_file,
             expected_session_id=args.session_id,
             prev_log_path=args.prev_log,
+            prev_pubkey_file=args.prev_pubkey_file,
         )
+        narration_text: str | None = args.narration
+        if args.narration_file is not None:
+            narration_text = Path(args.narration_file).read_text(encoding="utf-8")
+        since_seq = int(args.since_seq)
+        if since_seq < 0 or since_seq > verified.entry_count:
+            raise ProvenanceError(
+                f"--since-seq {since_seq} is out of range [0, {verified.entry_count}]."
+            )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         if args.json:
             print(json.dumps({"log_valid": False, "error": str(exc)}, sort_keys=True))
         else:
             print(f"TAMPER OR KEY ERROR: {exc}", file=sys.stderr)
         return 2
-
-    narration_text: str | None = args.narration
-    if args.narration_file is not None:
-        narration_text = Path(args.narration_file).read_text(encoding="utf-8")
 
     if narration_text is None:
         if args.json:
@@ -253,7 +267,6 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             )
         return 0
 
-    since_seq = max(0, int(args.since_seq))
     active_receipts = verified.receipts[since_seq:]
     sup = ReceiptSupervisor(device=args.device, warn_on_missing=False)
     verdict = sup.verify_narration(
@@ -357,6 +370,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional predecessor JSONL log path to chain-link across key rotation",
     )
     mp.add_argument(
+        "--prev-pubkey-file",
+        default=None,
+        help="Optional public key file pinning --prev-log during key rotation",
+    )
+    mp.add_argument(
         "server_cmd",
         nargs=argparse.REMAINDER,
         help="Target MCP server command and arguments (place after '--')",
@@ -378,6 +396,11 @@ def main(argv: list[str] | None = None) -> int:
         "--prev-log",
         default=None,
         help="Predecessor JSONL log path to verify key-rotation hash-chain continuity",
+    )
+    vl.add_argument(
+        "--prev-pubkey-file",
+        default=None,
+        help="Public key file pinning --prev-log during rotated-log verification",
     )
     vl.add_argument(
         "--since-seq",

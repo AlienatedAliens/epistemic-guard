@@ -1,4 +1,4 @@
-"""Comprehensive test suite for standalone `epistemic-guard` (`v0.3.0`, MIT)."""
+"""Comprehensive test suite for standalone `epistemic-guard` (`v0.5.2`, MIT)."""
 
 from __future__ import annotations
 
@@ -289,7 +289,6 @@ def test_download_models_sha256_verification_and_tamper_rejection(tmp_path: Path
         subdir="web_evidence_int8",
         archive_name="web_evidence_int8.tar.gz",
         env_var="EPISTEMIC_GUARD_WEB_EVIDENCE_DIR",
-        legacy_subdirs=(),
         upstream_base_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
         upstream_license="Apache-2.0",
         total_size_mb=0.01,
@@ -365,7 +364,6 @@ def test_download_models_hf_resolve_and_github_fallback(tmp_path: Path) -> None:
         subdir="web_evidence_int8",
         archive_name="web_evidence_int8.tar.gz",
         env_var="EPISTEMIC_GUARD_WEB_EVIDENCE_DIR",
-        legacy_subdirs=(),
         upstream_base_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
         upstream_license="Apache-2.0",
         total_size_mb=0.01,
@@ -1047,5 +1045,111 @@ def test_merkle_proof_geometry_and_concurrent_sqlite_provenance_store(tmp_path: 
     assert errors == []
     assert store.verify_chain() == 150
     store.close()
+
+
+def test_target_boundary_matching_nonfinite_floats_and_redirect_downgrade_rejection(
+    tmp_path: Path,
+) -> None:
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+
+    # 1. Substring false-grounding attacks ("a.py" vs "data.py" and "prod.db.bak" vs "prod.db")
+    r_short = ToolReceipt(tool="delete_file", ok=True, args={"path": "a.py"}, output="deleted a.py")
+    v_short = sup.verify_narration(
+        "I deleted data.py.",
+        receipts=[r_short],
+        user_prompt="Delete data.py.",
+    )
+    assert v_short.is_valid is False
+
+    r_bak = ToolReceipt(
+        tool="delete_file",
+        ok=True,
+        args={"path": "/backups/prod.db.bak"},
+        output="deleted backup",
+    )
+    v_bak = sup.verify_narration(
+        "I deleted prod.db.",
+        receipts=[r_bak],
+        user_prompt="Delete prod.db.",
+    )
+    assert v_bak.is_valid is False
+    assert (
+        sup.verify_narration("[ACTION: delete prod.db]", receipts=[r_bak]).is_valid is False
+    )
+
+    # Recipient-swap attack on same domain ("alice@acme.com" vs "ceo@acme.com")
+    r_mail = ToolReceipt(
+        tool="send_email",
+        ok=True,
+        args={"to": "alice@acme.com"},
+        output="sent",
+    )
+    assert (
+        sup.verify_narration(
+            "I emailed ceo@acme.com.",
+            receipts=[r_mail],
+            user_prompt="Email ceo@acme.com.",
+        ).is_valid
+        is False
+    )
+    assert (
+        sup.verify_narration(
+            "I emailed alice@acme.com.",
+            receipts=[r_mail],
+            user_prompt="Email alice@acme.com.",
+        ).is_valid
+        is True
+    )
+
+    # Legitimate path-suffix and numeric #ID matches remain grounded
+    r_subpath = ToolReceipt(
+        tool="write_file",
+        ok=True,
+        args={"path": "/srv/workspace/notes.txt"},
+        output="ok",
+    )
+    assert (
+        sup.verify_narration(
+            "I saved the checklist to notes.txt.",
+            receipts=[r_subpath],
+            user_prompt="Save notes.txt.",
+        ).is_valid
+        is True
+    )
+    r_order = ToolReceipt(tool="refund_order", ok=True, args={"order_id": 8821}, output="refunded")
+    assert sup.verify_narration("[ACTION: refund order #8821]", receipts=[r_order]).is_valid is True
+
+    # 2. Non-finite float coercion in ReceiptRecorder + non-standard NaN rejection in from_aer1
+    factory = SignerFactory.from_master_key(os.urandom(32))
+    recorder = ReceiptRecorder(signer=factory.tool_verified())
+
+    @recorder.tool
+    def compute_metric(alpha: float) -> str:
+        return f"alpha={alpha}"
+
+    compute_metric(float("nan"))
+    assert recorder.receipts[0].args["alpha"] == "nan"
+    assert recorder.receipts[0].to_aer1()["verification_status"] == "verified"
+
+    with pytest.raises(SignatureTamperError):
+        ToolReceipt.from_aer1('{"id": NaN}')
+
+    # 3. HTTPS -> insecure remote HTTP redirect downgrade blocked by _SafeRedirectHandler
+    import http.client
+    import urllib.request
+
+    from epistemic_guard.models import _SafeRedirectHandler
+
+    handler = _SafeRedirectHandler()
+    req = urllib.request.Request("https://huggingface.co/model.bin")
+    with pytest.raises(ModelIntegrityError):
+        handler.redirect_request(
+            req,
+            io.BytesIO(),
+            302,
+            "Found",
+            http.client.HTTPMessage(),
+            "http://attacker.example/evil.bin",
+        )
 
 

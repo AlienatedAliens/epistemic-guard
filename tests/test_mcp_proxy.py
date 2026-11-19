@@ -559,6 +559,103 @@ def test_mcp_proxy_scrubs_master_and_secret_env_vars_and_handles_duplicate_rpc_i
     assert verified.entry_count == 2
     assert verified.receipts[0].tool == "write_a"
     assert verified.receipts[0].output == "done-a"
+    assert verified.receipts[0].call_id == "mcp-7"
     assert verified.receipts[1].tool == "write_b"
     assert verified.receipts[1].output == "done-b"
+    assert verified.receipts[1].call_id == "mcp-7#2"
+
+
+def test_active_rehash_reorder_aer1_tamper_and_cli_bounds_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from epistemic_guard.store import MerkleReceiptLog
+
+    key_file = tmp_path / "entry_sig.key"
+    pub_file = tmp_path / "entry_sig.pub.json"
+    log_path = tmp_path / "entry_sig.jsonl"
+    signer = load_or_create_mcp_signer(key_file=key_file, pubkey_out=pub_file)
+    writer = ReceiptLogWriter(log_path, signer, include_aer1=True, session_id="sess-bind-1")
+    writer.append(
+        ToolReceipt(call_id="c-0", tool="write_file", ok=True, args={"p": "a.txt"}, output="ok-a")
+    )
+    writer.append(
+        ToolReceipt(call_id="c-1", tool="delete_file", ok=False, args={"p": "b.db"}, output="err-b")
+    )
+
+    raw_entries = [
+        json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    assert len(raw_entries) == 2
+
+    # 1. Active attacker swaps seq=0 and seq=1 AND recomputes public SHA-256 chain & Merkle roots
+    reordered = [dict(raw_entries[1]), dict(raw_entries[0])]
+    rehash_merkle = MerkleReceiptLog()
+    rebuilt_lines: list[str] = []
+    for new_seq, item in enumerate(reordered):
+        rcpt = ToolReceipt.model_validate(item["receipt"])
+        new_chain = rehash_merkle.append(rcpt)
+        proof = rehash_merkle.inclusion_proof(new_seq)
+        item["seq"] = new_seq
+        item["leaf_sha256"] = proof.leaf_sha256
+        item["chain_sha256"] = new_chain
+        item["merkle_root"] = proof.root_sha256
+        item.pop("prev_chain_sha256", None)
+        rebuilt_lines.append(json.dumps(item, sort_keys=True, separators=(",", ":")))
+
+    swapped_log = tmp_path / "swapped_rehashed.jsonl"
+    swapped_log.write_text("\n".join(rebuilt_lines) + "\n", encoding="utf-8")
+    with pytest.raises(SignatureTamperError):
+        verify_receipt_log_file(swapped_log, pubkey_file=pub_file)
+
+    # 2. Tampering embedded entry.aer1 without touching signed ToolReceipt is rejected
+    aer1_tampered = [dict(raw_entries[0]), dict(raw_entries[1])]
+    forged_rcpt = ToolReceipt(
+        call_id="c-0", tool="delete_file", ok=True, args={"p": "prod.db"}, output="wiped"
+    )
+    aer1_tampered[0]["aer1"] = forged_rcpt.to_aer1()
+    aer1_log = tmp_path / "aer1_tampered.jsonl"
+    aer1_log.write_text(
+        "\n".join(json.dumps(x, sort_keys=True, separators=(",", ":")) for x in aer1_tampered)
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SignatureTamperError):
+        verify_receipt_log_file(aer1_log, pubkey_file=pub_file)
+
+    # 3. Duplicate call_id in ReceiptLogWriter is rejected
+    with pytest.raises(MerkleTamperError):
+        writer.append(ToolReceipt(call_id="c-0", tool="ping", ok=True, output="dup"))
+
+    # 4. Out-of-range --since-seq and missing --narration-file fail closed with exit code 2
+    rc_bad_seq = cli_main(
+        [
+            "verify-log",
+            str(log_path),
+            "--pubkey-file",
+            str(pub_file),
+            "--since-seq",
+            "99",
+            "--narration",
+            "Done.",
+            "--json",
+        ]
+    )
+    assert rc_bad_seq == 2
+    err_seq = json.loads(capsys.readouterr().out)
+    assert err_seq["log_valid"] is False
+
+    rc_missing_file = cli_main(
+        [
+            "verify-log",
+            str(log_path),
+            "--pubkey-file",
+            str(pub_file),
+            "--narration-file",
+            str(tmp_path / "missing_reply.txt"),
+            "--json",
+        ]
+    )
+    assert rc_missing_file == 2
+    err_file = json.loads(capsys.readouterr().out)
+    assert err_file["log_valid"] is False
 

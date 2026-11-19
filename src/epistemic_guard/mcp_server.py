@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, BinaryIO, Final
@@ -641,10 +642,15 @@ def _coerce_receipt_args(raw_args: object) -> dict[str, str | int | float | bool
     clean: dict[str, str | int | float | bool] = {}
     for k, v in raw_args.items():
         key = str(k)
-        if isinstance(v, (str, int, float, bool)):
+        if isinstance(v, bool) or isinstance(v, (str, int)):
             clean[key] = v
+        elif isinstance(v, float):
+            clean[key] = v if math.isfinite(v) else str(v)
         else:
-            clean[key] = json.dumps(v, sort_keys=True, separators=(",", ":"))
+            try:
+                clean[key] = json.dumps(v, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError):
+                clean[key] = str(v)
     return clean
 
 
@@ -721,7 +727,7 @@ def _tool_result(payload: Mapping[str, object], *, is_error: bool = False) -> di
         "content": [
             {
                 "type": "text",
-                "text": json.dumps(body, sort_keys=True),
+                "text": json.dumps(body, sort_keys=True, allow_nan=False),
             }
         ],
         "isError": is_error,

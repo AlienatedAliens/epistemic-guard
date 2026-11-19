@@ -70,6 +70,30 @@ def canonical_receipt_bytes(receipt: ToolReceipt) -> bytes:
     )
 
 
+def canonical_log_entry_bytes(
+    *,
+    seq: int,
+    session_id: str,
+    leaf_sha256: str,
+    prev_chain_sha256: str,
+    chain_sha256: str,
+    merkle_root: str,
+) -> bytes:
+    """Serialize outer `ReceiptLogEntry` sequence and chain links for Ed25519 signing."""
+    canonical: dict[str, object] = {
+        "domain": "epistemic-guard:receipt-log-entry:v1",
+        "seq": int(seq),
+        "session_id": session_id,
+        "leaf_sha256": leaf_sha256,
+        "prev_chain_sha256": prev_chain_sha256,
+        "chain_sha256": chain_sha256,
+        "merkle_root": merkle_root,
+    }
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
+
+
 def _derive_domain_seed(master_key: bytes, provenance: Provenance, purpose: bytes) -> bytes:
     if len(master_key) < 32:
         raise ValueError("master_key must be at least 32 bytes")
@@ -149,6 +173,28 @@ class DomainSigner:
         raw_sig = self._private_key.sign(canonical_receipt_bytes(populated))
         sig_b64 = base64.b64encode(raw_sig).decode("ascii")
         return populated.model_copy(update={"signature": f"{ED25519_PREFIX}{sig_b64}"})
+
+    def sign_log_entry(
+        self,
+        *,
+        seq: int,
+        session_id: str,
+        leaf_sha256: str,
+        prev_chain_sha256: str,
+        chain_sha256: str,
+        merkle_root: str,
+    ) -> str:
+        """Sign outer `ReceiptLogEntry` sequence and hash-chain links with Ed25519."""
+        msg = canonical_log_entry_bytes(
+            seq=seq,
+            session_id=session_id,
+            leaf_sha256=leaf_sha256,
+            prev_chain_sha256=prev_chain_sha256,
+            chain_sha256=chain_sha256,
+            merkle_root=merkle_root,
+        )
+        sig_b64 = base64.b64encode(self._private_key.sign(msg)).decode("ascii")
+        return f"{ED25519_PREFIX}{sig_b64}"
 
 
 class SignerFactory:
@@ -276,6 +322,41 @@ class ProvenanceGate:
             return True
         except (ValueError, InvalidSignature) as exc:
             raise SignatureTamperError("Invalid Ed25519 signature on ToolReceipt.") from exc
+
+    def verify_log_entry(
+        self,
+        *,
+        seq: int,
+        session_id: str,
+        leaf_sha256: str,
+        prev_chain_sha256: str,
+        chain_sha256: str,
+        merkle_root: str,
+        entry_signature: str,
+        provenance: Provenance = Provenance.TOOL_VERIFIED,
+    ) -> bool:
+        """Verify the Ed25519 outer sequence and hash-chain signature on a `ReceiptLogEntry`."""
+        if not entry_signature.startswith(ED25519_PREFIX):
+            raise SignatureTamperError("ReceiptLogEntry is missing an Ed25519 entry_signature.")
+        pubkey = self._pubkeys.get(provenance)
+        if pubkey is None:
+            raise ProvenanceError(f"Missing public key for domain '{provenance}'.")
+        msg = canonical_log_entry_bytes(
+            seq=seq,
+            session_id=session_id,
+            leaf_sha256=leaf_sha256,
+            prev_chain_sha256=prev_chain_sha256,
+            chain_sha256=chain_sha256,
+            merkle_root=merkle_root,
+        )
+        try:
+            raw_sig = base64.b64decode(entry_signature[len(ED25519_PREFIX) :], validate=True)
+            pubkey.verify(raw_sig, msg)
+            return True
+        except (ValueError, InvalidSignature) as exc:
+            raise SignatureTamperError(
+                "Invalid Ed25519 entry_signature on ReceiptLogEntry."
+            ) from exc
 
 
 @dataclass(frozen=True)

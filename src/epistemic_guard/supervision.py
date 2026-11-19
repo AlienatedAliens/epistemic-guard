@@ -374,6 +374,31 @@ def mask_non_assertive_spans(text: str) -> str:
     return masked
 
 
+def _normalize_target_token(raw: str) -> str:
+    norm = raw.strip().strip("\"'`").replace("\\", "/").lower()
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.rstrip("/")
+
+
+def _target_matches_arg(claimed: str, recorded: str) -> bool:
+    """Match a claimed target against a recorded tool argument on path or token boundaries."""
+    c = _normalize_target_token(claimed)
+    a = _normalize_target_token(recorded)
+    if not c or not a:
+        return False
+    if c == a:
+        return True
+    if c.startswith("#") and c[1:] == a:
+        return True
+    if a.endswith("/" + c) or c.endswith("/" + a):
+        return True
+    boundary_pat = r"(?<![a-z0-9_.@-])" + re.escape(c) + r"(?![a-z0-9_.@-])"
+    if re.search(boundary_pat, a) is not None:
+        return True
+    return bool(a.isdigit() and re.search(r"#" + re.escape(a) + r"(?![0-9])", c) is not None)
+
+
 def parse_structured_action_tags(
     text: str, receipts: Sequence[ToolReceipt]
 ) -> list[StructuredActionTag]:
@@ -575,12 +600,15 @@ class ReceiptSupervisor:
             if stems and not any(s in tool_l for s in stems) and verb not in tool_l:
                 continue
             if not rcpt.args:
-                if not tgt_low or tgt_low in tool_l or tgt_low in rcpt.output.lower():
+                if (
+                    not tgt_low
+                    or _target_matches_arg(tgt_low, tool_l)
+                    or _target_matches_arg(tgt_low, rcpt.output)
+                ):
                     return True
                 continue
             for val in rcpt.args.values():
-                sval = str(val).strip().lower()
-                if sval and (sval in tgt_low or tgt_low in sval):
+                if _target_matches_arg(tgt_low, str(val)):
                     return True
         return False
 
@@ -601,27 +629,25 @@ class ReceiptSupervisor:
         if not matching_rcpts:
             return False
 
-        arg_pool: list[str] = []
-        for rcpt in matching_rcpts:
-            for val in rcpt.args.values():
-                sval = str(val).strip().lower()
-                if sval:
-                    arg_pool.append(sval)
-                    base = sval.replace("\\", "/").rsplit("/", 1)[-1]
-                    if base and base != sval:
-                        arg_pool.append(base)
-
         concrete_targets = re.findall(
-            r"(?:https?://[^\s,;)']+|#[0-9]+|\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b)",
+            r"(?:https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b"
+            r"|#[0-9]+|\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b)",
             cl_lower,
         )
         if concrete_targets:
             for tgt in concrete_targets:
                 clean_tgt = tgt.rstrip(".,!?;:")
-                in_args = any(clean_tgt in ap or ap in clean_tgt for ap in arg_pool)
+                in_args = any(
+                    _target_matches_arg(clean_tgt, str(val))
+                    for rcpt in matching_rcpts
+                    for val in rcpt.args.values()
+                )
                 in_zero_arg_rcpt = any(
                     not rcpt.args
-                    and (clean_tgt in rcpt.tool.lower() or clean_tgt in rcpt.output.lower())
+                    and (
+                        _target_matches_arg(clean_tgt, rcpt.tool)
+                        or _target_matches_arg(clean_tgt, rcpt.output)
+                    )
                     for rcpt in matching_rcpts
                 )
                 if not (in_args or in_zero_arg_rcpt):

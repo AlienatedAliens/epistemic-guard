@@ -8,6 +8,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, ParamSpec, Protocol, TypeVar, overload, runtime_checkable
 
@@ -21,11 +22,13 @@ R = TypeVar("R")
 
 
 def _coerce_arg_scalar(val: object) -> str | int | float | bool:
-    if isinstance(val, (str, int, float, bool)):
+    if isinstance(val, bool) or isinstance(val, (str, int)):
         return val
+    if isinstance(val, float):
+        return val if math.isfinite(val) else str(val)
     try:
-        return json.dumps(val, sort_keys=True, separators=(",", ":"))
-    except TypeError:
+        return json.dumps(val, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
         return str(val)
 
 

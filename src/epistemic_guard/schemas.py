@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -132,11 +133,13 @@ _AER1_NIL_UUID: Final[str] = "00000000-0000-0000-0000-000000000000"
 
 
 def _coerce_receipt_arg(val: object) -> str | int | float | bool:
-    if isinstance(val, (str, int, float, bool)):
+    if isinstance(val, bool) or isinstance(val, (str, int)):
         return val
+    if isinstance(val, float):
+        return val if math.isfinite(val) else str(val)
     try:
-        return json.dumps(val, sort_keys=True, separators=(",", ":"))
-    except TypeError:
+        return json.dumps(val, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
         return str(val)
 
 
@@ -187,7 +190,14 @@ def _parse_json_with_duplicate_check(text: str) -> tuple[object, str | None]:
             seen.add(key)
         return dict(pairs)
 
-    parsed: object = json.loads(text, object_pairs_hook=_hook)
+    def _reject_nonfinite(token: str) -> object:
+        raise SignatureTamperError(f"non-standard JSON numeric constant: {token}")
+
+    parsed: object = json.loads(
+        text,
+        object_pairs_hook=_hook,
+        parse_constant=_reject_nonfinite,
+    )
     return parsed, (duplicates[0] if duplicates else None)
 
 
@@ -320,7 +330,7 @@ def _validate_and_decode_aer1(
             raise SignatureTamperError("input_hash is not sha256: + lowercase hex digest")
         if verify_commitment and isinstance(inner_parsed, Mapping) and "inputs" in inner_parsed:
             inputs_raw = json.dumps(
-                inner_parsed["inputs"], sort_keys=True, separators=(",", ":")
+                inner_parsed["inputs"], sort_keys=True, separators=(",", ":"), allow_nan=False
             ).encode("utf-8")
             want_ih = f"sha256:{hashlib.sha256(inputs_raw).hexdigest()}"
             if ih != want_ih:
