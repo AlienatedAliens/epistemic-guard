@@ -15,7 +15,7 @@
   "nli": 91.1,
   "web_evidence": 23.06
  },
- "package_version": "0.4.2",
+ "package_version": "0.4.3",
  "pinned_artifact_files": 16,
  "policy_table_cells": 12,
  "proof_standard_count": 4,
@@ -36,15 +36,15 @@
   "inputs": [
    {
     "path": "pyproject.toml",
-    "sha256": "0f485216154aa3fa3a53f096431a73b59312623a7bfd8a4537d70821bb5e1e62"
+    "sha256": "5e6b19ee388f9d3a2986a33bcab50f45eb3dd653ca49f3a81988e56e2b423391"
    },
    {
     "path": "src/epistemic_guard/__init__.py",
-    "sha256": "3f60a62c2fb163e019631461ffe6b503064f0090279993fd3a601c92f8aa1091"
+    "sha256": "d85d67e3ea132185218cb221c4925aa47c73281ae5379992304b3a7e3597d0ee"
    },
    {
     "path": "src/epistemic_guard/cli.py",
-    "sha256": "651f3a88a891fa462aec6f4c906af02cca4c5e6ec610285e82397f0f95444d9a"
+    "sha256": "87c481af1c520a8c92a1a78bd2d4dd6da75ddf73e5f7b314b6d3b5779c70bf5c"
    },
    {
     "path": "src/epistemic_guard/corroboration.py",
@@ -68,11 +68,11 @@
    },
    {
     "path": "src/epistemic_guard/mcp_server.py",
-    "sha256": "587c031695ca69e20dfd1463d0484c81a99a0624e3df9d48d5031a30c3ab697e"
+    "sha256": "3cded917b7f726072b9d7ccea88e4b6f915d6f9fae6bfe86c0bd6c728a3a9380"
    },
    {
     "path": "src/epistemic_guard/models.py",
-    "sha256": "81a1bb57622f8d0dfcabaf97ef5abc0d710afb4f709d54bb1271eec543ed5e68"
+    "sha256": "96b84a75c638fa13a8e70672eb94f852dd4e861980dba80618d80b2e7466d125"
    },
    {
     "path": "src/epistemic_guard/nli.py",
@@ -84,7 +84,7 @@
    },
    {
     "path": "src/epistemic_guard/schemas.py",
-    "sha256": "6a475f591550d5cbc2ee67b7b1194fd94c8903871b3daca1213479ac241e5943"
+    "sha256": "34e69c35d603cbfb68a4820cb1a58f05f04e2a678ee8749760946a8678b978d9"
    },
    {
     "path": "src/epistemic_guard/store.py",
@@ -115,8 +115,8 @@
     "sha256": "0d96fd01fdb16601ee2a2c413383d1d1107cf16c71e080f75ebe9c678357405e"
    }
   ],
-  "commit": "9a09a19eba567c557913ec0e6eec64a8a2defad6",
-  "now": "2026-11-19T00:57:34+00:00",
+  "commit": "a12f6e60f01f1b174a9aa8fce25b7cfa14c50e4b",
+  "now": "2026-11-19T02:19:31+00:00",
   "osaudit": "0.7.0"
  }
 }
