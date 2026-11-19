@@ -3,22 +3,47 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
-import subprocess
+import sqlite3
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from epistemic_guard.corroboration import corroborate_sources, deduplicate_syndicated_sources  # noqa: E402
-from epistemic_guard.exceptions import MerkleTamperError, ProvenanceError, SignatureTamperError  # noqa: E402
+from epistemic_guard.corroboration import (  # noqa: E402
+    OpenVINOWebEvidenceClassifier,
+    corroborate_sources,
+    deduplicate_syndicated_sources,
+)
+from epistemic_guard.exceptions import (  # noqa: E402
+    MerkleTamperError,
+    ProvenanceError,
+    SignatureTamperError,
+)
+from epistemic_guard.hazard import OpenVINOHazardClassifier  # noqa: E402
 from epistemic_guard.integrations import ReceiptRecorder  # noqa: E402
-from epistemic_guard.mcp_proxy import McpStdioProxy, verify_receipt_log_file  # noqa: E402
-from epistemic_guard.provenance import ProvenanceGate, SignerFactory  # noqa: E402
-from epistemic_guard.schemas import Provenance, SignedPayload, ToolReceipt, UnsignedPayload  # noqa: E402
+from epistemic_guard.mcp_proxy import (  # noqa: E402
+    ReceiptLogWriter,
+    run_mcp_stdio_proxy,
+    verify_receipt_log_file,
+)
+from epistemic_guard.nli import OpenVINONLIVerifier  # noqa: E402
+from epistemic_guard.provenance import (  # noqa: E402
+    ProvenanceGate,
+    SignerFactory,
+    canonical_receipt_bytes,
+)
+from epistemic_guard.schemas import (  # noqa: E402
+    Provenance,
+    SignedPayload,
+    ToolReceipt,
+    UnsignedPayload,
+)
 from epistemic_guard.store import MerkleReceiptLog, SQLiteProvenanceStore  # noqa: E402
 
 
@@ -121,13 +146,10 @@ def _bench_aer1_interop() -> dict[str, int | float]:
 
 
 def _bench_mcp_proxy_wire() -> dict[str, int | float]:
-    import io
-
-    from epistemic_guard.mcp_proxy import run_mcp_stdio_proxy
-
     child_code = """
 import json, os, sys
-leaked = 1 if any(k.upper() in ("EPISTEMIC_GUARD_MCP_KEY_HEX", "EPISTEMIC_GUARD_MASTER_KEY") for k in os.environ) else 0
+KEYS = ("EPISTEMIC_GUARD_MCP_KEY_HEX", "EPISTEMIC_GUARD_MASTER_KEY")
+leaked = 1 if any(k.upper() in KEYS for k in os.environ) else 0
 for raw in sys.stdin:
     line = raw.strip()
     if not line:
@@ -137,11 +159,13 @@ for raw in sys.stdin:
     params = msg.get("params", {})
     name = params.get("name", "")
     if name == "ok_tool":
-        resp = {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"leak={leaked}"}], "isError": False}}
+        body = {"content": [{"type": "text", "text": f"leak={leaked}"}], "isError": False}
+        resp = {"jsonrpc": "2.0", "id": mid, "result": body}
         sys.stdout.write(json.dumps(resp) + "\\n")
         sys.stdout.flush()
     elif name == "err_tool":
-        resp = {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "disk full"}], "isError": True}}
+        body = {"content": [{"type": "text", "text": "disk full"}], "isError": True}
+        resp = {"jsonrpc": "2.0", "id": mid, "result": body}
         sys.stdout.write(json.dumps(resp) + "\\n")
         sys.stdout.flush()
     elif name == "invalid_params":
@@ -322,7 +346,6 @@ def _bench_sqlite_provenance_gate() -> dict[str, int | float]:
 
     # Check SQLite immutability triggers (UPDATE and DELETE must fail)
     immutable_triggers_blocked = 0
-    import sqlite3
 
     for sql in (
         "UPDATE provenance_envelopes SET content = 'mutated' WHERE seq = 1",
@@ -342,6 +365,7 @@ def _bench_sqlite_provenance_gate() -> dict[str, int | float]:
         "n_total_write_attempts": total_valid + total_unauthorized,
         "n_valid_writes": total_valid,
         "valid_writes_accepted": accepted_valid,
+        "valid_accept_pct": round(100.0 * accepted_valid / total_valid, 1),
         "false_rejections": total_valid - accepted_valid,
         "false_rejection_pct": round(100.0 * (total_valid - accepted_valid) / total_valid, 1),
         "n_unauthorized_writes": total_unauthorized,
@@ -352,14 +376,99 @@ def _bench_sqlite_provenance_gate() -> dict[str, int | float]:
         "verified_chain_records": chain_len,
         "immutable_sql_triggers_tested": 2,
         "immutable_sql_triggers_blocked": immutable_triggers_blocked,
+        "immutable_trigger_block_pct": round(100.0 * immutable_triggers_blocked / 2, 1),
+    }
+
+
+def _bench_adversarial_replay_and_concurrency() -> dict[str, int | float]:
+    factory = SignerFactory.from_master_key(_deterministic_key("adv-concurrency"))
+    signer = factory.tool_verified()
+
+    with tempfile.TemporaryDirectory(prefix="eg_adv_") as tmp:
+        tmp_dir = Path(tmp)
+        log_path = tmp_dir / "concurrent.jsonl"
+        pub_path = tmp_dir / "concurrent.pub.json"
+        pub_path.write_text(signer.public_key_bytes.hex() + "\n", encoding="ascii")
+
+        n_workers = 4
+        per_worker = 25
+        total_concurrent = n_workers * per_worker
+
+        def _worker(wid: int) -> None:
+            writer = ReceiptLogWriter(log_path, signer, session_id="sess-alpha")
+            for seq_i in range(per_worker):
+                rcpt = ToolReceipt(
+                    call_id=f"w{wid}-{seq_i}",
+                    tool="write_file",
+                    args={"worker": wid, "seq": seq_i},
+                    ok=True,
+                    executed=True,
+                    output="committed",
+                    session_id="sess-alpha",
+                    timestamp_utc="2026-11-18T00:00:00+00:00",
+                )
+                writer.append(rcpt)
+
+        threads = [threading.Thread(target=_worker, args=(w,)) for w in range(n_workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        ver = verify_receipt_log_file(
+            log_path, pubkey_file=pub_path, expected_session_id="sess-alpha"
+        )
+
+        # 1. Cross-session replay attack (log replayed under a different expected session_id)
+        replay_rejected = 0
+        try:
+            verify_receipt_log_file(
+                log_path, pubkey_file=pub_path, expected_session_id="sess-beta"
+            )
+        except (ProvenanceError, SignatureTamperError, MerkleTamperError):
+            replay_rejected = 1
+
+        # 2. Entry reordering / sequence swap attack
+        raw_lines = log_path.read_text(encoding="utf-8").splitlines()
+        reordered_path = tmp_dir / "reordered.jsonl"
+        swapped = list(raw_lines)
+        swapped[1], swapped[2] = swapped[2], swapped[1]
+        reordered_path.write_text("\n".join(swapped) + "\n", encoding="utf-8")
+        reorder_rejected = 0
+        try:
+            verify_receipt_log_file(reordered_path, pubkey_file=pub_path)
+        except (ProvenanceError, SignatureTamperError, MerkleTamperError):
+            reorder_rejected = 1
+
+        # 3. Canonical JSON non-finite float rejection (NaN and +Infinity)
+        nonfinite_rejected = 0
+        for bad_val in (float("nan"), float("inf")):
+            bad_rcpt = ToolReceipt(
+                call_id="nan-check",
+                tool="metric_op",
+                args={"score": bad_val},
+                ok=True,
+                executed=True,
+            )
+            try:
+                canonical_receipt_bytes(bad_rcpt)
+            except (SignatureTamperError, ValueError):
+                nonfinite_rejected += 1
+
+    adv_total = 1 + 1 + 2
+    adv_blocked = replay_rejected + reorder_rejected + nonfinite_rejected
+    return {
+        "n_workers": n_workers,
+        "n_concurrent_appends": total_concurrent,
+        "concurrent_verified_entries": ver.entry_count,
+        "concurrent_verified_pct": round(100.0 * ver.entry_count / total_concurrent, 1),
+        "replay_reorder_nan_trials": adv_total,
+        "replay_reorder_nan_rejected": adv_blocked,
+        "replay_reorder_nan_pct": round(100.0 * adv_blocked / adv_total, 1),
     }
 
 
 def _bench_syndication_dedup() -> dict[str, int | float]:
-    from epistemic_guard.corroboration import OpenVINOWebEvidenceClassifier
-    from epistemic_guard.hazard import OpenVINOHazardClassifier
-    from epistemic_guard.nli import OpenVINONLIVerifier
-
     hz_clf = OpenVINOHazardClassifier(device="CPU", warn_on_missing=False)
     ev_clf = OpenVINOWebEvidenceClassifier(device="CPU", warn_on_missing=False)
     nli_ver = OpenVINONLIVerifier(device="CPU", warn_on_missing=False)
@@ -400,6 +509,63 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
         if burden.independent_sources_count == 1 and not burden.meets_casual_burden:
             high_hazard_blocked += 1
 
+    # Paraphrase sensitivity sweep across 4 rewrite intensities (n=20 clusters x 3 URLs each)
+    n_sweep = 20
+    t0_collapsed = 0
+    t1_collapsed = 0
+    t2_collapsed = 0
+    t3_collapsed = 0
+    for idx in range(n_sweep):
+        origin = (
+            f"Security advisory {idx}: version 4.2 of gateway-{idx} contains an unauthenticated "
+            f"buffer overflow in packet parsing that permits remote code execution over port 8443."
+        )
+        # Tier 0: wire dateline + boilerplate wrapper (0% core lexical substitution)
+        m0_a = f"(REUTERS) - {origin}"
+        m0_b = f"{origin} Read more in our daily security briefing."
+        # Tier 1: light lexical edit (~15% word substitution, preserving 4-gram runs)
+        m1_a = (
+            f"Urgent advisory {idx}: version 4.2 of gateway-{idx} contains an unauthenticated "
+            f"buffer overflow in packet parsing that allows remote code execution on port 8443."
+        )
+        m1_b = (
+            f"Security bulletin {idx}: version 4.2 of gateway-{idx} contains an unauthenticated "
+            f"buffer overflow in packet parsing that permits remote command execution on port 8443."
+        )
+        # Tier 2: moderate clause & synonym rewrite (~45% lexical substitution)
+        m2_a = (
+            f"Gateway-{idx} release 4.2 suffers from a pre-auth memory overflow during packet "
+            f"handling, allowing attackers to run arbitrary code via TCP port 8443."
+        )
+        m2_b = (
+            f"An unauthenticated packet-parser overflow flaw in gateway-{idx} v4.2 lets remote "
+            f"actors execute code across network port 8443."
+        )
+        # Tier 3: heavy abstractive rewrite (>80% lexical replacement, zero shared 4-grams)
+        m3_a = (
+            f"Unpatched deployments of gateway-{idx} (build 4.2) expose port 8443 to full system "
+            f"takeover when malformed frames trigger memory corruption before login."
+        )
+        m3_b = (
+            f"Attackers targeting TCP/8443 on gateway-{idx} 4.2 can hijack host processes without "
+            f"credentials by sending crafted network traffic to the defective decoder."
+        )
+        for tier_idx, (ma, mb) in enumerate(
+            ((m0_a, m0_b), (m1_a, m1_b), (m2_a, m2_b), (m3_a, m3_b))
+        ):
+            ded, _ = deduplicate_syndicated_sources(
+                [(f"orig-{idx}.org", origin), (f"mir1-{idx}.net", ma), (f"mir2-{idx}.io", mb)]
+            )
+            if len(ded) == 1:
+                if tier_idx == 0:
+                    t0_collapsed += 1
+                elif tier_idx == 1:
+                    t1_collapsed += 1
+                elif tier_idx == 2:
+                    t2_collapsed += 1
+                else:
+                    t3_collapsed += 1
+
     return {
         "n_syndication_clusters": n_clusters,
         "mirrors_per_cluster": mirrors_per_cluster,
@@ -412,16 +578,20 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
         ),
         "high_hazard_false_consensus_blocked": high_hazard_blocked,
         "high_hazard_block_pct": round(100.0 * high_hazard_blocked / n_clusters, 1),
+        "paraphrase_sweep_clusters_per_tier": n_sweep,
+        "tier0_wrapper_collapse_pct": round(100.0 * t0_collapsed / n_sweep, 1),
+        "tier1_light_edit_collapse_pct": round(100.0 * t1_collapsed / n_sweep, 1),
+        "tier2_moderate_rewrite_collapse_pct": round(100.0 * t2_collapsed / n_sweep, 1),
+        "tier3_abstractive_rewrite_collapse_pct": round(100.0 * t3_collapsed / n_sweep, 1),
     }
 
 
 def main() -> None:
-    # Ensure subprocess invocation is unused warning-clean
-    _ = subprocess
     payload = {
         "merkle_receipts": _bench_merkle_and_tamper(),
         "aer1_interop": _bench_aer1_interop(),
         "mcp_proxy_wire": _bench_mcp_proxy_wire(),
+        "adversarial_concurrency": _bench_adversarial_replay_and_concurrency(),
         "sqlite_provenance_gate": _bench_sqlite_provenance_gate(),
         "syndication_dedup": _bench_syndication_dedup(),
     }

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import hashlib
+import http.server
 import io
 import os
 import sqlite3
 import tarfile
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -292,8 +297,10 @@ def test_download_models_sha256_verification_and_tamper_rejection(tmp_path: Path
     )
 
     cache_dir = tmp_path / "cache"
-    base_url = mirror_dir.as_uri()
-    with patch.dict("epistemic_guard.models.MODEL_SPECS", {"web_evidence": patched_spec}):
+    with (
+        _local_http_mirror(mirror_dir) as base_url,
+        patch.dict("epistemic_guard.models.MODEL_SPECS", {"web_evidence": patched_spec}),
+    ):
         installed = download_models(["web_evidence"], cache_dir=cache_dir, base_url=base_url)
         assert (installed["web_evidence"] / "openvino_model.xml").exists()
 
@@ -307,6 +314,25 @@ def test_download_models_sha256_verification_and_tamper_rejection(tmp_path: Path
 
         with pytest.raises(ModelIntegrityError):
             download_models(["web_evidence"], cache_dir=cache_dir, base_url=base_url, force=True)
+
+
+@contextlib.contextmanager
+def _local_http_mirror(root: Path) -> Iterator[str]:
+    class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+    handler = functools.partial(_QuietHandler, directory=str(root))
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=2.0)
 
 
 def test_download_models_hf_resolve_and_github_fallback(tmp_path: Path) -> None:
@@ -346,32 +372,63 @@ def test_download_models_hf_resolve_and_github_fallback(tmp_path: Path) -> None:
         files_sha256=fake_hashes,
     )
 
-    with patch.dict("epistemic_guard.models.MODEL_SPECS", {"web_evidence": patched_spec}):
+    with (
+        _local_http_mirror(tmp_path) as srv_url,
+        patch.dict("epistemic_guard.models.MODEL_SPECS", {"web_evidence": patched_spec}),
+    ):
+        hf_url = f"{srv_url}/resolve/main"
+        gh_url = f"{srv_url}/gh_releases"
+
         # 1. Direct HF /resolve/main layout succeeds and verifies SHA-256
         cache_hf = tmp_path / "cache_hf"
-        installed = download_models(
-            ["web_evidence"], cache_dir=cache_hf, base_url=hf_root.as_uri()
-        )
+        installed = download_models(["web_evidence"], cache_dir=cache_hf, base_url=hf_url)
         assert (installed["web_evidence"] / "openvino_model.xml").exists()
 
         # 2. Tampering on HF /resolve/main raises ModelIntegrityError (never falls back silently)
         (sub / "openvino_model.bin").write_bytes(b"TAMPERED")
         with (
-            patch("epistemic_guard.models.DEFAULT_HF_RESOLVE_BASE_URL", hf_root.as_uri()),
-            patch("epistemic_guard.models.DEFAULT_RELEASE_BASE_URL", gh_mirror.as_uri()),
+            patch("epistemic_guard.models.DEFAULT_HF_RESOLVE_BASE_URL", hf_url),
+            patch("epistemic_guard.models.DEFAULT_RELEASE_BASE_URL", gh_url),
             pytest.raises(ModelIntegrityError),
         ):
             download_models(["web_evidence"], cache_dir=cache_hf, force=True)
 
         # 3. Network/missing file on default HF primary falls back cleanly to GitHub Releases
-        broken_hf = (tmp_path / "resolve" / "unreachable").as_uri()
+        broken_hf = f"{srv_url}/resolve/unreachable"
         cache_fb = tmp_path / "cache_fb"
         with (
             patch("epistemic_guard.models.DEFAULT_HF_RESOLVE_BASE_URL", broken_hf),
-            patch("epistemic_guard.models.DEFAULT_RELEASE_BASE_URL", gh_mirror.as_uri()),
+            patch("epistemic_guard.models.DEFAULT_RELEASE_BASE_URL", gh_url),
         ):
             installed_fb = download_models(["web_evidence"], cache_dir=cache_fb)
             assert (installed_fb["web_evidence"] / "openvino_model.bin").exists()
+
+
+def test_v052_model_integrity_and_tar_url_guards(tmp_path: Path) -> None:
+    from epistemic_guard.models import _safe_extract_tar, resolve_managed_model_dir
+
+    # 1. Non-HTTPS / file:// URL schemes are rejected
+    with pytest.raises(ModelIntegrityError):
+        download_models(["web_evidence"], cache_dir=tmp_path / "c", base_url=tmp_path.as_uri())
+
+    # 2. Default verify_hashes=True rejects tampered weights even in custom-named directories
+    custom_dir = tmp_path / "arbitrary_custom_folder_name"
+    custom_dir.mkdir()
+    for fname in ("config.json", "openvino_model.bin", "openvino_model.xml", "tokenizer.json"):
+        (custom_dir / fname).write_bytes(b"untrusted_bytes")
+    with pytest.raises(ModelIntegrityError):
+        resolve_managed_model_dir("web_evidence", explicit_dir=custom_dir)
+
+    # 3. _safe_extract_tar blocks sibling-prefix traversal (`../dest_evil/pwn.txt`) and symlinks
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    evil_tar = tmp_path / "evil.tar.gz"
+    with tarfile.open(evil_tar, "w:gz") as tf:
+        info = tarfile.TarInfo(name="../dest_evil/pwn.txt")
+        info.size = 4
+        tf.addfile(info, io.BytesIO(b"evil"))
+    with tarfile.open(evil_tar, "r:gz") as tf, pytest.raises(ModelIntegrityError):
+        _safe_extract_tar(tf, dest)
 
 
 def test_corroborate_sources_syndication_dedup_and_consensus() -> None:

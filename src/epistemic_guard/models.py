@@ -9,6 +9,7 @@ import platform
 import shutil
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
 import warnings
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ DEFAULT_RELEASE_BASE_URL: Final[str] = (
     "https://github.com/AlienatedAliens/epistemic-guard/releases/download/"
     f"epistemic-guard-models-{MODEL_PACK_VERSION}"
 )
-_HTTP_HEADERS: Final[dict[str, str]] = {"User-Agent": "epistemic-guard/0.5.1 (openvino)"}
+_HTTP_HEADERS: Final[dict[str, str]] = {"User-Agent": "epistemic-guard/0.5.2 (openvino)"}
 
 
 @dataclass(frozen=True)
@@ -167,17 +168,17 @@ def resolve_managed_model_dir(
     model_key: str,
     explicit_dir: Path | str | None = None,
     *,
-    verify_hashes: bool = False,
+    verify_hashes: bool = True,
     require_neural: bool = False,
     warn_on_missing: bool = True,
 ) -> Path | None:
-    """Locate an OpenVINO model directory, warning or raising explicitly when absent."""
+    """Locate an OpenVINO model directory and verify SHA-256 digests by default."""
     spec = MODEL_SPECS[model_key]
 
     if explicit_dir is not None:
         p = Path(explicit_dir)
         if (p / "openvino_model.xml").exists() and (p / "tokenizer.json").exists():
-            if verify_hashes and p.name == spec.subdir:
+            if verify_hashes:
                 verify_model_dir(p, spec.files_sha256)
             return p
         if require_neural:
@@ -199,22 +200,9 @@ def resolve_managed_model_dir(
     cache_root = default_cache_root()
     candidates.append(cache_root / spec.subdir)
 
-    # Local ProjectLucca monorepo development roots (INT8 first, then legacy FP16)
-    repo_guess = Path(__file__).resolve().parents[4]
-    local_roots = (
-        Path.cwd(),
-        repo_guess,
-        Path(r"C:\Projects\ProjectLucca"),
-        Path(r"C:\ProjectLucca"),
-    )
-    for base in local_roots:
-        candidates.append(base / "models" / "epistemic_guard_int8" / spec.subdir)
-        for leg in spec.legacy_subdirs:
-            candidates.append(base / "models" / leg)
-
     for cand in candidates:
         if (cand / "openvino_model.xml").exists() and (cand / "tokenizer.json").exists():
-            if verify_hashes and cand.name == spec.subdir:
+            if verify_hashes:
                 verify_model_dir(cand, spec.files_sha256)
             return cand
 
@@ -237,17 +225,28 @@ def resolve_managed_model_dir(
 def _safe_extract_tar(tar: tarfile.TarFile, dest: Path) -> None:
     dest_resolved = dest.resolve()
     for member in tar.getmembers():
+        if member.issym() or member.islnk():
+            raise ModelIntegrityError(f"Links are not permitted in model archive: {member.name}")
         member_target = (dest / member.name).resolve()
-        if not str(member_target).startswith(str(dest_resolved)):
+        if not member_target.is_relative_to(dest_resolved):
             raise ModelIntegrityError(f"Unsafe path in model archive: {member.name}")
     tar.extractall(path=dest, filter="data")
 
 
 def _url_open(url: str, timeout: int = 120) -> BinaryIO:
-    if url.startswith(("http://", "https://")):
-        req = urllib.request.Request(url, headers=_HTTP_HEADERS)  # noqa: S310
-        return cast(BinaryIO, urllib.request.urlopen(req, timeout=timeout))  # noqa: S310
-    return cast(BinaryIO, urllib.request.urlopen(url, timeout=timeout))  # noqa: S310
+    parsed = urllib.parse.urlparse(url)
+    is_https = parsed.scheme == "https" and bool(parsed.netloc)
+    is_loopback_http = parsed.scheme == "http" and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+    if not (is_https or is_loopback_http):
+        raise ModelIntegrityError(
+            f"Refusing insecure or non-HTTPS model download URL: {url!r}"
+        )
+    req = urllib.request.Request(url, headers=_HTTP_HEADERS)  # noqa: S310
+    return cast(BinaryIO, urllib.request.urlopen(req, timeout=timeout))  # noqa: S310
 
 
 def _download_hf_subdir(base_url: str, spec: ModelSpec, tmp_path: Path) -> Path:

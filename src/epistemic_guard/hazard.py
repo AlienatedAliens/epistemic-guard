@@ -111,7 +111,7 @@ class OpenVINOHazardClassifier:
         *,
         device: str | None = None,
         confidence_threshold: float = 0.65,
-        verify_hashes: bool = False,
+        verify_hashes: bool = True,
         require_neural: bool = False,
         warn_on_missing: bool = True,
     ) -> None:

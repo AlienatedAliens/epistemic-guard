@@ -190,9 +190,15 @@ def load_or_create_mcp_signer(
         else:
             seed = os.urandom(32)
             kpath.parent.mkdir(parents=True, exist_ok=True)
-            kpath.write_text(seed.hex() + "\n", encoding="ascii")
-            with contextlib.suppress(OSError):
-                os.chmod(kpath, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            try:
+                fd = os.open(kpath, flags, 0o600)
+                with os.fdopen(fd, "w", encoding="ascii") as fh:
+                    fh.write(seed.hex() + "\n")
+                with contextlib.suppress(OSError):
+                    os.chmod(kpath, 0o600)
+            except FileExistsError:
+                seed = _decode_seed_bytes(kpath.read_bytes(), source=str(kpath))
     elif os.environ.get(_ENV_SIGNING_KEY_HEX):
         env_val = os.environ[_ENV_SIGNING_KEY_HEX].encode("ascii")
         seed = _decode_seed_bytes(env_val, source=_ENV_SIGNING_KEY_HEX)

@@ -40,26 +40,24 @@ def _cmd_doctor() -> int:
     print(f"Model cache dir  : {default_cache_root()}")
     print("-" * 60)
     for key, spec in MODEL_SPECS.items():
-        resolved = resolve_managed_model_dir(key, warn_on_missing=False)
+        resolved = resolve_managed_model_dir(key, verify_hashes=False, warn_on_missing=False)
         if resolved is None:
             print(
                 f"[{key:<12}] NOT INSTALLED ({spec.total_size_mb:.1f} MB INT8 — "
                 "run `epistemic-guard download-models`)"
             )
         else:
-            sha_status = "custom/legacy dir"
-            if resolved.name == spec.subdir:
-                try:
-                    verify_model_dir(resolved, spec.files_sha256)
-                    sha_status = "SHA-256 OK"
-                except Exception as exc:
-                    sha_status = f"HASH ERROR ({exc})"
+            try:
+                verify_model_dir(resolved, spec.files_sha256)
+                sha_status = "SHA-256 OK"
+            except Exception as exc:
+                sha_status = f"HASH ERROR ({exc})"
             print(f"[{key:<12}] READY at {resolved} [{sha_status}]")
     return 0
 
 
 def _cmd_demo() -> int:
-    print("epistemic-guard v0.5.1 — Live Verification Demo")
+    print("epistemic-guard v0.5.2 — Live Verification Demo")
     print("=" * 68)
 
     master_key = os.urandom(32)

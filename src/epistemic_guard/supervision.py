@@ -452,7 +452,7 @@ class ReceiptSupervisor:
         claim_threshold: float = 0.55,
         flag_unfulfilled_promises: bool = False,
         allow_creative_context: bool = True,
-        verify_hashes: bool = False,
+        verify_hashes: bool = True,
         require_neural: bool = False,
         warn_on_missing: bool = True,
         gate: ProvenanceGate | None = None,

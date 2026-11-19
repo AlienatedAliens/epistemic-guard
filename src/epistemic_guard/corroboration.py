@@ -113,7 +113,7 @@ class OpenVINOWebEvidenceClassifier:
         model_dir: Path | str | None = None,
         *,
         device: str | None = None,
-        verify_hashes: bool = False,
+        verify_hashes: bool = True,
         require_neural: bool = False,
         warn_on_missing: bool = True,
     ) -> None:

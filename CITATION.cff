@@ -9,7 +9,7 @@ authors:
 repository-code: "https://github.com/AlienatedAliens/epistemic-guard"
 url: "https://pypi.org/project/epistemic-guard/"
 doi: 10.5281/zenodo.23649049
-version: "0.5.1"
+version: "0.5.2"
 date-released: "2026-11-19"
 license: MIT
 keywords:

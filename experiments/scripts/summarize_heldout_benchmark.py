@@ -8,14 +8,19 @@ from pathlib import Path
 
 
 def main() -> None:
-    bench_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("benchmarks/external_baselines_benchmark.json")
+    bench_path = (
+        Path(sys.argv[1])
+        if len(sys.argv) > 1
+        else Path("benchmarks/external_baselines_benchmark.json")
+    )
     raw = json.loads(bench_path.read_text(encoding="utf-8"))
     systems = raw["systems"]
 
-    eg = systems["epistemic_guard_v0_3_0_cpu_int8"]
+    eg = systems["epistemic_guard_cpu_int8"]
     deb = systems["off_the_shelf_deberta_v3_xsmall_nli_cpu"]
     phi = systems["llm_judge_microsoft_phi_4_14b_q6_k_gpu"]
     nemo = systems["llm_judge_mistral_nemo_12b_q5_k_m_gpu"]
+    mcn = raw["paired_mcnemar"]
 
     positive_cases = eg["tp"] + eg["fn"]
     negative_cases = eg["tn"] + eg["fp"]
@@ -43,13 +48,20 @@ def main() -> None:
             "latency_p50_ms": eg["latency_p50_ms"],
             "latency_mean_ms": eg["latency_mean_ms"],
             "latency_p95_ms": eg["latency_p95_ms"],
+            "single_clause_p50_ms": eg["single_clause_p50_ms"],
             "gpu_vram_mib": eg["gpu_vram_mib"],
             "locked_coh_50_correct": eg["by_split"]["LOCKED_COH_50"]["correct"],
             "locked_coh_50_accuracy_pct": eg["by_split"]["LOCKED_COH_50"]["accuracy_pct"],
+            "locked_coh_50_ci95_low": eg["by_split"]["LOCKED_COH_50"]["accuracy_wilson_95ci"][0],
+            "locked_coh_50_ci95_high": eg["by_split"]["LOCKED_COH_50"]["accuracy_wilson_95ci"][1],
             "blind42_coh_100_correct": eg["by_split"]["BLIND42_COH_100"]["correct"],
             "blind42_coh_100_accuracy_pct": eg["by_split"]["BLIND42_COH_100"]["accuracy_pct"],
+            "blind42_coh_100_ci95_low": eg["by_split"]["BLIND42_COH_100"]["accuracy_wilson_95ci"][0],
+            "blind42_coh_100_ci95_high": eg["by_split"]["BLIND42_COH_100"]["accuracy_wilson_95ci"][1],
             "organic_h100_correct": eg["by_split"]["Organic_Heldout_H100"]["correct"],
             "organic_h100_accuracy_pct": eg["by_split"]["Organic_Heldout_H100"]["accuracy_pct"],
+            "organic_h100_ci95_low": eg["by_split"]["Organic_Heldout_H100"]["accuracy_wilson_95ci"][0],
+            "organic_h100_ci95_high": eg["by_split"]["Organic_Heldout_H100"]["accuracy_wilson_95ci"][1],
         },
         "mistral_nemo_12b_gpu": {
             "correct": nemo["correct"],
@@ -82,6 +94,9 @@ def main() -> None:
             "accuracy_pct": deb["accuracy_pct"],
             "ci95_low": deb["accuracy_wilson_95ci"][0],
             "ci95_high": deb["accuracy_wilson_95ci"][1],
+            "fn": deb["fn"],
+            "fn_neutral_dominant_count": deb["fn_neutral_dominant_count"],
+            "fn_neutral_dominant_pct": deb["fn_neutral_dominant_pct"],
             "recall_pct": deb["recall_pct"],
             "fpr_pct": deb["fpr_pct"],
             "latency_p50_ms": deb["latency_p50_ms"],
@@ -94,8 +109,33 @@ def main() -> None:
             "delta_accuracy_vs_deberta_pp": round(eg["accuracy_pct"] - deb["accuracy_pct"], 1),
             "delta_accuracy_vs_nemo_pp": round(eg["accuracy_pct"] - nemo["accuracy_pct"], 1),
             "delta_accuracy_vs_phi4_pp": round(eg["accuracy_pct"] - phi["accuracy_pct"], 1),
+            "delta_organic_vs_nemo_pp": round(
+                eg["by_split"]["Organic_Heldout_H100"]["accuracy_pct"]
+                - nemo["by_split"]["Organic_Heldout_H100"]["accuracy_pct"],
+                1,
+            ),
+            "delta_organic_vs_phi4_pp": round(
+                eg["by_split"]["Organic_Heldout_H100"]["accuracy_pct"]
+                - phi["by_split"]["Organic_Heldout_H100"]["accuracy_pct"],
+                1,
+            ),
             "speedup_p50_vs_phi4_x": round(phi["latency_p50_ms"] / eg["latency_p50_ms"], 2),
             "speedup_p50_vs_nemo_x": round(nemo["latency_p50_ms"] / eg["latency_p50_ms"], 2),
+            "mcnemar_vs_nemo_eg_only": mcn["vs_mistral_nemo_12b_overall"][
+                "epistemic_guard_only_correct"
+            ],
+            "mcnemar_vs_nemo_base_only": mcn["vs_mistral_nemo_12b_overall"][
+                "baseline_only_correct"
+            ],
+            "mcnemar_vs_nemo_p": round(
+                mcn["vs_mistral_nemo_12b_overall"]["p_value_two_sided"], 4
+            ),
+            "mcnemar_vs_phi4_eg_only": mcn["vs_phi_4_14b_overall"]["epistemic_guard_only_correct"],
+            "mcnemar_vs_phi4_base_only": mcn["vs_phi_4_14b_overall"]["baseline_only_correct"],
+            "mcnemar_vs_phi4_p": round(mcn["vs_phi_4_14b_overall"]["p_value_two_sided"], 4),
+            "mcnemar_organic_vs_phi4_p": round(
+                mcn["vs_phi_4_14b_organic_h100"]["p_value_two_sided"], 4
+            ),
         },
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
