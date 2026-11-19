@@ -67,3 +67,86 @@ cite = "mcp2025spec"
 value = "18"
 reason = "MCP protocol revision identifier 2025-06-18"
 cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "05"
+reason = "MCP protocol revision identifier 2024-11-05"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "03"
+reason = "MCP protocol revision identifier 2025-03-26"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "8032"
+reason = "IETF RFC 8032 EdDSA specification number"
+cite = "josefsson2017rfc8032"
+
+[[numbers.allow]]
+value = "0600"
+reason = "POSIX owner-only file permission mode for private key creation"
+
+[[numbers.allow]]
+value = "32700"
+reason = "JSON-RPC 2.0 Parse error code (-32700)"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "32600"
+reason = "JSON-RPC 2.0 Invalid Request error code (-32600)"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "32601"
+reason = "JSON-RPC 2.0 Method not found error code (-32601)"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "32602"
+reason = "JSON-RPC 2.0 Invalid params error code (-32602)"
+cite = "mcp2025spec"
+
+[[numbers.allow]]
+value = "9"
+reason = "Benchmark host CPU series identifier (Intel Core Ultra 9 275HX)"
+
+[[numbers.allow]]
+value = "2407"
+reason = "Mistral-Nemo-Instruct-2407 upstream checkpoint release identifier"
+
+[[numbers.allow]]
+value = "24"
+reason = "Benchmark host CPU physical core count (Intel Core Ultra 9 275HX)"
+
+[[numbers.allow]]
+value = "5080"
+reason = "Benchmark host GPU model identifier (NVIDIA GeForce RTX 5080 Laptop GPU)"
+
+[[numbers.allow]]
+value = "16"
+reason = "Benchmark host GPU VRAM capacity in GB (RTX 5080 Laptop GPU)"
+
+[[numbers.allow]]
+value = "4096"
+reason = "llama.cpp context window size (-c 4096) for LLM-judge baselines"
+
+[[numbers.allow]]
+value = "99"
+reason = "llama.cpp full GPU layer offload flag (-ngl 99)"
+
+[[numbers.allow]]
+value = "0.0"
+reason = "Deterministic greedy decoding temperature (temperature=0.0) for LLM-judge baselines"
+
+[[numbers.allow]]
+value = "25"
+reason = "Appends per worker thread (4 workers x 25 = 100) in concurrency test"
+
+[[numbers.allow]]
+value = "15%"
+reason = "Approximate lexical word-substitution fraction in Tier 1 light-edit paraphrase sweep"
+
+[[numbers.allow]]
+value = "3"
+reason = "Count of legacy zero-argument worksheet items in BLIND42_COH_100 rejected by strict target-binding"

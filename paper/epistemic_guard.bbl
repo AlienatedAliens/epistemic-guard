@@ -28,7 +28,9 @@ Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
 
 \bibitem{guardrailsai2024}
 {Guardrails AI Contributors}.
-\newblock {Guardrails AI}: Adding guardrails to large language models, 2024.
+\newblock {Guardrails AI}: Adding guardrails to large language models.
+\newblock \url{https://github.com/guardrails-ai/guardrails}, 2024.
+\newblock Accessed: 2026-11-19.
 
 \bibitem{he2023debertav3}
 Pengcheng He, Jianfeng Gao, and Weizhu Chen.
@@ -41,7 +43,8 @@ Hakan Inan, Kartikeya Upasani, Jianfeng Chi, Rashi Rungta, Krithika Iyer,
   Yuning Mao, Michael Tontchev, Qing Hu, Brian Fuller, Davide Testuggine, and
   Madian Khabsa.
 \newblock {Llama Guard}: {LLM}-based input-output safeguard for human-{AI}
-  conversations, 2023.
+  conversations.
+\newblock arXiv:2312.06674, \url{https://arxiv.org/abs/2312.06674}, 2023.
 
 \bibitem{josefsson2017rfc8032}
 Simon Josefsson and Ilari Liusvaara.
@@ -68,40 +71,64 @@ Martin Leucker and Christian Schallhart.
 Sean Maxwell.
 \newblock Closing the epistemic loop across the five layers of agent memory:
   Cryptographic provenance, paraconsistent bilattices, and {Z3}-quarantined
-  procedural induction, 2026.
+  procedural induction.
+\newblock Zenodo preprint, \url{https://doi.org/10.5281/zenodo.23901683}, 2026.
 
 \bibitem{maxwell2026poisoning}
 Sean Maxwell.
 \newblock Cryptographic provenance gates mitigate multi-session memory
-  poisoning in autonomous agents, 2026.
+  poisoning in autonomous agents.
+\newblock Zenodo preprint, \url{https://doi.org/10.5281/zenodo.23901452}, 2026.
 
 \bibitem{maxwell2026seed}
 Sean Maxwell.
 \newblock Provenance-gated memory and deontic output supervision for
-  epistemically grounded autonomous agents, 2026.
+  epistemically grounded autonomous agents.
+\newblock Zenodo preprint, \url{https://doi.org/10.5281/zenodo.23649049}, 2026.
 
 \bibitem{maxwell2026evasion}
 Sean Maxwell.
 \newblock Why speech-regex action supervisors miss live output: An empirical
-  evasion taxonomy and held-out structured action contract evaluation, 2026.
+  evasion taxonomy and held-out structured action contract evaluation.
+\newblock Zenodo preprint, \url{https://doi.org/10.5281/zenodo.23901605}, 2026.
+
+\bibitem{mcnemar1947note}
+Quinn McNemar.
+\newblock Note on the sampling error of the difference between correlated
+  proportions or percentages.
+\newblock {\em Psychometrika}, 12(2):153--157, 1947.
 
 \bibitem{mcp2025spec}
 {Model Context Protocol Contributors}.
-\newblock {Model Context Protocol} specification (revision 2025-06-18), 2025.
+\newblock {Model Context Protocol} specification (revision 2025-06-18).
+\newblock \url{https://modelcontextprotocol.io/specification/2025-06-18}, 2025.
+\newblock Accessed: 2026-11-19.
+
+\bibitem{monperrus2026osaudit}
+Martin Monperrus.
+\newblock {osaudit}: Automated open-science audit.
+\newblock \url{https://github.com/ASSERT-KTH/osaudit}, 2026.
+\newblock Accessed: 2026-11-19.
 
 \bibitem{nabaos2026}
 {NabaOS Contributors}.
 \newblock {NabaOS}: Sandboxed agent runtime with {Ed25519}-signed
-  constitutions, 2026.
+  constitutions.
+\newblock \url{https://github.com/nabaos/nabaos}, 2026.
+\newblock Accessed: 2026-11-19.
 
 \bibitem{owasp2026agentic}
 {OWASP GenAI Security Project}.
-\newblock {OWASP} {Top} 10 for {Agentic} {Applications}, 2026.
+\newblock {OWASP} {Top} 10 for {Agentic} {Applications}.
+\newblock \url{https://genai.owasp.org/}, 2026.
+\newblock Accessed: 2026-11-19.
 
 \bibitem{pipelock2026}
 {Pipelab Contributors}.
 \newblock {Pipelock}: Open-source {AI} agent firewall for {MCP} security and
-  mediator-signed action receipts, 2026.
+  mediator-signed action receipts.
+\newblock \url{https://github.com/pipelab-org/pipelock}, 2026.
+\newblock Accessed: 2026-11-19.
 
 \bibitem{rebedea2023nemo}
 Traian Rebedea, Razvan Dinu, Makesh~Narsimhan Sreedhar, Christopher Parisien,
@@ -126,8 +153,10 @@ Edwin~B. Wilson.
   22(158):209--212, 1927.
 
 \bibitem{zambo2026aer1}
-Daniel Zambo.
-\newblock {Agent Execution Receipt} format ({AER-1}), 2026.
-\newblock Specification \texttt{draft-zambo-aer1}.
+Brennan Zambo.
+\newblock {AI} {Agent Execution Receipt} ({AER-1}).
+\newblock IETF Internet-Draft \texttt{draft-zambo-aer1},
+  \url{https://datatracker.ietf.org/doc/draft-zambo-aer1/}, 2026.
+\newblock Accessed: 2026-11-19.
 
 \end{thebibliography}

@@ -15,7 +15,7 @@
   "nli": 91.1,
   "web_evidence": 23.06
  },
- "package_version": "0.5.1",
+ "package_version": "0.5.2",
  "pinned_artifact_files": 16,
  "policy_table_cells": 12,
  "proof_standard_count": 4,
@@ -24,7 +24,7 @@
  "source_module_count": 15,
  "supported_mcp_protocols": 3,
  "test_file_count": 4,
- "test_function_count": 31,
+ "test_function_count": 32,
  "total_int8_unpacked_mb": 279.48,
  "provenance": {
   "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
@@ -36,87 +36,19 @@
   "inputs": [
    {
     "path": "pyproject.toml",
-    "sha256": "c24dc9cd0dab245df2c4b724765963623728050f2fe8534876cb31996281cef4"
+    "sha256": "636c9c173d13098fd947fab057db10c47d35deacfbf4c416e0394090601de7c0"
    },
    {
-    "path": "src/epistemic_guard/__init__.py",
-    "sha256": "fa57bbcbf3e4dcd9b874dad4e42ffcb3fed66ee598e8a0a5c23bc0a2d61fc20e"
+    "path": "src/epistemic_guard",
+    "sha256": "127e6ed67b663c0692d05e6fc77919e5dbb983629bee05b9531b6106f3428bcc"
    },
    {
-    "path": "src/epistemic_guard/cli.py",
-    "sha256": "fac41dfed8801f2dd72544ec1c355a475c86cf3a16f113f27ed7b6092c28ccc4"
-   },
-   {
-    "path": "src/epistemic_guard/corroboration.py",
-    "sha256": "0269389a6cb9cf15b9a5138fabbaa458ff17207fafe4482fd949ec7d43e9ebf9"
-   },
-   {
-    "path": "src/epistemic_guard/exceptions.py",
-    "sha256": "c8293e8f8e445991c09f22e9a19624c384733d6b9d2dc922a43fc7618ce83498"
-   },
-   {
-    "path": "src/epistemic_guard/hazard.py",
-    "sha256": "70e2d2fba2bc85af4f54beb0c8c7acf33132f3aa669acc87ee766f23d108aa31"
-   },
-   {
-    "path": "src/epistemic_guard/integrations.py",
-    "sha256": "49431545da79612c62e098e1638ecb8cf4cf43a794639c866afa6d5decf2477f"
-   },
-   {
-    "path": "src/epistemic_guard/mcp_proxy.py",
-    "sha256": "1bf5f61ab95218472839c94715d4a3565ef032f541daf4c01c1297e91254d0e8"
-   },
-   {
-    "path": "src/epistemic_guard/mcp_server.py",
-    "sha256": "091bc2bc9e219375fb62f3b7fa6dc6e8708834d32ff48876cb21e39917703213"
-   },
-   {
-    "path": "src/epistemic_guard/models.py",
-    "sha256": "197630ab9b9725fd3f9f4a45f875145a5fba900dc8a9bf7d817c30e2015d282c"
-   },
-   {
-    "path": "src/epistemic_guard/nli.py",
-    "sha256": "88e9bdf7bcb938b878921cf0c0e6664d1824904d2098ddf382428929ac6519cd"
-   },
-   {
-    "path": "src/epistemic_guard/provenance.py",
-    "sha256": "472d967ac4542976fe0fb38481fb21d0d54b659af9bf375b61d0e41e356d9e81"
-   },
-   {
-    "path": "src/epistemic_guard/schemas.py",
-    "sha256": "1b3ea1ae3d2a9900611fa907c9e2e47f638b7db599deed1f4bf7892ca9fd67a3"
-   },
-   {
-    "path": "src/epistemic_guard/store.py",
-    "sha256": "0a63ce0263a92806a6e108aaf8a9e228c5ddca0be193ecaa1d58f89c6c80ba22"
-   },
-   {
-    "path": "src/epistemic_guard/supervision.py",
-    "sha256": "1dc7beefad0ade2a80d80674094a87fefae34dc3e1628892c3ae5c5fb231c222"
-   },
-   {
-    "path": "src/epistemic_guard/web_filters.py",
-    "sha256": "f2ea3ee82cdb4cfc21e69d1bfa904173d6e74b7221b9f8eee8759dcd0851323f"
-   },
-   {
-    "path": "tests/test_aer1_conformance.py",
-    "sha256": "92b1754fe0cde102a907149e8d55d7897aeaed652d818b1be59b1a95db7e5441"
-   },
-   {
-    "path": "tests/test_epistemic_guard.py",
-    "sha256": "466f97ffef85d248b8ef40edb5b1ffb2eff0a291b293ca24ff743aff4190e2b8"
-   },
-   {
-    "path": "tests/test_mcp_proxy.py",
-    "sha256": "3bbd7170812ca7c1d7a9943e0fb5a3127e33ba61bcb4d72a6b81fab459fa2c45"
-   },
-   {
-    "path": "tests/test_mcp_server.py",
-    "sha256": "89a87d36745b5c5f5984a67f72f4435cdb7b085bf65dc73a90fd91873f693ce5"
+    "path": "tests",
+    "sha256": "55fd6d081ec82674fb4ed9694b7273d746245c6c1781569b5d263e5c5cfb761c"
    }
   ],
-  "commit": "9ee2bdcba629a62b3740d1fea6cfbf9a22adb867",
-  "now": "2026-11-19T07:22:20+00:00",
+  "commit": "7778f32a498f4b7d58861e384322d4147ce484f5",
+  "now": "2026-11-19T11:50:55+00:00",
   "osaudit": "0.7.0"
  }
 }

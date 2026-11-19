@@ -1,4 +1,13 @@
 {
+ "adversarial_concurrency": {
+  "concurrent_verified_entries": 100,
+  "concurrent_verified_pct": 100.0,
+  "n_concurrent_appends": 100,
+  "n_workers": 4,
+  "replay_reorder_nan_pct": 100.0,
+  "replay_reorder_nan_rejected": 4,
+  "replay_reorder_nan_trials": 4
+ },
  "aer1_interop": {
   "digest_mismatches_rejected": 50,
   "digest_rejection_pct": 100.0,
@@ -32,6 +41,7 @@
   "false_rejections": 0,
   "immutable_sql_triggers_blocked": 2,
   "immutable_sql_triggers_tested": 2,
+  "immutable_trigger_block_pct": 100.0,
   "n_forged_key_attempts": 50,
   "n_llm_narration_attempts": 50,
   "n_total_write_attempts": 300,
@@ -39,6 +49,7 @@
   "n_valid_writes": 200,
   "unauthorized_block_pct": 100.0,
   "unauthorized_writes_blocked": 100,
+  "valid_accept_pct": 100.0,
   "valid_writes_accepted": 200,
   "verified_chain_records": 200
  },
@@ -48,8 +59,13 @@
   "high_hazard_false_consensus_blocked": 45,
   "mirrors_per_cluster": 3,
   "n_syndication_clusters": 45,
+  "paraphrase_sweep_clusters_per_tier": 20,
   "single_origin_clusters_collapsed": 45,
   "single_origin_collapse_pct": 100.0,
+  "tier0_wrapper_collapse_pct": 100.0,
+  "tier1_light_edit_collapse_pct": 100.0,
+  "tier2_moderate_rewrite_collapse_pct": 0.0,
+  "tier3_abstractive_rewrite_collapse_pct": 0.0,
   "total_duplicate_urls_collapsed": 90,
   "total_syndicated_urls": 135
  },
@@ -63,71 +79,15 @@
   "inputs": [
    {
     "path": "pyproject.toml",
-    "sha256": "c24dc9cd0dab245df2c4b724765963623728050f2fe8534876cb31996281cef4"
+    "sha256": "636c9c173d13098fd947fab057db10c47d35deacfbf4c416e0394090601de7c0"
    },
    {
-    "path": "src/epistemic_guard/__init__.py",
-    "sha256": "fa57bbcbf3e4dcd9b874dad4e42ffcb3fed66ee598e8a0a5c23bc0a2d61fc20e"
-   },
-   {
-    "path": "src/epistemic_guard/cli.py",
-    "sha256": "fac41dfed8801f2dd72544ec1c355a475c86cf3a16f113f27ed7b6092c28ccc4"
-   },
-   {
-    "path": "src/epistemic_guard/corroboration.py",
-    "sha256": "0269389a6cb9cf15b9a5138fabbaa458ff17207fafe4482fd949ec7d43e9ebf9"
-   },
-   {
-    "path": "src/epistemic_guard/exceptions.py",
-    "sha256": "c8293e8f8e445991c09f22e9a19624c384733d6b9d2dc922a43fc7618ce83498"
-   },
-   {
-    "path": "src/epistemic_guard/hazard.py",
-    "sha256": "70e2d2fba2bc85af4f54beb0c8c7acf33132f3aa669acc87ee766f23d108aa31"
-   },
-   {
-    "path": "src/epistemic_guard/integrations.py",
-    "sha256": "49431545da79612c62e098e1638ecb8cf4cf43a794639c866afa6d5decf2477f"
-   },
-   {
-    "path": "src/epistemic_guard/mcp_proxy.py",
-    "sha256": "1bf5f61ab95218472839c94715d4a3565ef032f541daf4c01c1297e91254d0e8"
-   },
-   {
-    "path": "src/epistemic_guard/mcp_server.py",
-    "sha256": "091bc2bc9e219375fb62f3b7fa6dc6e8708834d32ff48876cb21e39917703213"
-   },
-   {
-    "path": "src/epistemic_guard/models.py",
-    "sha256": "197630ab9b9725fd3f9f4a45f875145a5fba900dc8a9bf7d817c30e2015d282c"
-   },
-   {
-    "path": "src/epistemic_guard/nli.py",
-    "sha256": "88e9bdf7bcb938b878921cf0c0e6664d1824904d2098ddf382428929ac6519cd"
-   },
-   {
-    "path": "src/epistemic_guard/provenance.py",
-    "sha256": "472d967ac4542976fe0fb38481fb21d0d54b659af9bf375b61d0e41e356d9e81"
-   },
-   {
-    "path": "src/epistemic_guard/schemas.py",
-    "sha256": "1b3ea1ae3d2a9900611fa907c9e2e47f638b7db599deed1f4bf7892ca9fd67a3"
-   },
-   {
-    "path": "src/epistemic_guard/store.py",
-    "sha256": "0a63ce0263a92806a6e108aaf8a9e228c5ddca0be193ecaa1d58f89c6c80ba22"
-   },
-   {
-    "path": "src/epistemic_guard/supervision.py",
-    "sha256": "1dc7beefad0ade2a80d80674094a87fefae34dc3e1628892c3ae5c5fb231c222"
-   },
-   {
-    "path": "src/epistemic_guard/web_filters.py",
-    "sha256": "f2ea3ee82cdb4cfc21e69d1bfa904173d6e74b7221b9f8eee8759dcd0851323f"
+    "path": "src/epistemic_guard",
+    "sha256": "127e6ed67b663c0692d05e6fc77919e5dbb983629bee05b9531b6106f3428bcc"
    }
   ],
-  "commit": "9ee2bdcba629a62b3740d1fea6cfbf9a22adb867",
-  "now": "2026-11-19T07:22:21+00:00",
+  "commit": "7778f32a498f4b7d58861e384322d4147ce484f5",
+  "now": "2026-11-19T11:50:56+00:00",
   "osaudit": "0.7.0"
  }
 }
