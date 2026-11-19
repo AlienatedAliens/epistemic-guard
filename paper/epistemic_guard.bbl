@@ -55,7 +55,7 @@ Hugo Krawczyk and Pasi Eronen.
 
 \bibitem{laurie2013rfc6962}
 Ben Laurie, Adam Langley, and Emilia Kasper.
-\newblock Certificate transparency.
+\newblock {Certificate Transparency}.
 \newblock RFC 6962, Internet Engineering Task Force, 2013.
 
 \bibitem{leucker2009brief}
@@ -67,7 +67,7 @@ Martin Leucker and Christian Schallhart.
 \bibitem{maxwell2026fivelayer}
 Sean Maxwell.
 \newblock Closing the epistemic loop across the five layers of agent memory:
-  Cryptographic provenance, paraconsistent bilattices, and z3-quarantined
+  Cryptographic provenance, paraconsistent bilattices, and {Z3}-quarantined
   procedural induction, 2026.
 
 \bibitem{maxwell2026poisoning}
@@ -87,7 +87,7 @@ Sean Maxwell.
 
 \bibitem{mcp2025spec}
 {Model Context Protocol Contributors}.
-\newblock Model context protocol specification (revision 2025-06-18), 2025.
+\newblock {Model Context Protocol} specification (revision 2025-06-18), 2025.
 
 \bibitem{nabaos2026}
 {NabaOS Contributors}.
@@ -96,11 +96,11 @@ Sean Maxwell.
 
 \bibitem{owasp2026agentic}
 {OWASP GenAI Security Project}.
-\newblock {OWASP} top 10 for agentic applications, 2026.
+\newblock {OWASP} {Top} 10 for {Agentic} {Applications}, 2026.
 
 \bibitem{pipelock2026}
 {Pipelab Contributors}.
-\newblock Pipelock: Open-source {AI} agent firewall for {MCP} security and
+\newblock {Pipelock}: Open-source {AI} agent firewall for {MCP} security and
   mediator-signed action receipts, 2026.
 
 \bibitem{rebedea2023nemo}
@@ -127,7 +127,7 @@ Edwin~B. Wilson.
 
 \bibitem{zambo2026aer1}
 Daniel Zambo.
-\newblock Agent execution receipt format ({AER-1}), 2026.
+\newblock {Agent Execution Receipt} format ({AER-1}), 2026.
 \newblock Specification \texttt{draft-zambo-aer1}.
 
 \end{thebibliography}
