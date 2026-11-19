@@ -595,7 +595,7 @@ class ToolReceipt(BaseModel):
             "issuer_claims": {"provenance_class": prov_cls},
             "output": out_block,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.4.2"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.4.3"},
         }
         canon_raw = json.dumps(canon_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         canon_sha = hashlib.sha256(canon_raw).hexdigest()
@@ -605,7 +605,7 @@ class ToolReceipt(BaseModel):
             "id": aer1_id,
             "created_at": created_at,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.4.2"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.4.3"},
             "provenance_class": prov_cls,
             "canonical_bytes": base64.b64encode(canon_raw).decode("ascii"),
             "output_hash": f"sha256:{canon_sha}",

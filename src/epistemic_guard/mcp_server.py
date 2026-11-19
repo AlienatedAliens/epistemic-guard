@@ -18,7 +18,7 @@ _DEFAULT_PROTOCOL_VERSION: Final[str] = "2024-11-05"
 _SUPPORTED_PROTOCOLS: Final[frozenset[str]] = frozenset(
     {"2024-11-05", "2025-03-26", "2025-06-18"}
 )
-_SERVER_VERSION: Final[str] = "0.4.2"
+_SERVER_VERSION: Final[str] = "0.4.3"
 
 MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
