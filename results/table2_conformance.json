@@ -95,7 +95,7 @@
    },
    {
     "path": "src/epistemic_guard/mcp_server.py",
-    "sha256": "dc2e67925e926556fac33a500d06716f3894570cf3fa4d2bd440770f6a5bd388"
+    "sha256": "587c031695ca69e20dfd1463d0484c81a99a0624e3df9d48d5031a30c3ab697e"
    },
    {
     "path": "src/epistemic_guard/models.py",
@@ -126,8 +126,8 @@
     "sha256": "f2ea3ee82cdb4cfc21e69d1bfa904173d6e74b7221b9f8eee8759dcd0851323f"
    }
   ],
-  "commit": "a22906b7a900742bc527e55346cf07021c8bc874",
-  "now": "2026-11-18T17:39:54+00:00",
+  "commit": "9a09a19eba567c557913ec0e6eec64a8a2defad6",
+  "now": "2026-11-19T00:57:35+00:00",
   "osaudit": "0.7.0"
  }
 }
