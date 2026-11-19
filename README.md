@@ -33,7 +33,7 @@ epistemic-guard demo
 
 ## 1. Out-of-Process MCP Receipt Proxy (`mcp-proxy` + `verify-log`)
 
-Wrap any stdio MCP server (`Claude Desktop`, `Cursor`, `Cline`, `Windsurf`, or custom agents in any language). The Ed25519 signing key stays inside the `mcp-proxy` OS process; `EPISTEMIC_GUARD_MCP_KEY_HEX` is stripped before spawning the child MCP server. Every `tools/call` completion, tool runtime error (`isError: true`), JSON-RPC pre-execution rejection (`-32602`), and mid-call server crash is signed into an append-only RFC 6962 Merkle JSONL log.
+Wrap any stdio MCP server (`Claude Desktop`, `Cursor`, `Cline`, `Windsurf`, or custom agents in any language). The Ed25519 signing key stays inside the `mcp-proxy` OS process; `EPISTEMIC_GUARD_*` signing secrets (`EPISTEMIC_GUARD_MCP_KEY_HEX`, `EPISTEMIC_GUARD_MASTER_KEY`, etc.) are stripped before spawning the child MCP server. Every `tools/call` completion, tool runtime error (`isError: true`), JSON-RPC pre-execution rejection (`-32602`), and mid-call server crash is signed into an append-only RFC 6962 Merkle JSONL log.
 
 ```json
 {
@@ -226,7 +226,7 @@ Evaluated across `LOCKED_COH_50` (`50`), `BLIND42_COH_100` (`100`), and `Organic
   - **Pre-execution firewalls (`NeMo Guardrails`, `LlamaFirewall`, `Guardrails AI`):** Gate inputs and tool calls *before* execution; `epistemic-guard` verifies post-execution assistant prose against signed `ToolReceipt` records.
   - **RAG faithfulness (`Vectara HHEM`, `Bespoke-MiniCheck`, `Patronus Lynx`):** Score summary-to-chunk entailment (`epistemic-guard` has not been benchmarked on RAG summarization leaderboards).
   - **Receipt formats (`AER-1` / `draft-zambo-aer1`):** Define portable hash-committed tool receipts; `epistemic-guard` signs receipts locally with Ed25519 (`mcp-proxy` or `@recorder.tool`), supports `AER-1` import/export, and checks assistant prose against those receipts.
-- **Disclosures:** Neural models are English-only. Benchmarks ran on a single workstation; pre-registrations (`WO-46`) use git + OpenTimestamps SHA-256 locks ([dataset & `.ots` proofs](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)), and $\kappa$ agreement figures come from blinded LLM raters rather than human crowdworkers.
+- **Disclosures:** Neural models are English-only. Benchmarks ran on a single workstation; pre-registrations use git + OpenTimestamps SHA-256 locks ([dataset & `.ots` proofs](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)), and $\kappa$ agreement figures come from blinded LLM raters rather than human crowdworkers.
 
 ---
 
