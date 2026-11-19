@@ -21,6 +21,10 @@ def main() -> None:
     phi = systems["llm_judge_microsoft_phi_4_14b_q6_k_gpu"]
     nemo = systems["llm_judge_mistral_nemo_12b_q5_k_m_gpu"]
     mcn = raw["paired_mcnemar"]
+    abl = raw["ablations"]
+    det_abl = abl["deterministic_regex_with_receipts_cpu"]
+    s1_abl = abl["stage1_neural_encoder_without_receipts_cpu"]
+    prov = raw["dataset_provenance"]
 
     positive_cases = eg["tp"] + eg["fn"]
     negative_cases = eg["tn"] + eg["fp"]
@@ -49,6 +53,8 @@ def main() -> None:
             "latency_mean_ms": eg["latency_mean_ms"],
             "latency_p95_ms": eg["latency_p95_ms"],
             "single_clause_p50_ms": eg["single_clause_p50_ms"],
+            "cold_start_init_p50_ms": eg["cold_start_init_p50_ms"],
+            "cold_start_init_p95_ms": eg["cold_start_init_p95_ms"],
             "gpu_vram_mib": eg["gpu_vram_mib"],
             "locked_coh_50_correct": eg["by_split"]["LOCKED_COH_50"]["correct"],
             "locked_coh_50_accuracy_pct": eg["by_split"]["LOCKED_COH_50"]["accuracy_pct"],
@@ -133,9 +139,57 @@ def main() -> None:
             "mcnemar_vs_phi4_eg_only": mcn["vs_phi_4_14b_overall"]["epistemic_guard_only_correct"],
             "mcnemar_vs_phi4_base_only": mcn["vs_phi_4_14b_overall"]["baseline_only_correct"],
             "mcnemar_vs_phi4_p": round(mcn["vs_phi_4_14b_overall"]["p_value_two_sided"], 4),
+            "mcnemar_organic_vs_nemo_eg_only": mcn["vs_mistral_nemo_12b_organic_h100"][
+                "epistemic_guard_only_correct"
+            ],
+            "mcnemar_organic_vs_nemo_base_only": mcn["vs_mistral_nemo_12b_organic_h100"][
+                "baseline_only_correct"
+            ],
+            "mcnemar_organic_vs_nemo_p": round(
+                mcn["vs_mistral_nemo_12b_organic_h100"]["p_value_two_sided"], 4
+            ),
+            "mcnemar_organic_vs_phi4_eg_only": mcn["vs_phi_4_14b_organic_h100"][
+                "epistemic_guard_only_correct"
+            ],
+            "mcnemar_organic_vs_phi4_base_only": mcn["vs_phi_4_14b_organic_h100"][
+                "baseline_only_correct"
+            ],
             "mcnemar_organic_vs_phi4_p": round(
                 mcn["vs_phi_4_14b_organic_h100"]["p_value_two_sided"], 4
             ),
+        },
+        "ablations": {
+            "deterministic_regex_correct": det_abl["correct"],
+            "deterministic_regex_accuracy_pct": det_abl["accuracy_pct"],
+            "deterministic_regex_ci95_low": det_abl["accuracy_wilson_95ci"][0],
+            "deterministic_regex_ci95_high": det_abl["accuracy_wilson_95ci"][1],
+            "deterministic_regex_recall_pct": det_abl["recall_pct"],
+            "deterministic_regex_fpr_pct": det_abl["fpr_pct"],
+            "deterministic_regex_p50_ms": det_abl["latency_p50_ms"],
+            "deterministic_regex_organic_correct": det_abl["by_split"]["Organic_Heldout_H100"][
+                "correct"
+            ],
+            "stage1_no_receipts_correct": s1_abl["correct"],
+            "stage1_no_receipts_accuracy_pct": s1_abl["accuracy_pct"],
+            "stage1_no_receipts_ci95_low": s1_abl["accuracy_wilson_95ci"][0],
+            "stage1_no_receipts_ci95_high": s1_abl["accuracy_wilson_95ci"][1],
+            "stage1_no_receipts_recall_pct": s1_abl["recall_pct"],
+            "stage1_no_receipts_fpr_pct": s1_abl["fpr_pct"],
+            "stage1_no_receipts_p50_ms": s1_abl["latency_p50_ms"],
+            "stage1_no_receipts_organic_correct": s1_abl["by_split"]["Organic_Heldout_H100"][
+                "correct"
+            ],
+        },
+        "dataset_provenance": {
+            "v030_pre_hardening_correct": prov["v030_pre_hardening_correct"],
+            "v030_pre_hardening_accuracy_pct": prov["v030_pre_hardening_accuracy_pct"],
+            "v030_blind42_correct": prov["v030_blind42_correct"],
+            "v052_zero_arg_strict_fp_delta": prov["v052_zero_arg_strict_fp_delta"],
+            "organic_gemma4_e4b_turns": prov["organic_gemma4_e4b_turns"],
+            "organic_gemma4_26b_a4b_turns": prov["organic_gemma4_26b_a4b_turns"],
+            "organic_dual_rater_overlap_n": prov["organic_dual_rater_overlap_n"],
+            "organic_dual_rater_agreement_count": prov["organic_dual_rater_agreement_count"],
+            "organic_dual_rater_agreement_pct": prov["organic_dual_rater_agreement_pct"],
         },
     }
     print(json.dumps(summary, indent=2, sort_keys=True))

@@ -56,6 +56,12 @@ def main() -> None:
         "ed25519_key_bytes": 32,
         "ed25519_signature_bytes": 64,
         "shingle_window_words": DEFAULT_SHINGLE_WINDOW,
+        "dedup_thresholds": {
+            "token_jaccard_min": 0.45,
+            "shingle3_jaccard_min": 0.25,
+            "shingle4_jaccard_min": 0.55,
+            "simhash64_max_hamming_bits": 12,
+        },
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
 

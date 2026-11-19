@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -136,12 +137,39 @@ def _bench_aer1_interop() -> dict[str, int | float]:
         except (SignatureTamperError, ProvenanceError, ValueError):
             tampered_rejected += 1
 
+    corpus_path = ROOT / "benchmarks" / "aer1_conformance_vectors.json"
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    official_vectors = corpus["vectors"]
+    official_total = len(official_vectors)
+    official_valid_total = int(corpus["valid_core_count"])
+    official_invalid_total = int(corpus["invalid_core_count"])
+    official_valid_passed = 0
+    official_invalid_rejected = 0
+    for vec in official_vectors:
+        raw_bytes = base64.b64decode(vec["raw_b64"])
+        if vec["expect_core_valid"]:
+            ToolReceipt.from_aer1(raw_bytes)
+            official_valid_passed += 1
+        else:
+            try:
+                ToolReceipt.from_aer1(raw_bytes)
+            except (SignatureTamperError, ProvenanceError, ValueError):
+                official_invalid_rejected += 1
+    official_matched = official_valid_passed + official_invalid_rejected
+
     return {
         "n_aer1_cases": n_cases,
         "valid_roundtrips": valid_roundtrips,
         "valid_roundtrip_pct": round(100.0 * valid_roundtrips / n_cases, 1),
         "digest_mismatches_rejected": tampered_rejected,
         "digest_rejection_pct": round(100.0 * tampered_rejected / n_cases, 1),
+        "official_kit_vectors": official_total,
+        "official_kit_valid_total": official_valid_total,
+        "official_kit_valid_passed": official_valid_passed,
+        "official_kit_invalid_total": official_invalid_total,
+        "official_kit_invalid_rejected": official_invalid_rejected,
+        "official_kit_matched": official_matched,
+        "official_kit_conformance_pct": round(100.0 * official_matched / official_total, 1),
     }
 
 
@@ -522,10 +550,11 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
         if burden.independent_sources_count == 1 and not burden.meets_casual_burden:
             high_hazard_blocked += 1
 
-    # Paraphrase sensitivity sweep across 4 rewrite intensities (n=20 clusters x 3 URLs each)
-    n_sweep = 20
+    # Paraphrase sensitivity sweep across 5 rewrite intensities (n=50 clusters x 3 URLs each)
+    n_sweep = 50
     t0_collapsed = 0
     t1_collapsed = 0
+    t15_collapsed = 0
     t2_collapsed = 0
     t3_collapsed = 0
     for idx in range(n_sweep):
@@ -536,7 +565,7 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
         # Tier 0: wire dateline + boilerplate wrapper (0% core lexical substitution)
         m0_a = f"(REUTERS) - {origin}"
         m0_b = f"{origin} Read more in our daily security briefing."
-        # Tier 1: light lexical edit (~15% word substitution, preserving 4-gram runs)
+        # Tier 1: light lexical edit (~15% word substitution, preserving 3/4-gram runs)
         m1_a = (
             f"Urgent advisory {idx}: version 4.2 of gateway-{idx} contains an unauthenticated "
             f"buffer overflow in packet parsing that allows remote code execution on port 8443."
@@ -545,6 +574,25 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
             f"Security bulletin {idx}: version 4.2 of gateway-{idx} contains an unauthenticated "
             f"buffer overflow in packet parsing that permits remote command execution on port 8443."
         )
+        # Tier 1.5: intermediate lexical edit (~30% substitution, partial 3-gram overlap)
+        if idx % 2 == 0:
+            m15_a = (
+                f"Vendor notice {idx}: release 4.2 of gateway-{idx} has an unauthenticated "
+                f"buffer overflow in packet parsing enabling remote code execution on port 8443."
+            )
+            m15_b = (
+                f"Patch alert {idx}: release 4.2 of gateway-{idx} includes an unauthenticated "
+                f"buffer overflow in packet handling enabling remote code execution via port 8443."
+            )
+        else:
+            m15_a = (
+                f"Vendor notice {idx}: gateway-{idx} release 4.2 exposes a pre-login "
+                f"overflow defect inside frame decoding that enables remote takeover on TCP 8443."
+            )
+            m15_b = (
+                f"Patch alert {idx}: gateway-{idx} build 4.2 suffers a pre-auth memory bug "
+                f"when decoding frames, permitting arbitrary command execution over TCP 8443."
+            )
         # Tier 2: moderate clause & synonym rewrite (~45% lexical substitution)
         m2_a = (
             f"Gateway-{idx} release 4.2 suffers from a pre-auth memory overflow during packet "
@@ -564,7 +612,7 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
             f"credentials by sending crafted network traffic to the defective decoder."
         )
         for tier_idx, (ma, mb) in enumerate(
-            ((m0_a, m0_b), (m1_a, m1_b), (m2_a, m2_b), (m3_a, m3_b))
+            ((m0_a, m0_b), (m1_a, m1_b), (m15_a, m15_b), (m2_a, m2_b), (m3_a, m3_b))
         ):
             ded, _ = deduplicate_syndicated_sources(
                 [(f"orig-{idx}.org", origin), (f"mir1-{idx}.net", ma), (f"mir2-{idx}.io", mb)]
@@ -575,6 +623,8 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
                 elif tier_idx == 1:
                     t1_collapsed += 1
                 elif tier_idx == 2:
+                    t15_collapsed += 1
+                elif tier_idx == 3:
                     t2_collapsed += 1
                 else:
                     t3_collapsed += 1
@@ -594,6 +644,7 @@ def _bench_syndication_dedup() -> dict[str, int | float]:
         "paraphrase_sweep_clusters_per_tier": n_sweep,
         "tier0_wrapper_collapse_pct": round(100.0 * t0_collapsed / n_sweep, 1),
         "tier1_light_edit_collapse_pct": round(100.0 * t1_collapsed / n_sweep, 1),
+        "tier15_intermediate_edit_collapse_pct": round(100.0 * t15_collapsed / n_sweep, 1),
         "tier2_moderate_rewrite_collapse_pct": round(100.0 * t2_collapsed / n_sweep, 1),
         "tier3_abstractive_rewrite_collapse_pct": round(100.0 * t3_collapsed / n_sweep, 1),
     }
