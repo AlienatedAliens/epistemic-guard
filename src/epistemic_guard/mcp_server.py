@@ -24,10 +24,14 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
     {
         "name": "verify_narration",
         "description": (
-            "Audit an assistant reply clause-by-clause against structured in-memory tool "
-            "execution receipts (or AER-1 envelopes) on local CPU encoders to detect fabricated "
-            "action claims and generate a corrective retry prompt. Use this solely for semantic "
-            "prose supervision; use verify_receipt_log for cryptographic JSONL file verification."
+            "Audit an assistant draft reply clause-by-clause against in-memory turn receipts "
+            "to flag fabricated tool-action claims, unlike verify_receipt_log and inspect_receipt "
+            "which read on-disk JSONL logs. Call before sending a tool-using reply (pass "
+            "receipts=[] when zero tools ran to reject any claimed side effects); do not use for "
+            "RAG citation checking (use corroborate_sources) or log-file cryptography. Runs "
+            "offline with zero network calls: ungrounded claims return is_valid=false with "
+            "character offsets and retry_prompt rather than raising an error, whereas malformed "
+            "receipt objects return isError=true."
         ),
         "annotations": {
             "title": "Verify Assistant Narration Against Tool Receipts",
@@ -46,8 +50,8 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 "receipts": {
                     "type": "array",
                     "description": (
-                        "Tool execution receipts for the current turn (ToolReceipt objects "
-                        "with tool, ok, executed, args, output; pass [] if zero tools ran)."
+                        "Tool execution receipts for the current turn (ToolReceipt objects or "
+                        "AER-1 dicts; pass [] if zero tools ran)."
                     ),
                     "items": {
                         "type": "object",
@@ -95,15 +99,80 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
             "required": ["narration", "receipts"],
             "additionalProperties": False,
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "is_valid": {
+                    "type": "boolean",
+                    "description": "True when every action claim is backed by a receipt.",
+                },
+                "device": {
+                    "type": "string",
+                    "description": "Inference device used for supervision (e.g. CPU).",
+                },
+                "latency_ms": {
+                    "type": "number",
+                    "description": "Wall-clock supervision latency in milliseconds.",
+                },
+                "unsupported_claims": {
+                    "type": "array",
+                    "description": "Verbatim assistant clauses lacking receipt support.",
+                    "items": {"type": "string"},
+                },
+                "unsupported_spans": {
+                    "type": "array",
+                    "description": "Character-level spans for each ungrounded action claim.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "Matched ungrounded clause text.",
+                            },
+                            "start_char": {
+                                "type": "integer",
+                                "description": "Zero-based start character offset in narration.",
+                            },
+                            "end_char": {
+                                "type": "integer",
+                                "description": "Zero-based exclusive end character offset.",
+                            },
+                            "claimed_family": {
+                                "type": "string",
+                                "description": "Inferred action category of the claim.",
+                            },
+                        },
+                        "required": ["text", "start_char", "end_char", "claimed_family"],
+                    },
+                },
+                "retry_prompt": {
+                    "type": "string",
+                    "description": "Corrective repair instruction when is_valid is false, else ''.",
+                },
+            },
+            "required": [
+                "is_valid",
+                "device",
+                "latency_ms",
+                "unsupported_claims",
+                "unsupported_spans",
+                "retry_prompt",
+            ],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "verify_receipt_log",
         "description": (
-            "Cryptographically verify an entire on-disk JSONL receipt log produced by "
-            "`epistemic-guard mcp-proxy`: validates detached Ed25519 signatures, pinned public "
-            "keys, sequential SHA-256 chain hashes, and the aggregate RFC 6962 Merkle root. "
-            "Receipt signing occurs strictly inside the isolated mcp-proxy parent process so "
-            "untrusted agents cannot mint receipts; use inspect_receipt to query single entries."
+            "Validate whole-file cryptographic integrity of an on-disk JSONL receipt log written "
+            "by epistemic-guard mcp-proxy, returning aggregate chain and Merkle root status "
+            "rather than individual entries (use inspect_receipt to fetch entries). Call in CI "
+            "gates or post-session audits; do not use to check assistant prose (use "
+            "verify_narration) or mint receipts (signing is confined to the isolated mcp-proxy "
+            "parent process). Passing both pubkey_file and expected_pubkey_hex requires them to "
+            "encode the identical 32-byte key (omitting both checks self-consistency against "
+            "entry 0), and any missing file, key conflict, sequence gap, or tampered digest "
+            "returns isError=true naming the failing seq."
         ),
         "annotations": {
             "title": "Verify Signed MCP Merkle Receipt Log",
@@ -131,14 +200,59 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
             "required": ["log_path"],
             "additionalProperties": False,
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "log_valid": {
+                    "type": "boolean",
+                    "description": "True when all signatures, chain links, and Merkle roots hold.",
+                },
+                "entry_count": {
+                    "type": "integer",
+                    "description": "Total verified receipt records in the JSONL file.",
+                },
+                "merkle_root": {
+                    "type": "string",
+                    "description": "Hex-encoded 64-char RFC 6962 SHA-256 Merkle root.",
+                },
+                "head_chain_hash": {
+                    "type": "string",
+                    "description": "Hex-encoded cumulative sequential SHA-256 chain tip.",
+                },
+                "public_key_hex": {
+                    "type": "string",
+                    "description": (
+                        "Hex-encoded 32-byte Ed25519 public key verified across entries."
+                    ),
+                },
+                "key_pinned": {
+                    "type": "boolean",
+                    "description": "True when verified against an explicit caller-pinned key.",
+                },
+            },
+            "required": [
+                "log_valid",
+                "entry_count",
+                "merkle_root",
+                "head_chain_hash",
+                "public_key_hex",
+                "key_pinned",
+            ],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "inspect_receipt",
         "description": (
-            "Query a cryptographically verified JSONL receipt log by zero-based sequence index "
-            "(`seq`), tool invocation ID (`call_id`), or tool name (`tool`), returning matching "
-            "signed ToolReceipt records alongside standalone O(log N) RFC 6962 Merkle inclusion "
-            "proofs and optional canonical AER-1 interoperable receipt envelopes."
+            "Retrieve individual signed receipt records, standalone RFC 6962 Merkle inclusion "
+            "proofs, and optional AER-1 envelopes from an on-disk JSONL receipt log, whereas "
+            "verify_receipt_log returns only a whole-log summary. Call when auditing a specific "
+            "tool invocation or exporting portable inclusion proofs; do not use for a fast "
+            "whole-file pass/fail check (use verify_receipt_log) or assistant reply checking (use "
+            "verify_narration). Cryptographically verifies the entire log before returning data: "
+            "filters seq, call_id, and tool combine via logical AND (omitting all three lists "
+            "from seq=0 truncated to limit), while a missing/tampered file, key mismatch, or "
+            "out-of-range seq returns isError=true."
         ),
         "annotations": {
             "title": "Inspect Signed Receipt and Merkle Inclusion Proof",
@@ -192,13 +306,128 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
             "required": ["log_path"],
             "additionalProperties": False,
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "log_valid": {
+                    "type": "boolean",
+                    "description": "True after full-file signature and Merkle verification.",
+                },
+                "entry_count": {
+                    "type": "integer",
+                    "description": "Total entries present in the verified JSONL log.",
+                },
+                "merkle_root": {
+                    "type": "string",
+                    "description": "Hex-encoded 64-char RFC 6962 SHA-256 Merkle root of the log.",
+                },
+                "public_key_hex": {
+                    "type": "string",
+                    "description": "Hex-encoded Ed25519 public key that signed the log.",
+                },
+                "key_pinned": {
+                    "type": "boolean",
+                    "description": "True when verified against expected_pubkey_hex or pubkey_file.",
+                },
+                "match_count": {
+                    "type": "integer",
+                    "description": "Number of filtered receipt entries returned in entries.",
+                },
+                "entries": {
+                    "type": "array",
+                    "description": "Matched receipt records with standalone Merkle proofs.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "seq": {
+                                "type": "integer",
+                                "description": "Zero-based sequence index in the JSONL log.",
+                            },
+                            "receipt": {
+                                "type": "object",
+                                "description": "Signed ToolReceipt fields (tool, args, ok, etc.).",
+                            },
+                            "merkle_inclusion_proof": {
+                                "type": "object",
+                                "description": "Standalone O(log N) RFC 6962 inclusion proof.",
+                                "properties": {
+                                    "leaf_index": {
+                                        "type": "integer",
+                                        "description": "Zero-based leaf position in Merkle tree.",
+                                    },
+                                    "tree_size": {
+                                        "type": "integer",
+                                        "description": "Total leaf count in the Merkle tree.",
+                                    },
+                                    "leaf_sha256": {
+                                        "type": "string",
+                                        "description": "Domain-separated 0x00 leaf SHA-256 hex.",
+                                    },
+                                    "siblings": {
+                                        "type": "array",
+                                        "description": "Ordered sibling hashes from leaf to root.",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "side": {
+                                                    "type": "string",
+                                                    "enum": ["L", "R"],
+                                                    "description": "Sibling position (L or R).",
+                                                },
+                                                "sha256": {
+                                                    "type": "string",
+                                                    "description": "64-char hex sibling digest.",
+                                                },
+                                            },
+                                            "required": ["side", "sha256"],
+                                        },
+                                    },
+                                    "root_sha256": {
+                                        "type": "string",
+                                        "description": "Expected 64-char hex RFC 6962 Merkle root.",
+                                    },
+                                },
+                                "required": [
+                                    "leaf_index",
+                                    "tree_size",
+                                    "leaf_sha256",
+                                    "siblings",
+                                    "root_sha256",
+                                ],
+                            },
+                            "aer1": {
+                                "type": "object",
+                                "description": "Canonical AER-1 envelope when include_aer1=true.",
+                            },
+                        },
+                        "required": ["seq", "receipt", "merkle_inclusion_proof"],
+                    },
+                },
+            },
+            "required": [
+                "log_valid",
+                "entry_count",
+                "merkle_root",
+                "public_key_hex",
+                "key_pinned",
+                "match_count",
+                "entries",
+            ],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "corroborate_sources",
         "description": (
-            "Collapse syndicated wire-copy mirrors across retrieved RAG or web URLs via "
-            "word-shingle MinHash/SimHash clustering, check cross-domain NLI contradictions, "
-            "and evaluate whether independent sources meet hazard-scaled evidentiary burden."
+            "Evaluate independent evidentiary support across retrieved RAG or web snippets by "
+            "collapsing syndicated wire-copy duplicates and checking cross-domain contradictions. "
+            "Call before answering factual queries from retrieved passages; do not use to fetch "
+            "web URLs (URLs are parsed offline solely for domain grouping and never contacted "
+            "over the network) or to audit tool-execution prose (use verify_narration). Supply "
+            "at least two sources from distinct domains to reach multi-source proof standards "
+            "(sources=[] yields speculation with meets_casual_burden=false); contradictions set "
+            "disputed=true without failing, whereas an empty query or malformed sources item "
+            "returns isError=true."
         ),
         "annotations": {
             "title": "Corroborate and Deduplicate RAG Sources",
@@ -222,7 +451,7 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                         "properties": {
                             "url": {
                                 "type": "string",
-                                "description": "Canonical URL or domain identifier of the passage.",
+                                "description": "Source URL or hostname parsed offline for domain.",
                             },
                             "snippet": {
                                 "type": "string",
@@ -235,6 +464,73 @@ MCP_TOOLS: Final[tuple[dict[str, object], ...]] = (
                 },
             },
             "required": ["query", "sources"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "hazard": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Classified risk tier of query scaling required corroboration.",
+                },
+                "achieved_standard": {
+                    "type": "string",
+                    "enum": [
+                        "speculation",
+                        "balance of probabilities",
+                        "clear and convincing",
+                        "beyond reasonable doubt",
+                    ],
+                    "description": "Highest evidentiary standard met after deduplication.",
+                },
+                "raw_sources_count": {
+                    "type": "integer",
+                    "description": "Total input snippet items supplied in sources.",
+                },
+                "independent_sources_count": {
+                    "type": "integer",
+                    "description": "Remaining independent source clusters after deduplication.",
+                },
+                "deduplicated_duplicates_collapsed": {
+                    "type": "integer",
+                    "description": "Count of mirrored or syndicated passages collapsed.",
+                },
+                "disputed": {
+                    "type": "boolean",
+                    "description": "True if cross-domain NLI detected conflicting claims.",
+                },
+                "dispute_sources": {
+                    "type": "array",
+                    "description": "Domain or URL pairs exhibiting NLI contradiction.",
+                    "items": {"type": "string"},
+                },
+                "required_casual_standard": {
+                    "type": "string",
+                    "enum": [
+                        "speculation",
+                        "balance of probabilities",
+                        "clear and convincing",
+                        "beyond reasonable doubt",
+                    ],
+                    "description": "Minimum proof standard required for hazard tier.",
+                },
+                "meets_casual_burden": {
+                    "type": "boolean",
+                    "description": "True if achieved_standard satisfies required_casual_standard.",
+                },
+            },
+            "required": [
+                "hazard",
+                "achieved_standard",
+                "raw_sources_count",
+                "independent_sources_count",
+                "deduplicated_duplicates_collapsed",
+                "disputed",
+                "dispute_sources",
+                "required_casual_standard",
+                "meets_casual_burden",
+            ],
             "additionalProperties": False,
         },
     },
@@ -293,15 +589,19 @@ def _parse_receipts(raw_items: object) -> list[ToolReceipt]:
 
 
 def _tool_result(payload: Mapping[str, object], *, is_error: bool = False) -> dict[str, object]:
-    return {
+    body = dict(payload)
+    res: dict[str, object] = {
         "content": [
             {
                 "type": "text",
-                "text": json.dumps(dict(payload), sort_keys=True),
+                "text": json.dumps(body, sort_keys=True),
             }
         ],
         "isError": is_error,
     }
+    if not is_error:
+        res["structuredContent"] = body
+    return res
 
 
 class EpistemicGuardMcpServer:

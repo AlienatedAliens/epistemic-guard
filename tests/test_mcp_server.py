@@ -55,6 +55,8 @@ def test_mcp_server_introspection_handshake() -> None:
     for tool_def in tools:
         assert tool_def["annotations"]["readOnlyHint"] is True
         assert tool_def["inputSchema"]["additionalProperties"] is False
+        assert tool_def["outputSchema"]["type"] == "object"
+        assert tool_def["outputSchema"]["additionalProperties"] is False
 
 
 def test_mcp_server_verify_narration_and_corroborate() -> None:
@@ -211,6 +213,7 @@ def test_mcp_server_inspect_receipt_and_merkle_proof(tmp_path: Path) -> None:
     single_res = single_resp["result"]
     assert single_res["isError"] is False
     body = json.loads(single_res["content"][0]["text"])
+    assert single_res["structuredContent"] == body
     assert body["log_valid"] is True
     assert body["entry_count"] == 3
     assert body["match_count"] == 1
@@ -265,3 +268,4 @@ def test_mcp_server_inspect_receipt_and_merkle_proof(tmp_path: Path) -> None:
     )
     assert isinstance(oob_resp, dict)
     assert oob_resp["result"]["isError"] is True
+    assert "structuredContent" not in oob_resp["result"]
