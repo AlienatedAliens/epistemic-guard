@@ -1,10 +1,33 @@
 {
+ "ablations": {
+  "deterministic_regex_accuracy_pct": 64.0,
+  "deterministic_regex_ci95_high": 69.7,
+  "deterministic_regex_ci95_low": 57.88,
+  "deterministic_regex_correct": 160,
+  "deterministic_regex_fpr_pct": 3.91,
+  "deterministic_regex_organic_correct": 50,
+  "deterministic_regex_p50_ms": 0.08,
+  "deterministic_regex_recall_pct": 30.33,
+  "stage1_no_receipts_accuracy_pct": 84.8,
+  "stage1_no_receipts_ci95_high": 88.72,
+  "stage1_no_receipts_ci95_low": 79.83,
+  "stage1_no_receipts_correct": 212,
+  "stage1_no_receipts_fpr_pct": 27.34,
+  "stage1_no_receipts_organic_correct": 91,
+  "stage1_no_receipts_p50_ms": 24.98,
+  "stage1_no_receipts_recall_pct": 97.54
+ },
  "comparisons": {
   "delta_accuracy_vs_deberta_pp": 40.4,
   "delta_accuracy_vs_nemo_pp": 6.4,
   "delta_accuracy_vs_phi4_pp": 6.8,
   "delta_organic_vs_nemo_pp": 7.0,
   "delta_organic_vs_phi4_pp": 12.0,
+  "mcnemar_organic_vs_nemo_base_only": 7,
+  "mcnemar_organic_vs_nemo_eg_only": 14,
+  "mcnemar_organic_vs_nemo_p": 0.1892,
+  "mcnemar_organic_vs_phi4_base_only": 5,
+  "mcnemar_organic_vs_phi4_eg_only": 17,
   "mcnemar_organic_vs_phi4_p": 0.0169,
   "mcnemar_vs_nemo_base_only": 15,
   "mcnemar_vs_nemo_eg_only": 31,
@@ -14,6 +37,17 @@
   "mcnemar_vs_phi4_p": 0.0095,
   "speedup_p50_vs_nemo_x": 4.5,
   "speedup_p50_vs_phi4_x": 4.26
+ },
+ "dataset_provenance": {
+  "organic_dual_rater_agreement_count": 30,
+  "organic_dual_rater_agreement_pct": 100.0,
+  "organic_dual_rater_overlap_n": 30,
+  "organic_gemma4_26b_a4b_turns": 50,
+  "organic_gemma4_e4b_turns": 50,
+  "v030_blind42_correct": 95,
+  "v030_pre_hardening_accuracy_pct": 94.4,
+  "v030_pre_hardening_correct": 236,
+  "v052_zero_arg_strict_fp_delta": 3
  },
  "deberta_v3_xsmall_nli_cpu": {
   "accuracy_pct": 52.8,
@@ -39,6 +73,8 @@
   "blind42_coh_100_correct": 92,
   "ci95_high": 95.71,
   "ci95_low": 89.38,
+  "cold_start_init_p50_ms": 921.8,
+  "cold_start_init_p95_ms": 1044.6,
   "correct": 233,
   "fn": 4,
   "fp": 13,
@@ -104,11 +140,11 @@
   "inputs": [
    {
     "path": "benchmarks/external_baselines_benchmark.json",
-    "sha256": "bfed6c82ae05e906a2bc2970ec73efc5efdc2bdc2fe162d62c12aef5c3babb00"
+    "sha256": "fe3f4d3b3ccfe3e6fa98a80a8af6e3c36db04e23d9f77e42875fc1e7c4698e04"
    }
   ],
-  "commit": "6b284eb7eeb921f9dac9922d6fe6f69bf694d514",
-  "now": "2026-11-19T13:50:25+00:00",
+  "commit": "139e8d8564d269d82c5e4b0010d1ea1c8334deac",
+  "now": "2026-11-19T20:19:06+00:00",
   "osaudit": "0.7.0"
  }
 }

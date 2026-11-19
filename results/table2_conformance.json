@@ -12,6 +12,13 @@
   "digest_mismatches_rejected": 50,
   "digest_rejection_pct": 100.0,
   "n_aer1_cases": 50,
+  "official_kit_conformance_pct": 100.0,
+  "official_kit_invalid_rejected": 36,
+  "official_kit_invalid_total": 36,
+  "official_kit_matched": 58,
+  "official_kit_valid_passed": 22,
+  "official_kit_valid_total": 22,
+  "official_kit_vectors": 58,
   "valid_roundtrip_pct": 100.0,
   "valid_roundtrips": 50
  },
@@ -60,10 +67,11 @@
   "high_hazard_false_consensus_blocked": 45,
   "mirrors_per_cluster": 3,
   "n_syndication_clusters": 45,
-  "paraphrase_sweep_clusters_per_tier": 20,
+  "paraphrase_sweep_clusters_per_tier": 50,
   "single_origin_clusters_collapsed": 45,
   "single_origin_collapse_pct": 100.0,
   "tier0_wrapper_collapse_pct": 100.0,
+  "tier15_intermediate_edit_collapse_pct": 40.0,
   "tier1_light_edit_collapse_pct": 100.0,
   "tier2_moderate_rewrite_collapse_pct": 0.0,
   "tier3_abstractive_rewrite_collapse_pct": 0.0,
@@ -85,10 +93,14 @@
    {
     "path": "src/epistemic_guard",
     "sha256": "ea59a91cafcee9a196b5659914115fc640b5890eac60830d03f3eb2b4e0c8729"
+   },
+   {
+    "path": "benchmarks/aer1_conformance_vectors.json",
+    "sha256": "be9f3d9f7290ec967050cfc556593ed620222aafd4975d4c4af3cf8b69e904cc"
    }
   ],
-  "commit": "6b284eb7eeb921f9dac9922d6fe6f69bf694d514",
-  "now": "2026-11-19T13:50:20+00:00",
+  "commit": "139e8d8564d269d82c5e4b0010d1ea1c8334deac",
+  "now": "2026-11-19T20:19:00+00:00",
   "osaudit": "0.7.0"
  }
 }

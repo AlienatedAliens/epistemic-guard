@@ -148,5 +148,13 @@ value = "15%"
 reason = "Approximate lexical word-substitution fraction in Tier 1 light-edit paraphrase sweep"
 
 [[numbers.allow]]
-value = "3"
-reason = "Count of legacy zero-argument worksheet items in BLIND42_COH_100 rejected by strict target-binding"
+value = "30%"
+reason = "Approximate lexical word-substitution fraction in Tier 1.5 intermediate paraphrase sweep"
+
+[[numbers.allow]]
+value = "45%"
+reason = "Approximate lexical word-substitution fraction in Tier 2 moderate-rewrite paraphrase sweep"
+
+[[numbers.allow]]
+value = "80%"
+reason = "Approximate lexical word-substitution fraction in Tier 3 abstractive-rewrite paraphrase sweep"

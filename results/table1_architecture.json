@@ -1,5 +1,11 @@
 {
  "corroboration_bucket_count": 4,
+ "dedup_thresholds": {
+  "shingle3_jaccard_min": 0.25,
+  "shingle4_jaccard_min": 0.55,
+  "simhash64_max_hamming_bits": 12,
+  "token_jaccard_min": 0.45
+ },
  "ed25519_key_bytes": 32,
  "ed25519_signature_bytes": 64,
  "eligible_write_provenance_count": 5,
@@ -47,8 +53,8 @@
     "sha256": "c6bd3931ac95621feb5bb5b5338992370ab8a9f5ea3c59e8f84e6d9ceda17382"
    }
   ],
-  "commit": "6b284eb7eeb921f9dac9922d6fe6f69bf694d514",
-  "now": "2026-11-19T13:50:19+00:00",
+  "commit": "139e8d8564d269d82c5e4b0010d1ea1c8334deac",
+  "now": "2026-11-19T20:18:59+00:00",
   "osaudit": "0.7.0"
  }
 }

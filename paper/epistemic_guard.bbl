@@ -154,9 +154,9 @@ Edwin~B. Wilson.
 
 \bibitem{zambo2026aer1}
 Brennan Zambo.
-\newblock {AI} {Agent Execution Receipt} ({AER-1}).
-\newblock IETF Internet-Draft \texttt{draft-zambo-aer1},
-  \url{https://datatracker.ietf.org/doc/draft-zambo-aer1/}, 2026.
+\newblock {AER-1}: A portable execution receipt for {AI} agent tool calls.
+\newblock IETF Internet-Draft \texttt{draft-zambo-aer1-26} (Work in Progress),
+  \url{https://datatracker.ietf.org/doc/draft-zambo-aer1-26/}, 2026.
 \newblock Accessed: 2026-11-19.
 
 \end{thebibliography}
