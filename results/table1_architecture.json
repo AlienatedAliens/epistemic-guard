@@ -24,7 +24,7 @@
  "source_module_count": 15,
  "supported_mcp_protocols": 3,
  "test_file_count": 4,
- "test_function_count": 32,
+ "test_function_count": 34,
  "total_int8_unpacked_mb": 279.48,
  "provenance": {
   "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
@@ -40,15 +40,15 @@
    },
    {
     "path": "src/epistemic_guard",
-    "sha256": "127e6ed67b663c0692d05e6fc77919e5dbb983629bee05b9531b6106f3428bcc"
+    "sha256": "ea59a91cafcee9a196b5659914115fc640b5890eac60830d03f3eb2b4e0c8729"
    },
    {
     "path": "tests",
-    "sha256": "55fd6d081ec82674fb4ed9694b7273d746245c6c1781569b5d263e5c5cfb761c"
+    "sha256": "c6bd3931ac95621feb5bb5b5338992370ab8a9f5ea3c59e8f84e6d9ceda17382"
    }
   ],
-  "commit": "7778f32a498f4b7d58861e384322d4147ce484f5",
-  "now": "2026-11-19T11:50:55+00:00",
+  "commit": "6b284eb7eeb921f9dac9922d6fe6f69bf694d514",
+  "now": "2026-11-19T13:50:19+00:00",
   "osaudit": "0.7.0"
  }
 }
