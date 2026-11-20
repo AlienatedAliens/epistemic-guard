@@ -19,6 +19,8 @@
   "official_kit_valid_passed": 22,
   "official_kit_valid_total": 22,
   "official_kit_vectors": 58,
+  "reference_verifier_exports_passed": 50,
+  "reference_verifier_exports_pct": 100.0,
   "valid_roundtrip_pct": 100.0,
   "valid_roundtrips": 50
  },
@@ -97,10 +99,14 @@
    {
     "path": "benchmarks/aer1_conformance_vectors.json",
     "sha256": "be9f3d9f7290ec967050cfc556593ed620222aafd4975d4c4af3cf8b69e904cc"
+   },
+   {
+    "path": "benchmarks/aer1_reference_verifier.py",
+    "sha256": "5af209f3961b992da1315cb92505aa3c8191640af76ef17abad9e5d56e7f33a7"
    }
   ],
-  "commit": "139e8d8564d269d82c5e4b0010d1ea1c8334deac",
-  "now": "2026-11-19T20:19:00+00:00",
+  "commit": "4f532d6fe30b2c418484015fe422425cbf10d79a",
+  "now": "2026-11-20T00:42:40+00:00",
   "osaudit": "0.7.0"
  }
 }
