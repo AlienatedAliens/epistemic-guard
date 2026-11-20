@@ -1,0 +1,26 @@
+# epistemic-guard
+
+> Out-of-process Ed25519 MCP tool-receipt proxy, RFC 6962 Merkle audit logs, provenance-gated SQLite memory, and zero-VRAM OpenVINO INT8 runtime verification for catching hallucinated AI agent tool completions.
+
+- Repository: https://github.com/AlienatedAliens/epistemic-guard
+- PyPI: https://pypi.org/project/epistemic-guard/
+- Official MCP Registry: `io.github.AlienatedAliens/epistemic-guard`
+- Models (INT8 ONNX/OpenVINO): https://huggingface.co/RollSolo/epistemic-guard-models
+- Benchmarks (`N=250` & `Live-60`): https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks
+- License: MIT
+
+## Core Capabilities
+
+- **Out-of-process MCP Proxies (`mcp-proxy` stdio & `mcp-http-proxy` Streamable HTTP/SSE):** Signs `tools/call` outcomes, tool errors (`isError: true`), and JSON-RPC `-32602` schema rejections with HKDF-SHA256 + Ed25519 in an isolated parent process; appends RFC 6962 Merkle JSONL logs; pins `tools/list` SHA-256 schemas against mid-session MCP rug-pulls; enforces idempotent retry deduplication and `GET /receipts/<key>` recovery.
+- **Zero-VRAM Post-Turn Supervision (`ReceiptSupervisor`, `OutputValueGuard`, `ConformalCalibrator`):** `82.7 MB` OpenVINO INT8 10-class speech-act classifier + dynamic MCP `tools/list` binder + JSON scalar/NLI payload witness (`~9-18 ms` CPU turn latency, `0 MiB` GPU VRAM) with split-conformal risk calibration (`fnr` / `fpr`).
+- **Provenance-Gated Memory & Source Corroboration (`SQLiteProvenanceStore`, `corroborate_sources`):** Blocks unverified or failed tool outputs from entering episodic SQLite memory (`BEFORE INSERT` triggers + Belnap 4-valued truth states) and deduplicates syndicated RAG web mirrors via 5-word shingle Jaccard + SimHash clustering.
+- **Framework Adapters:** Drop-in helpers for OpenAI, Anthropic, Google Gemini (`verify_chat_turn`), LiteLLM (`EpistemicGuardLiteLLM`), OpenTelemetry `gen_ai.*` spans (`verify_otel_spans`), and one-command MCP config wrapping (`epistemic-guard wrap-config`).
+
+## Key Files
+
+- [AGENTS.md](https://github.com/AlienatedAliens/epistemic-guard/blob/main/AGENTS.md): Step-by-step integration instructions for coding agents and CLI users.
+- [README.md](https://github.com/AlienatedAliens/epistemic-guard/blob/main/README.md): Architecture overview, benchmark tables, threat model, and API quickstart.
+- [src/epistemic_guard/mcp_proxy.py](https://github.com/AlienatedAliens/epistemic-guard/blob/main/src/epistemic_guard/mcp_proxy.py): Out-of-process stdio MCP proxy, `tools/list` SHA-256 rug-pull pinning, and RFC 6962 Merkle JSONL writer.
+- [src/epistemic_guard/http_proxy.py](https://github.com/AlienatedAliens/epistemic-guard/blob/main/src/epistemic_guard/http_proxy.py): Streamable HTTP / SSE MCP proxy with operation-key idempotency (`A1-A5`) and receipt lookup endpoint.
+- [src/epistemic_guard/supervision.py](https://github.com/AlienatedAliens/epistemic-guard/blob/main/src/epistemic_guard/supervision.py): Deontic speech-act clause supervision, contrastive negation handling, and `OutputValueGuard`.
+- [src/epistemic_guard/integrations.py](https://github.com/AlienatedAliens/epistemic-guard/blob/main/src/epistemic_guard/integrations.py): OpenAI, Anthropic, Gemini, LiteLLM, and OpenTelemetry `gen_ai.*` integrations.
