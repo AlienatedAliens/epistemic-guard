@@ -338,6 +338,7 @@ class ReceiptLogWriter:
         )
         self._seen_call_ids: set[str] = set()
         self._op_index: dict[str, ReceiptLogEntry] = {}
+        self._id_index: dict[str, ReceiptLogEntry] = {}
         self._synced_lines = 0
 
         with _exclusive_log_lock(self.log_path):
@@ -436,6 +437,9 @@ class ReceiptLogWriter:
             ):
                 raise MerkleTamperError(f"Existing receipt log failed Merkle check at seq={idx}.")
             self._seen_call_ids.add(entry.receipt.call_id)
+            self._id_index[entry.receipt.call_id] = entry
+            if isinstance(entry.aer1, Mapping) and isinstance(entry.aer1.get("id"), str):
+                self._id_index[str(entry.aer1["id"])] = entry
             if entry.operation_key and entry.operation_key not in self._op_index:
                 self._op_index[entry.operation_key] = entry
         self._synced_lines = len(raw_lines)
@@ -449,6 +453,16 @@ class ReceiptLogWriter:
             if self.log_path.exists() and self.log_path.stat().st_size > 0:
                 self._sync_from_disk_locked()
             return self._op_index.get(key)
+
+    def lookup_receipt_or_operation(self, identifier: str) -> ReceiptLogEntry | None:
+        """Resolve a log entry by `operation_key`, `receipt.call_id`, or `aer1.id`."""
+        ident = identifier.strip()
+        if not ident:
+            return None
+        with self._lock, _exclusive_log_lock(self.log_path):
+            if self.log_path.exists() and self.log_path.stat().st_size > 0:
+                self._sync_from_disk_locked()
+            return self._op_index.get(ident) or self._id_index.get(ident)
 
     def export_aer1_chain_v07(
         self, *, close: bool = True, published_at: str | None = None
@@ -526,6 +540,9 @@ class ReceiptLogWriter:
             )
             if clean_op and clean_op not in self._op_index:
                 self._op_index[clean_op] = entry
+            self._id_index[signed.call_id] = entry
+            if isinstance(entry.aer1, Mapping) and isinstance(entry.aer1.get("id"), str):
+                self._id_index[str(entry.aer1["id"])] = entry
             serialized = json.dumps(
                 entry.model_dump(exclude_none=True),
                 sort_keys=True,

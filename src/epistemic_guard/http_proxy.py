@@ -157,8 +157,8 @@ class McpStreamableHttpProxy:
             return f"{prefix}-{self._call_seq}-{uuid4().hex[:8]}"
 
     def recover_operation(self, operation_key: str) -> tuple[int, dict[str, object]]:
-        """Lost-Response Contract `A3` & `A5`: key-only recovery returning committed digest."""
-        entry = self.writer.lookup_operation(operation_key)
+        """Lost-Response Contract `A3` & `A5`: resolve committed digest by `K` or `receipt_id`."""
+        entry = self.writer.lookup_receipt_or_operation(operation_key)
         if entry is None:
             return (
                 404,
