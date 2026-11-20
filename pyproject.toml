@@ -1,7 +1,7 @@
 [project]
 name = "epistemic-guard"
-version = "0.5.2"
-description = "Signed tool receipts, out-of-process MCP receipt proxy, Ed25519 memory write-gating, and RAG deduplication for agents (CPU/NPU, zero LLM calls)"
+version = "0.6.0"
+description = "Signed tool receipts, stdio & Streamable HTTP MCP proxies, Ed25519 memory write-gating, and CPU/NPU agent verification (zero LLM calls)"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Sean Maxwell" }]
@@ -87,6 +87,7 @@ ignore = ["PLR0913", "PLR2004", "S105", "PLR0911", "PLR0912", "PLR0915", "PLR091
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S102", "S106", "S603", "S607", "S608", "ANN", "PLR", "BLE001", "PLC0415", "E501"]
 "src/epistemic_guard/mcp_proxy.py" = ["S603"]
+"src/epistemic_guard/http_proxy.py" = ["S310"]
 "src/epistemic_guard/models.py" = ["S310"]
 
 [tool.mypy]

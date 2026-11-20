@@ -12,6 +12,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, ParamSpec, Protocol, TypeVar, overload, runtime_checkable
 
+from epistemic_guard.exceptions import EpistemicGuardError
 from epistemic_guard.provenance import DomainSigner
 from epistemic_guard.schemas import SupervisionVerdict, ToolReceipt
 from epistemic_guard.store import MerkleReceiptLog
@@ -494,13 +495,63 @@ def signed_tool(  # noqa: UP047
     return _decorator
 
 
-def _extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> list[ToolReceipt]:
-    """Extract `ToolReceipt` items from OpenAI-style `tool_calls` + `role='tool'` message pairs."""
+def _extract_text_from_message(msg: Mapping[str, Any]) -> str:
+    """Extract plain assistant/user prose across OpenAI, Anthropic (`content` blocks),
+    and Google Gemini (`parts` arrays) message formats.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for blk in content:
+            if isinstance(blk, str):
+                chunks.append(blk)
+            elif isinstance(blk, Mapping) and blk.get("type") == "text":
+                txt = blk.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks)
+
+    parts = msg.get("parts")
+    if isinstance(parts, list):
+        g_chunks: list[str] = []
+        for part in parts:
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                if part["text"].strip():
+                    g_chunks.append(part["text"])
+        if g_chunks:
+            return "\n".join(g_chunks)
+    return ""
+
+
+def _parse_raw_args_map(raw_args: object) -> dict[str, str | int | float | bool]:
+    if isinstance(raw_args, str):
+        try:
+            obj = json.loads(raw_args)
+            if isinstance(obj, Mapping):
+                return {str(k): _coerce_arg_scalar(v) for k, v in obj.items()}
+        except Exception:
+            return {}
+    elif isinstance(raw_args, Mapping):
+        return {str(k): _coerce_arg_scalar(v) for k, v in raw_args.items()}
+    return {}
+
+
+def extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> list[ToolReceipt]:
+    """Extract `ToolReceipt` items across OpenAI (`tool_calls`/`tool`), Anthropic
+    (`tool_use`/`tool_result`), and Google Gemini (`functionCall`/`functionResponse`) transcripts.
+    """
     call_meta: dict[str, tuple[str, dict[str, str | int | float | bool]]] = {}
+    gemini_pending_by_name: dict[str, list[dict[str, str | int | float | bool]]] = {}
     extracted: list[ToolReceipt] = []
+    seq_counter = 0
 
     for msg in messages:
         role = str(msg.get("role", "")).lower()
+
+        # 1. OpenAI assistant `tool_calls`
         if role == "assistant":
             tcalls = msg.get("tool_calls")
             if isinstance(tcalls, list):
@@ -511,27 +562,106 @@ def _extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> li
                     fn_obj = tc.get("function")
                     if isinstance(fn_obj, Mapping):
                         tname = str(fn_obj.get("name", ""))
-                        raw_args = fn_obj.get("arguments", "{}")
-                        parsed_args: dict[str, str | int | float | bool] = {}
-                        if isinstance(raw_args, str):
-                            try:
-                                obj = json.loads(raw_args)
-                                if isinstance(obj, Mapping):
-                                    parsed_args = {
-                                        str(k): _coerce_arg_scalar(v) for k, v in obj.items()
-                                    }
-                            except Exception:
-                                parsed_args = {}
-                        elif isinstance(raw_args, Mapping):
-                            parsed_args = {
-                                str(k): _coerce_arg_scalar(v) for k, v in raw_args.items()
-                            }
+                        parsed_args = _parse_raw_args_map(fn_obj.get("arguments", "{}"))
                         if cid and tname:
                             call_meta[cid] = (tname, parsed_args)
-        elif role == "tool":
+
+        # 2. Anthropic `content` blocks (`tool_use` + `tool_result`)
+        content_val = msg.get("content")
+        if isinstance(content_val, list):
+            for blk in content_val:
+                if not isinstance(blk, Mapping):
+                    continue
+                btype = blk.get("type")
+                if btype == "tool_use":
+                    cid = str(blk.get("id", ""))
+                    tname = str(blk.get("name", ""))
+                    parsed_args = _parse_raw_args_map(blk.get("input", {}))
+                    if cid and tname:
+                        call_meta[cid] = (tname, parsed_args)
+                elif btype == "tool_result":
+                    seq_counter += 1
+                    cid = str(blk.get("tool_use_id", ""))
+                    raw_res = blk.get("content", "")
+                    if isinstance(raw_res, list):
+                        res_txt = "\n".join(
+                            str(x.get("text", ""))
+                            for x in raw_res
+                            if isinstance(x, Mapping) and x.get("type") == "text"
+                        )
+                    elif isinstance(raw_res, str):
+                        res_txt = raw_res
+                    else:
+                        res_txt = json.dumps(raw_res, sort_keys=True, separators=(",", ":"))
+                    is_err = bool(blk.get("is_error", False)) or res_txt.lower().startswith(
+                        ("error:", "traceback")
+                    )
+                    tname, parsed_args = call_meta.get(
+                        cid, (str(blk.get("name", "tool")), {})
+                    )
+                    extracted.append(
+                        ToolReceipt(
+                            tool=tname,
+                            ok=not is_err,
+                            call_id=cid or f"anthropic-tool-{seq_counter}",
+                            args=parsed_args,
+                            output=res_txt,
+                        )
+                    )
+
+        # 3. Google Gemini `parts` (`functionCall` + `functionResponse`)
+        parts_val = msg.get("parts")
+        if isinstance(parts_val, list):
+            for part in parts_val:
+                if not isinstance(part, Mapping):
+                    continue
+                fc = part.get("functionCall") or part.get("function_call")
+                if isinstance(fc, Mapping):
+                    tname = str(fc.get("name", ""))
+                    parsed_args = _parse_raw_args_map(fc.get("args", {}))
+                    cid = str(fc.get("id", ""))
+                    if cid and tname:
+                        call_meta[cid] = (tname, parsed_args)
+                    elif tname:
+                        gemini_pending_by_name.setdefault(tname, []).append(parsed_args)
+                fr = part.get("functionResponse") or part.get("function_response")
+                if isinstance(fr, Mapping):
+                    seq_counter += 1
+                    tname = str(fr.get("name", "tool"))
+                    cid = str(fr.get("id", ""))
+                    resp_obj = fr.get("response", {})
+                    if cid and cid in call_meta:
+                        tname, parsed_args = call_meta[cid]
+                    else:
+                        q = gemini_pending_by_name.get(tname)
+                        parsed_args = q.pop(0) if q else {}
+                    is_err = False
+                    if isinstance(resp_obj, Mapping):
+                        if bool(resp_obj.get("is_error", False)) or "error" in resp_obj:
+                            is_err = True
+                        out_txt = json.dumps(resp_obj, sort_keys=True, separators=(",", ":"))
+                    else:
+                        out_txt = str(resp_obj)
+                    extracted.append(
+                        ToolReceipt(
+                            tool=tname,
+                            ok=not is_err,
+                            call_id=cid or f"gemini-fn-{seq_counter}",
+                            args=parsed_args,
+                            output=out_txt,
+                        )
+                    )
+
+        # 4. OpenAI `role == "tool"` messages
+        if role == "tool" and not isinstance(parts_val, list):
+            seq_counter += 1
             cid = str(msg.get("tool_call_id", ""))
-            content = str(msg.get("content", ""))
-            is_err = bool(msg.get("is_error", False)) or content.lower().startswith(
+            content_str = (
+                content_val
+                if isinstance(content_val, str)
+                else json.dumps(content_val, sort_keys=True, separators=(",", ":"))
+            )
+            is_err = bool(msg.get("is_error", False)) or content_str.lower().startswith(
                 ("error:", "traceback")
             )
             tname, parsed_args = call_meta.get(cid, (str(msg.get("name", "tool")), {}))
@@ -539,42 +669,277 @@ def _extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> li
                 ToolReceipt(
                     tool=tname,
                     ok=not is_err,
-                    call_id=cid or "tool-msg",
+                    call_id=cid or f"tool-msg-{seq_counter}",
                     args=parsed_args,
-                    output=content,
+                    output=content_str,
                 )
             )
     return extracted
 
 
+_extract_receipts_from_messages = extract_receipts_from_messages
+
+
 def verify_chat_turn(
     messages: Sequence[Mapping[str, Any]],
     *,
+    response: str | Mapping[str, Any] | None = None,
     receipts: Sequence[ToolReceipt] | None = None,
     supervisor: ReceiptSupervisor | None = None,
+    verify_output_values: bool | None = None,
     device: str | None = None,
     warn_on_missing: bool = True,
 ) -> SupervisionVerdict:
-    """Verify the latest assistant message in an OpenAI/Anthropic history against `ToolReceipt`s."""
+    """Verify an OpenAI, Anthropic, or Google Gemini turn against executed `ToolReceipt`s."""
     sup = supervisor or ReceiptSupervisor(device=device, warn_on_missing=warn_on_missing)
 
     last_assistant = ""
+    if isinstance(response, str):
+        last_assistant = response
+    elif isinstance(response, Mapping):
+        # Support OpenAI ChatCompletion dict (`choices[0].message`) or direct message dict
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+            msg_obj = choices[0].get("message")
+            if isinstance(msg_obj, Mapping):
+                last_assistant = _extract_text_from_message(msg_obj)
+        if not last_assistant:
+            last_assistant = _extract_text_from_message(response)
+
     last_user = ""
     for msg in reversed(messages):
         role = str(msg.get("role", "")).lower()
-        content = msg.get("content", "")
-        text = content if isinstance(content, str) else json.dumps(content)
-        if not last_assistant and role == "assistant" and text.strip():
+        text = _extract_text_from_message(msg)
+        if not last_assistant and role in {"assistant", "model"} and text.strip():
             last_assistant = text
-        elif last_assistant and role == "user" and text.strip():
+        elif role == "user" and text.strip():
             last_user = text
-            break
+            if last_assistant:
+                break
 
     active_receipts = (
-        list(receipts) if receipts is not None else _extract_receipts_from_messages(messages)
+        list(receipts) if receipts is not None else extract_receipts_from_messages(messages)
     )
     return sup.verify_narration(
         last_assistant,
         receipts=active_receipts,
         user_prompt=last_user,
+        verify_output_values=verify_output_values,
     )
+
+
+verify_turn = verify_chat_turn
+
+
+def _read_span_attributes(span: object) -> dict[str, Any]:
+    if isinstance(span, Mapping):
+        raw_attrs = span.get("attributes")
+        if isinstance(raw_attrs, Mapping):
+            return {str(k): v for k, v in raw_attrs.items()}
+        return {str(k): v for k, v in span.items()}
+    attrs_prop = getattr(span, "attributes", None)
+    if isinstance(attrs_prop, Mapping):
+        return {str(k): v for k, v in attrs_prop.items()}
+    return {}
+
+
+def extract_receipts_from_otel_spans(spans: Sequence[object]) -> list[ToolReceipt]:
+    """Extract `ToolReceipt` records from OpenTelemetry `gen_ai.*` / OpenInference tool spans."""
+    receipts: list[ToolReceipt] = []
+    for idx, sp in enumerate(spans):
+        attrs = _read_span_attributes(sp)
+        op_name = str(attrs.get("gen_ai.operation.name") or "").lower()
+        tool_name = str(
+            attrs.get("gen_ai.tool.name")
+            or attrs.get("epistemic_guard.receipt.tool")
+            or attrs.get("tool.name")
+            or ""
+        )
+        if not tool_name and op_name != "execute_tool":
+            continue
+        if not tool_name:
+            span_name = getattr(sp, "name", None) or (
+                sp.get("name") if isinstance(sp, Mapping) else ""
+            )
+            tool_name = str(span_name or "tool")
+
+        call_id = str(
+            attrs.get("gen_ai.tool.call.id")
+            or attrs.get("epistemic_guard.receipt.call_id")
+            or f"otel-tool-{idx + 1}"
+        )
+        raw_args = (
+            attrs.get("gen_ai.tool.call.arguments")
+            or attrs.get("tool.parameters")
+            or attrs.get("input.value")
+            or {}
+        )
+        args_map = _parse_raw_args_map(raw_args)
+        raw_res = (
+            attrs.get("gen_ai.tool.call.result")
+            or attrs.get("output.value")
+            or ""
+        )
+        out_str = (
+            raw_res
+            if isinstance(raw_res, str)
+            else json.dumps(raw_res, sort_keys=True, separators=(",", ":"))
+        )
+        err_type = str(
+            attrs.get("error.type") or attrs.get("epistemic_guard.receipt.error_code") or ""
+        )
+        status_code_attr = str(attrs.get("otel.status_code") or "").upper()
+        ok_attr = attrs.get("epistemic_guard.receipt.ok")
+        exec_attr = attrs.get("epistemic_guard.receipt.executed")
+        is_ok = (
+            bool(ok_attr)
+            if isinstance(ok_attr, bool)
+            else (not bool(err_type) and status_code_attr != "ERROR")
+        )
+        executed = bool(exec_attr) if isinstance(exec_attr, bool) else True
+        receipts.append(
+            ToolReceipt(
+                tool=tool_name,
+                ok=is_ok,
+                executed=executed,
+                error_code=err_type,
+                call_id=call_id,
+                args=args_map,
+                output=out_str,
+            )
+        )
+    return receipts
+
+
+def verify_otel_spans(
+    spans: Sequence[object],
+    *,
+    assistant_text: str | None = None,
+    user_prompt: str = "",
+    target_span: SupportsOtelSpan | None = None,
+    supervisor: ReceiptSupervisor | None = None,
+    verify_output_values: bool | None = None,
+    device: str | None = None,
+    warn_on_missing: bool = False,
+) -> SupervisionVerdict:
+    """Verify an assistant turn directly from OpenTelemetry `gen_ai.*` spans (Langfuse, Arize,
+    Datadog) and optionally stamp verdict attributes onto `target_span`.
+    """
+    sup = supervisor or ReceiptSupervisor(device=device, warn_on_missing=warn_on_missing)
+    receipts = extract_receipts_from_otel_spans(spans)
+    reply_txt = assistant_text or ""
+    prompt_txt = user_prompt
+    if not reply_txt or not prompt_txt:
+        for sp in reversed(spans):
+            attrs = _read_span_attributes(sp)
+            if not reply_txt:
+                cand = (
+                    attrs.get("gen_ai.completion")
+                    or attrs.get("gen_ai.output.messages")
+                    or attrs.get("output.value")
+                )
+                if isinstance(cand, str) and cand.strip() and not attrs.get("gen_ai.tool.name"):
+                    reply_txt = cand
+            if not prompt_txt:
+                pcand = attrs.get("gen_ai.prompt") or attrs.get("input.value")
+                if isinstance(pcand, str) and pcand.strip() and not attrs.get("gen_ai.tool.name"):
+                    prompt_txt = pcand
+    verdict = sup.verify_narration(
+        reply_txt,
+        receipts=receipts,
+        user_prompt=prompt_txt,
+        verify_output_values=verify_output_values,
+    )
+    if target_span is not None:
+        attach_otel_evidence(target_span, receipts=receipts, verdict=verdict)
+    return verdict
+
+
+class EpistemicGuardLiteLLM:
+    """Drop-in LiteLLM post-call guardrail (`BerriAI/litellm` `CustomGuardrail` compatible,
+    without requiring `litellm` to be installed).
+    """
+
+    def __init__(
+        self,
+        *,
+        supervisor: ReceiptSupervisor | None = None,
+        action_on_fail: str = "raise",
+        verify_output_values: bool = False,
+        device: str | None = None,
+        warn_on_missing: bool = False,
+    ) -> None:
+        if action_on_fail not in {"raise", "rewrite"}:
+            raise ValueError("action_on_fail must be 'raise' or 'rewrite'.")
+        self.supervisor = supervisor or ReceiptSupervisor(
+            device=device,
+            verify_output_values=verify_output_values,
+            warn_on_missing=warn_on_missing,
+        )
+        self.action_on_fail = action_on_fail
+        self.verify_output_values = verify_output_values
+
+    def verify_completion(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        response: object,
+    ) -> SupervisionVerdict:
+        reply_text = ""
+        if isinstance(response, str):
+            reply_text = response
+        elif isinstance(response, Mapping):
+            reply_text = ""
+            verdict = verify_chat_turn(
+                messages,
+                response=response,
+                supervisor=self.supervisor,
+                verify_output_values=self.verify_output_values,
+            )
+            return verdict
+        else:
+            choices = getattr(response, "choices", None)
+            if isinstance(choices, list) and choices:
+                msg = getattr(choices[0], "message", None)
+                content = getattr(msg, "content", None)
+                if isinstance(content, str):
+                    reply_text = content
+        return verify_chat_turn(
+            messages,
+            response=reply_text,
+            supervisor=self.supervisor,
+            verify_output_values=self.verify_output_values,
+        )
+
+    async def async_post_call_success_hook(
+        self,
+        data: Mapping[str, Any],
+        user_api_key_dict: Any,  # noqa: ANN401
+        response: Any,  # noqa: ANN401
+    ) -> Any:  # noqa: ANN401
+        """LiteLLM `CustomGuardrail.async_post_call_success_hook` signature."""
+        del user_api_key_dict
+        raw_msgs = data.get("messages")
+        msgs = [m for m in raw_msgs if isinstance(m, Mapping)] if isinstance(raw_msgs, list) else []
+        verdict = self.verify_completion(msgs, response)
+        if verdict.is_valid:
+            return response
+        receipts = extract_receipts_from_messages(msgs)
+        retry_hint = verdict.to_retry_prompt(receipts)
+        if self.action_on_fail == "raise":
+            raise EpistemicGuardError(retry_hint)
+        if isinstance(response, Mapping):
+            mut = dict(response)
+            choices = mut.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+                c0 = dict(choices[0])
+                m0 = dict(c0.get("message") or {})
+                m0["content"] = f"[UNGROUNDED CLAIM BLOCKED] {retry_hint}"
+                c0["message"] = m0
+                mut["choices"] = [c0, *choices[1:]]
+            return mut
+        choices_attr = getattr(response, "choices", None)
+        if isinstance(choices_attr, list) and choices_attr:
+            msg_attr = getattr(choices_attr[0], "message", None)
+            if msg_attr is not None and hasattr(msg_attr, "content"):
+                msg_attr.content = f"[UNGROUNDED CLAIM BLOCKED] {retry_hint}"
+        return response

@@ -6,14 +6,18 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import openvino as ov
 
 from epistemic_guard.corroboration import corroborate_sources
 from epistemic_guard.exceptions import EpistemicGuardError, ProvenanceError
+from epistemic_guard.http_proxy import run_mcp_http_proxy
 from epistemic_guard.integrations import ReceiptRecorder
 from epistemic_guard.mcp_proxy import run_mcp_stdio_proxy, verify_receipt_log_file
 from epistemic_guard.mcp_server import run_mcp_stdio_server
@@ -61,7 +65,7 @@ def _cmd_doctor() -> int:
 
 
 def _cmd_demo() -> int:
-    print("epistemic-guard v0.5.2 — Live Verification Demo")
+    print("epistemic-guard v0.6.0 — Live Verification Demo")
     print("=" * 68)
 
     master_key = os.urandom(32)
@@ -208,6 +212,8 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             pubkey_out=args.pubkey_out,
             truncate_log=args.truncate,
             include_aer1=args.aer1,
+            pin_tools=args.pin_tools,
+            filter_web_results=args.filter_web_results,
             session_id=args.session_id,
             prev_log_path=args.prev_log,
             prev_pubkey_file=args.prev_pubkey_file,
@@ -215,6 +221,148 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
         return 2
+
+
+def _cmd_mcp_http_proxy(args: argparse.Namespace) -> int:
+    try:
+        return run_mcp_http_proxy(
+            args.upstream,
+            log_path=args.log,
+            host=args.host,
+            port=int(args.port),
+            key_file=args.key_file,
+            pubkey_out=args.pubkey_out,
+            truncate_log=args.truncate,
+            include_aer1=args.aer1,
+            pin_tools=args.pin_tools,
+            filter_web_results=args.filter_web_results,
+            session_id=args.session_id,
+            prev_log_path=args.prev_log,
+            prev_pubkey_file=args.prev_pubkey_file,
+            timeout_s=float(args.timeout),
+        )
+    except (EpistemicGuardError, OSError, ValueError) as exc:
+        print(f"epistemic-guard mcp-http-proxy error: {exc}", file=sys.stderr)
+        return 2
+
+
+def wrap_mcp_config_dict(
+    config_doc: Mapping[str, Any],
+    *,
+    log_dir: Path,
+    pin_tools: bool = False,
+    filter_web_results: bool = False,
+    unwrap: bool = False,
+) -> tuple[dict[str, Any], int]:
+    """Wrap or unwrap `mcpServers` entries in Cursor / Claude Desktop / Claude Code JSON configs."""
+    out = dict(config_doc)
+    servers_raw = out.get("mcpServers")
+    if not isinstance(servers_raw, Mapping):
+        return (out, 0)
+
+    updated_servers: dict[str, Any] = {}
+    changed = 0
+    for name, entry in servers_raw.items():
+        if not isinstance(entry, Mapping):
+            updated_servers[str(name)] = entry
+            continue
+        ent = dict(entry)
+        cmd = ent.get("command")
+        raw_args = ent.get("args")
+        arg_list = [str(x) for x in raw_args] if isinstance(raw_args, list) else []
+
+        is_wrapped = cmd == "epistemic-guard" and len(arg_list) >= 2 and arg_list[0] == "mcp-proxy"
+        if unwrap:
+            if is_wrapped and "--" in arg_list:
+                sep_idx = arg_list.index("--")
+                orig = arg_list[sep_idx + 1 :]
+                if orig:
+                    ent["command"] = orig[0]
+                    ent["args"] = orig[1:]
+                    changed += 1
+            updated_servers[str(name)] = ent
+            continue
+
+        if is_wrapped or str(name) == "epistemic-guard" or not isinstance(cmd, str) or not cmd:
+            updated_servers[str(name)] = ent
+            continue
+
+        log_path = (log_dir / f"{name}.receipts.jsonl").as_posix()
+        proxy_args: list[str] = ["mcp-proxy", "--log", log_path]
+        if pin_tools:
+            proxy_args.append("--pin-tools")
+        if filter_web_results:
+            proxy_args.append("--filter-web-results")
+        proxy_args.extend(["--", cmd, *arg_list])
+        ent["command"] = "epistemic-guard"
+        ent["args"] = proxy_args
+        updated_servers[str(name)] = ent
+        changed += 1
+
+    out["mcpServers"] = updated_servers
+    return (out, changed)
+
+
+def _resolve_client_config_path(target: str) -> Path:
+    low = target.strip().lower()
+    home = Path.home()
+    if low == "cursor":
+        return home / ".cursor" / "mcp.json"
+    if low in {"claude-code", "claudecode"}:
+        return home / ".claude.json"
+    if low in {"claude", "claude-desktop"}:
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA") or str(home / "AppData" / "Roaming")
+            return Path(appdata) / "Claude" / "claude_desktop_config.json"
+        if sys.platform == "darwin":
+            return (
+                home
+                / "Library"
+                / "Application Support"
+                / "Claude"
+                / "claude_desktop_config.json"
+            )
+        return home / ".config" / "Claude" / "claude_desktop_config.json"
+    return Path(target)
+
+
+def _cmd_wrap_config(args: argparse.Namespace) -> int:
+    cfg_path = _resolve_client_config_path(args.target)
+    if not cfg_path.exists():
+        print(f"epistemic-guard wrap-config: file not found: {cfg_path}", file=sys.stderr)
+        return 2
+    try:
+        loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"epistemic-guard wrap-config: invalid JSON in {cfg_path}: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(loaded, Mapping):
+        print(
+            f"epistemic-guard wrap-config: root of {cfg_path} must be an object.",
+            file=sys.stderr,
+        )
+        return 2
+
+    log_dir = Path(args.log_dir) if args.log_dir else (Path.home() / ".epistemic_guard" / "logs")
+    updated, count = wrap_mcp_config_dict(
+        loaded,
+        log_dir=log_dir,
+        pin_tools=args.pin_tools,
+        filter_web_results=args.filter_web_results,
+        unwrap=args.unwrap,
+    )
+    rendered = json.dumps(updated, indent=2) + "\n"
+    if args.dry_run:
+        print(rendered, end="")
+        return 0
+    if count > 0:
+        backup = cfg_path.with_suffix(cfg_path.suffix + ".bak")
+        shutil.copy2(cfg_path, backup)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(rendered, encoding="utf-8")
+    verb = "unwrapped" if args.unwrap else "wrapped"
+    print(f"OK: {verb} {count} MCP server(s) in {cfg_path}")
+    return 0
 
 
 def _cmd_verify_log(args: argparse.Namespace) -> int:
@@ -360,6 +508,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Include an exported AER-1 envelope alongside each native ToolReceipt",
     )
     mp.add_argument(
+        "--pin-tools",
+        action="store_true",
+        help="Pin SHA-256 of initial tools/list schemas and block mid-session rug-pulls",
+    )
+    mp.add_argument(
+        "--filter-web-results",
+        action="store_true",
+        help="Sanitize untrusted web-search MCP outputs (dedup wire copies & strip directives)",
+    )
+    mp.add_argument(
         "--session-id",
         default=None,
         help="Optional session identifier bound into each signed ToolReceipt",
@@ -428,6 +586,51 @@ def main(argv: list[str] | None = None) -> int:
     )
     ms.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
 
+    mhp = sub.add_parser(
+        "mcp-http-proxy",
+        help="Run a Streamable HTTP / SSE MCP receipt proxy with Lost-Response recovery",
+    )
+    mhp.add_argument("--upstream", required=True, help="Target http:// or https:// MCP endpoint")
+    mhp.add_argument("--log", required=True, help="Append-only JSONL receipt log path")
+    mhp.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    mhp.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    mhp.add_argument("--key-file", default=None, help="Path to 32-byte Ed25519 seed file")
+    mhp.add_argument("--pubkey-out", default=None, help="Write Ed25519 public key JSON here")
+    mhp.add_argument("--truncate", action="store_true", help="Truncate existing --log on startup")
+    mhp.add_argument("--aer1", action="store_true", help="Include AER-1 export on each log entry")
+    mhp.add_argument(
+        "--pin-tools", action="store_true", help="Pin tools/list SHA-256 against rug-pulls"
+    )
+    mhp.add_argument(
+        "--filter-web-results",
+        action="store_true",
+        help="Deduplicate wire copies and strip directives from web MCP outputs",
+    )
+    mhp.add_argument("--session-id", default=None, help="Session ID bound into signed receipts")
+    mhp.add_argument("--prev-log", default=None, help="Predecessor JSONL log path for rotation")
+    mhp.add_argument("--prev-pubkey-file", default=None, help="Public key file pinning --prev-log")
+    mhp.add_argument("--timeout", type=float, default=30.0, help="Upstream HTTP timeout in seconds")
+
+    wc = sub.add_parser(
+        "wrap-config",
+        help="Auto-wrap mcpServers in Cursor, Claude Desktop, Claude Code, or a JSON file",
+    )
+    wc.add_argument(
+        "target",
+        help="Client alias ('cursor', 'claude', 'claude-code') or path to mcp.json",
+    )
+    wc.add_argument("--log-dir", default=None, help="Directory for per-server .receipts.jsonl logs")
+    wc.add_argument(
+        "--pin-tools", action="store_true", help="Enable --pin-tools on wrapped servers"
+    )
+    wc.add_argument(
+        "--filter-web-results",
+        action="store_true",
+        help="Enable --filter-web-results on wrapped servers",
+    )
+    wc.add_argument("--unwrap", action="store_true", help="Restore unwrapped server commands")
+    wc.add_argument("--dry-run", action="store_true", help="Print updated JSON without writing")
+
     parsed = parser.parse_args(argv)
     if parsed.command == "doctor":
         return _cmd_doctor()
@@ -435,6 +638,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_download(parsed)
     if parsed.command == "mcp-proxy":
         return _cmd_mcp_proxy(parsed)
+    if parsed.command == "mcp-http-proxy":
+        return _cmd_mcp_http_proxy(parsed)
+    if parsed.command == "wrap-config":
+        return _cmd_wrap_config(parsed)
     if parsed.command == "mcp-server":
         return run_mcp_stdio_server(device=parsed.device)
     if parsed.command == "verify-log":

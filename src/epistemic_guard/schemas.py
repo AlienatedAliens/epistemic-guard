@@ -223,6 +223,34 @@ def _json_quote(val: object) -> str:
     return json.dumps(val, ensure_ascii=False)
 
 
+def _aer1_metadata_block(rec: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Rebuild Section 3.1 canonical metadata block (`draft-zambo-aer1-26`)."""
+    tool = rec.get("tool")
+    if not isinstance(tool, Mapping):
+        return None
+    block: dict[str, Any] = {}
+    for key in ("created_at", "id", "output_hash", "provenance_class", "receipt_schema_version"):
+        val = rec.get(key)
+        if not isinstance(val, str):
+            return None
+        block[key] = val
+    tool_block: dict[str, str] = {}
+    for key in ("name", "scope", "version"):
+        val = tool.get(key)
+        if not isinstance(val, str):
+            return None
+        tool_block[key] = val
+    block["tool"] = tool_block
+    return block
+
+
+def _aer1_metadata_digest(block: Mapping[str, Any]) -> str:
+    blob = json.dumps(
+        block, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(blob).hexdigest()}"
+
+
 def _derive_aer1_uuid(call_id: str, canon_sha: str) -> str:
     if _AER1_UUID_RE.match(call_id) and call_id != _AER1_NIL_UUID:
         return call_id
@@ -316,6 +344,21 @@ def _validate_and_decode_aer1(
     computed_hex = hashlib.sha256(canon_bytes).hexdigest()
     if verify_commitment and oh != f"sha256:{computed_hex}":
         raise SignatureTamperError("output_hash does not match sha256(canonical_bytes)")
+
+    mh = rec.get("metadata_hash")
+    if mh is not None:
+        if not isinstance(mh, str) or not _AER1_HASH_RE.match(mh):
+            raise SignatureTamperError("metadata_hash is not sha256: + lowercase hex digest")
+        if verify_commitment:
+            mblock = _aer1_metadata_block(rec)
+            if mblock is None:
+                raise SignatureTamperError(
+                    "metadata block cannot be recomputed from the stored member values"
+                )
+            if mh != _aer1_metadata_digest(mblock):
+                raise SignatureTamperError(
+                    "metadata_hash does not match the recomputed metadata block"
+                )
 
     try:
         inner_parsed, inner_dup = _parse_json_with_duplicate_check(canon_text)
@@ -630,7 +673,7 @@ class ToolReceipt(BaseModel):
             "issuer_claims": {"provenance_class": prov_cls},
             "output": out_block,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.5.2"},
+            "tool": {"name": self.tool, "scope": "local", "version": "0.6.0"},
         }
         canon_raw = json.dumps(
             canon_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -639,15 +682,28 @@ class ToolReceipt(BaseModel):
         inputs_sha = hashlib.sha256(inputs_raw).hexdigest()
         aer1_id = _derive_aer1_uuid(self.call_id, canon_sha)
         created_at = _normalize_aer1_timestamp(self.timestamp_utc)
+        tool_descriptor = {"name": self.tool, "scope": "local", "version": "0.6.0"}
+        output_hash_str = f"sha256:{canon_sha}"
+        meta_hash_str = _aer1_metadata_digest(
+            {
+                "created_at": created_at,
+                "id": aer1_id,
+                "output_hash": output_hash_str,
+                "provenance_class": prov_cls,
+                "receipt_schema_version": receipt_schema_version,
+                "tool": tool_descriptor,
+            }
+        )
         return {
             "id": aer1_id,
             "created_at": created_at,
             "receipt_schema_version": receipt_schema_version,
-            "tool": {"name": self.tool, "scope": "local", "version": "0.5.2"},
+            "tool": tool_descriptor,
             "provenance_class": prov_cls,
             "canonical_bytes": base64.b64encode(canon_raw).decode("ascii"),
             "input_hash": f"sha256:{inputs_sha}",
-            "output_hash": f"sha256:{canon_sha}",
+            "output_hash": output_hash_str,
+            "metadata_hash": meta_hash_str,
             "verification_status": "verified",
             "steps": [
                 {

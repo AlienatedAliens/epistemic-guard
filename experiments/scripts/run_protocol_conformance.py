@@ -17,6 +17,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from epistemic_guard.aer1 import (  # noqa: E402
+    aer1_anchor_report,
+    aer1_merkle_root,
+    load_aer1_json,
+    verify_aer1_chain,
+    verify_aer1_chain_commitment,
+    verify_aer1_chain_v07,
+    verify_aer1_receipt,
+    verify_aer1_unicode_vector,
+    verify_aer1_workflow,
+)
 from epistemic_guard.corroboration import (  # noqa: E402
     OpenVINOWebEvidenceClassifier,
     corroborate_sources,
@@ -172,6 +183,135 @@ def _bench_aer1_interop() -> dict[str, int | float]:
                 official_invalid_rejected += 1
     official_matched = official_valid_passed + official_invalid_rejected
 
+    full_bundle = json.loads(
+        (ROOT / "benchmarks" / "aer1_full_corpus.json").read_text(encoding="utf-8")
+    )
+    fb: dict[str, str] = full_bundle["files_b64"]
+    full_total = 0
+    full_passed = 0
+
+    def _rec(ok: bool) -> None:
+        nonlocal full_total, full_passed
+        full_total += 1
+        if ok:
+            full_passed += 1
+
+    for k, b64 in sorted(fb.items()):
+        raw = base64.b64decode(b64)
+        if k.startswith("test-vectors/valid/"):
+            _rec(verify_aer1_receipt(raw).valid)
+        elif k.startswith("test-vectors/invalid/"):
+            _rec(not verify_aer1_receipt(raw).valid)
+        elif k.startswith("test-vectors/invalid-profile/"):
+            rep = verify_aer1_receipt(raw)
+            _rec(rep.valid and not rep.reference_profile_valid)
+        elif k.startswith("test-vectors/anchored/"):
+            rep = verify_aer1_receipt(raw)
+            fname = k.rsplit("/", 1)[1]
+            exp = (
+                "verified"
+                if fname == "anchored-valid.json"
+                else (
+                    "rejected: unresolvable record"
+                    if fname == "anchored-unresolvable-anchor.json"
+                    else "verification failed"
+                )
+            )
+            _rec(rep.valid and rep.anchor.outcome == exp)
+        elif k.startswith("tests/metadata-probes/") and not k.endswith("laurent-receipt.json"):
+            rep = verify_aer1_receipt(raw)
+            _rec(not rep.valid and any("metadata_hash" in f for f in rep.failures))
+
+    for v in json.loads(base64.b64decode(fb["merkle-vectors.json"]).decode("utf-8"))["vectors"]:
+        if "receipt_ids" in v:
+            _rec(aer1_merkle_root(v["receipt_ids"]) == v["expected_root"])
+        elif "leaves" in v:
+            leaves = [
+                hashlib.sha256(lf["preimage"].encode("utf-8")).digest()
+                for lf in sorted(v["leaves"], key=lambda x: x["seq"])
+            ]
+            lvl = list(leaves)
+            while len(lvl) > 1:
+                if len(lvl) % 2:
+                    lvl.append(lvl[-1])
+                lvl = [
+                    hashlib.sha256(lvl[i] + lvl[i + 1]).digest() for i in range(0, len(lvl), 2)
+                ]
+            got = lvl[0].hex() if lvl else hashlib.sha256(b"").hexdigest()
+            _rec(got == v["expected_root"])
+        if v.get("expected_workflow_verdict") is not None:
+            wf = {
+                "type": "verifiable-workflow-receipt",
+                "version": "1",
+                "workflow_id": "11111111-1111-1111-1111-111111111111",
+                "receipt_id": "22222222-2222-2222-2222-222222222222",
+                "session_id": "test-session",
+                "goal": "test workflow",
+                "status": "ok",
+                "steps": [
+                    {
+                        "seq": i + 1,
+                        "tool": "test-tool",
+                        "receipt_id": rid,
+                        "receipt_hash": "a" * 64,
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "ended_at": "2026-01-01T00:00:01Z",
+                        "status": "ok",
+                    }
+                    for i, rid in enumerate(v["receipt_ids"])
+                ],
+                "merkle_root": v["expected_root"],
+                "output_hash": "b" * 64,
+                "verify_url": "https://example.com/workflow/test",
+            }
+            wf_fails = verify_aer1_workflow(wf)
+            verdict = "valid" if not wf_fails else "invalid"
+            ok = verdict == v["expected_workflow_verdict"] and (
+                verdict != "invalid" or any(v.get("rejected_by", "") in f for f in wf_fails)
+            )
+            _rec(ok)
+
+    for v in json.loads(base64.b64decode(fb["chain-vectors.json"]).decode("utf-8"))["vectors"]:
+        tl = v.get("timeline") if v.get("timeline") is not None else v.get("entries")
+        _rec((not verify_aer1_chain(tl)) == (v["expected_verdict"] == "valid"))
+    for v in json.loads(base64.b64decode(fb["chain-vectors-v07.json"]).decode("utf-8"))["vectors"]:
+        tl = v.get("timeline") if v.get("timeline") is not None else v.get("entries")
+        _rec((not verify_aer1_chain_v07(tl)) == (v["expected_verdict"] == "valid"))
+    for v in json.loads(base64.b64decode(fb["commitment-vectors.json"]).decode("utf-8"))[
+        "vectors"
+    ]:
+        _rec(
+            (not verify_aer1_chain_commitment(v.get("timeline"), v.get("commitment")))
+            == (v["expected_verdict"] == "valid")
+        )
+    for v in json.loads(base64.b64decode(fb["unicode-vectors.json"]).decode("utf-8"))["vectors"]:
+        _rec(not verify_aer1_unicode_vector(v))
+    for v in json.loads(base64.b64decode(fb["id-binding-vectors.json"]).decode("utf-8"))["vectors"]:
+        rep = verify_aer1_receipt(
+            v["receipt"],
+            expected_id=v.get("expected_id"),
+            resolved_record=v.get("resolved_record"),
+        )
+        _rec(
+            rep.digest_valid == (v["expected_digest"] == "pass")
+            and rep.id_state == v["expected_id_state"]
+            and rep.id_verdict == v["expected_id_verdict"]
+            and rep.valid == (v["expected_verdict"] == "pass")
+        )
+    for v in json.loads(base64.b64decode(fb["anchor-vectors.json"]).decode("utf-8"))["vectors"]:
+        rec_raw = (
+            v["receipt"]
+            if isinstance(v.get("receipt"), dict)
+            else base64.b64decode(fb[v["file"]])
+        )
+        loaded, _ = load_aer1_json(rec_raw)
+        ar = aer1_anchor_report(loaded, evaluate=v.get("evaluate", True))
+        _rec(
+            ar.present == v["expected_present"]
+            and ar.evaluated == v["expected_evaluated"]
+            and ar.outcome == v["expected_anchor_outcome"]
+        )
+
     return {
         "n_aer1_cases": n_cases,
         "valid_roundtrips": valid_roundtrips,
@@ -187,6 +327,9 @@ def _bench_aer1_interop() -> dict[str, int | float]:
         "official_kit_invalid_rejected": official_invalid_rejected,
         "official_kit_matched": official_matched,
         "official_kit_conformance_pct": round(100.0 * official_matched / official_total, 1),
+        "official_full_corpus_checks": full_total,
+        "official_full_corpus_passed": full_passed,
+        "official_full_corpus_pct": round(100.0 * full_passed / full_total, 1),
     }
 
 

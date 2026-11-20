@@ -19,12 +19,24 @@ class SignatureTamperError(ProvenanceError):
     """Raised when an Ed25519/HMAC signature or immutable SQLite row fails verification."""
 
 
+class ToolPinMismatchError(ProvenanceError):
+    """Raised when an MCP server mutates a pinned `tools/list` schema mid-session (rug-pull)."""
+
+
+class IdempotencyConflictError(ProvenanceError):
+    """Raised when a Lost-Response operation key is retried with mutated tool name or arguments."""
+
+
 class MerkleTamperError(EpistemicGuardError):
     """Raised when a receipt hash chain or Merkle inclusion proof fails verification."""
 
 
 class ModelIntegrityError(EpistemicGuardError):
     """Raised when OpenVINO model files are missing (strict mode) or fail SHA-256 verification."""
+
+
+class InsufficientCalibrationError(EpistemicGuardError):
+    """Raised when split-conformal calibration lacks sufficient samples for `(1 - alpha)`."""
 
 
 class EpistemicModelUnavailableWarning(RuntimeWarning):

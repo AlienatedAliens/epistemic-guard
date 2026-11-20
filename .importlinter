@@ -6,10 +6,10 @@ name = Acyclic layered architecture for epistemic_guard
 type = layers
 layers =
     epistemic_guard.cli
-    epistemic_guard.mcp_server
-    epistemic_guard.mcp_proxy : epistemic_guard.integrations
+    epistemic_guard.mcp_server : epistemic_guard.http_proxy
+    epistemic_guard.mcp_proxy : epistemic_guard.integrations : epistemic_guard.conformal
     epistemic_guard.corroboration : epistemic_guard.supervision : epistemic_guard.store
     epistemic_guard.hazard : epistemic_guard.nli : epistemic_guard.web_filters : epistemic_guard.provenance
-    epistemic_guard.models
+    epistemic_guard.models : epistemic_guard.aer1
     epistemic_guard.schemas
     epistemic_guard.exceptions
