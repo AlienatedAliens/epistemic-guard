@@ -5,6 +5,7 @@
   "deterministic_regex_ci95_low": 57.88,
   "deterministic_regex_correct": 160,
   "deterministic_regex_fpr_pct": 3.91,
+  "deterministic_regex_organic_accuracy_pct": 50.0,
   "deterministic_regex_organic_correct": 50,
   "deterministic_regex_p50_ms": 0.08,
   "deterministic_regex_recall_pct": 30.33,
@@ -13,6 +14,7 @@
   "stage1_no_receipts_ci95_low": 79.83,
   "stage1_no_receipts_correct": 212,
   "stage1_no_receipts_fpr_pct": 27.34,
+  "stage1_no_receipts_organic_accuracy_pct": 91.0,
   "stage1_no_receipts_organic_correct": 91,
   "stage1_no_receipts_p50_ms": 24.98,
   "stage1_no_receipts_recall_pct": 97.54
@@ -96,6 +98,62 @@
   "tn": 115,
   "tp": 118
  },
+ "live_mcp_e2e_60": {
+  "deberta_accuracy_pct": 80.0,
+  "deberta_correct": 48,
+  "deberta_fn": 12,
+  "deberta_recall_pct": 53.85,
+  "delta_vs_phi4_pp": 11.67,
+  "delta_vs_stage1_pp": 18.34,
+  "eg_accuracy_pct": 76.67,
+  "eg_ci95_high": 85.56,
+  "eg_ci95_low": 64.56,
+  "eg_correct": 46,
+  "eg_fn": 1,
+  "eg_fp": 13,
+  "eg_fp_failed_turn_clauses": 7,
+  "eg_fp_unmapped_tool_stems": 6,
+  "eg_fpr_pct": 38.24,
+  "eg_p50_ms": 9.16,
+  "eg_p95_ms": 23.12,
+  "eg_recall_pct": 96.15,
+  "eg_tn": 21,
+  "eg_tp": 25,
+  "gemma_4_e4b_turns": 30,
+  "mcnemar_vs_nemo_base_only": 8,
+  "mcnemar_vs_nemo_eg_only": 6,
+  "mcnemar_vs_nemo_p": 0.7905,
+  "mcnemar_vs_phi4_base_only": 6,
+  "mcnemar_vs_phi4_eg_only": 13,
+  "mcnemar_vs_phi4_p": 0.1671,
+  "mcnemar_vs_stage1_base_only": 0,
+  "mcnemar_vs_stage1_eg_only": 11,
+  "mcnemar_vs_stage1_p": 0.001,
+  "n_negative_grounded": 34,
+  "n_positive_ungrounded": 26,
+  "n_total": 60,
+  "nemo_accuracy_pct": 80.0,
+  "nemo_correct": 48,
+  "nemo_fpr_pct": 35.29,
+  "nemo_p50_ms": 71.69,
+  "nemo_recall_pct": 100.0,
+  "nemotron_3_5_30b_turns": 30,
+  "phi4_accuracy_pct": 65.0,
+  "phi4_correct": 39,
+  "phi4_fp": 21,
+  "phi4_fpr_pct": 61.76,
+  "phi4_p50_ms": 67.04,
+  "phi4_recall_pct": 100.0,
+  "regex_accuracy_pct": 56.67,
+  "regex_correct": 34,
+  "regex_recall_pct": 0.0,
+  "speedup_vs_nemo_x": 7.83,
+  "speedup_vs_phi4_x": 7.32,
+  "stage1_accuracy_pct": 58.33,
+  "stage1_correct": 35,
+  "stage1_fpr_pct": 70.59,
+  "stage1_recall_pct": 96.15
+ },
  "mistral_nemo_12b_gpu": {
   "accuracy_pct": 86.8,
   "ci95_high": 90.44,
@@ -140,11 +198,15 @@
   "inputs": [
    {
     "path": "benchmarks/external_baselines_benchmark.json",
-    "sha256": "fe3f4d3b3ccfe3e6fa98a80a8af6e3c36db04e23d9f77e42875fc1e7c4698e04"
+    "sha256": "05bfc48b278350301bfa250dbadae0507e5f036e3c49f591432e17a407bb89fa"
+   },
+   {
+    "path": "benchmarks/live_mcp_e2e_60.jsonl",
+    "sha256": "60b3ea0f2f6315c0f706c9a809fc23477cc31ac29bf7faac79f3eeb756bbc005"
    }
   ],
-  "commit": "139e8d8564d269d82c5e4b0010d1ea1c8334deac",
-  "now": "2026-11-19T20:19:06+00:00",
+  "commit": "e026fbacfc6e17cf80a605d902bc73a623782846",
+  "now": "2026-11-20T00:41:51+00:00",
   "osaudit": "0.7.0"
  }
 }
