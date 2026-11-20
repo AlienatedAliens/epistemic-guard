@@ -116,6 +116,8 @@
   "eg_fpr_pct": 38.24,
   "eg_p50_ms": 9.16,
   "eg_p95_ms": 23.12,
+  "eg_recall_ci95_high": 99.32,
+  "eg_recall_ci95_low": 81.11,
   "eg_recall_pct": 96.15,
   "eg_tn": 21,
   "eg_tp": 25,
@@ -135,6 +137,7 @@
   "nemo_accuracy_pct": 80.0,
   "nemo_correct": 48,
   "nemo_fpr_pct": 35.29,
+  "nemo_lead_pp": 3.33,
   "nemo_p50_ms": 71.69,
   "nemo_recall_pct": 100.0,
   "nemotron_3_5_30b_turns": 30,
@@ -205,8 +208,8 @@
     "sha256": "60b3ea0f2f6315c0f706c9a809fc23477cc31ac29bf7faac79f3eeb756bbc005"
    }
   ],
-  "commit": "e026fbacfc6e17cf80a605d902bc73a623782846",
-  "now": "2026-11-20T00:41:51+00:00",
+  "commit": "5970a888df5d75d1417300402edce88f74376a77",
+  "now": "2026-11-20T03:27:56+00:00",
   "osaudit": "0.7.0"
  }
 }
