@@ -158,3 +158,7 @@ reason = "Approximate lexical word-substitution fraction in Tier 2 moderate-rewr
 [[numbers.allow]]
 value = "80%"
 reason = "Approximate lexical word-substitution fraction in Tier 3 abstractive-rewrite paraphrase sweep"
+
+[[numbers.allow]]
+value = "3.5"
+reason = "NVIDIA Nemotron-3.5-30B-A3B generator model version identifier"
