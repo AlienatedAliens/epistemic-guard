@@ -8,14 +8,21 @@ authors = [{ name = "Sean Maxwell" }]
 requires-python = ">=3.10"
 keywords = [
     "agents",
+    "ai-security",
+    "ed25519",
+    "guardrails",
+    "hallucination-detection",
+    "litellm",
     "mcp",
     "mcp-proxy",
-    "tool-calling",
-    "ed25519",
+    "merkle-tree",
+    "model-context-protocol",
+    "opentelemetry",
+    "openvino",
     "provenance",
     "rag",
-    "openvino",
-    "guardrails",
+    "runtime-verification",
+    "tool-calling",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -52,6 +59,7 @@ epistemic-guard = "epistemic_guard.cli:main"
 Homepage = "https://github.com/AlienatedAliens/epistemic-guard"
 Repository = "https://github.com/AlienatedAliens/epistemic-guard"
 Issues = "https://github.com/AlienatedAliens/epistemic-guard/issues"
+Models = "https://huggingface.co/RollSolo/epistemic-guard-int8"
 Benchmarks = "https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks"
 Demo = "https://huggingface.co/spaces/RollSolo/epistemic-guard"
 "Author ORCID" = "https://orcid.org/0009-0004-0133-0463"
@@ -67,9 +75,11 @@ packages = ["src/epistemic_guard"]
 include = [
     "/src",
     "/tests",
+    "/AGENTS.md",
     "/LICENSE",
     "/MODEL_NOTICES.md",
     "/README.md",
+    "/llms.txt",
 ]
 
 [tool.pytest.ini_options]

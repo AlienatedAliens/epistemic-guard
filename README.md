@@ -2,10 +2,10 @@
 
 <!-- mcp-name: io.github.AlienatedAliens/epistemic-guard -->
 
-Signed tool receipts, out-of-process MCP receipt proxying, Ed25519 memory write-gating, and RAG source deduplication for autonomous agents.  
-Runs locally on CPU, GPU, or NPU in **3–11 ms**. Zero LLM API calls. MIT License.
+Signed tool receipts, out-of-process stdio & Streamable HTTP MCP receipt proxies, Ed25519 memory write-gating, and RAG source deduplication for autonomous agents.  
+Runs locally on CPU or NPU (`0 MiB` GPU VRAM, **8.6 ms** per clause / **17.9 ms** median turn latency). Zero LLM API calls. MIT License.
 
-[Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks (`N=973`)](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)
+[Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks (`N=1,033`)](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
 
 ---
 
@@ -31,9 +31,21 @@ epistemic-guard demo
 
 ---
 
-## 1. Out-of-Process MCP Receipt Proxy (`mcp-proxy` + `verify-log`)
+## 1. Out-of-Process MCP Receipt Proxies (`mcp-proxy`, `mcp-http-proxy`, `wrap-config`)
 
-Wrap any stdio MCP server (`Claude Desktop`, `Cursor`, `Cline`, `Windsurf`, or custom agents in any language). The Ed25519 signing key stays inside the `mcp-proxy` OS process; `EPISTEMIC_GUARD_*` signing secrets (`EPISTEMIC_GUARD_MCP_KEY_HEX`, `EPISTEMIC_GUARD_MASTER_KEY`, etc.) are stripped before spawning the child MCP server. Every `tools/call` completion, tool runtime error (`isError: true`), JSON-RPC pre-execution rejection (`-32602`), and mid-call server crash is signed into an append-only RFC 6962 Merkle JSONL log.
+Wrap any stdio or Streamable HTTP MCP server (`Claude Desktop`, `Cursor`, `Cline`, `Windsurf`, or custom agents in any language). The Ed25519 signing key stays inside the proxy OS process; `EPISTEMIC_GUARD_*` signing secrets (`EPISTEMIC_GUARD_MCP_KEY_HEX`, `EPISTEMIC_GUARD_MASTER_KEY`, etc.) are stripped before spawning child MCP servers. Every `tools/call` completion, tool runtime error (`isError: true`), JSON-RPC pre-execution rejection (`-32602`), and mid-call server crash is signed into an append-only RFC 6962 Merkle JSONL log, with optional `--pin-tools` SHA-256 schema pinning against mid-session MCP rug-pulls.
+
+Wrap an entire existing `mcp_config.json` in one command:
+
+```bash
+epistemic-guard wrap-config --input mcp_config.json --output mcp_config.wrapped.json --log /var/log/agent/receipts.jsonl --pin-tools
+```
+
+Or wrap a remote Streamable HTTP / SSE MCP server (adds `Idempotency-Key` / `params._meta.operation_key` retry deduplication, `HTTP 409` / `-32602` parameter-mismatch refusal, and `GET /receipts/<id_or_key>` lost-response recovery):
+
+```bash
+epistemic-guard mcp-http-proxy --upstream http://127.0.0.1:8080/mcp --port 8081 --log /var/log/agent/receipts.jsonl --pin-tools --aer1
+```
 
 ```json
 {
@@ -132,8 +144,9 @@ print(verdict.to_retry_prompt(recorder.receipts))
 - **Signature pinning, session binding & freshness anti-replay:** Pass `gate=gate`, `expected_session_id="..."`, and `max_receipt_age_seconds=300` to `ReceiptSupervisor` (or `expected_pubkey_hex` / `expected_session_id` / `max_receipt_age_seconds` on MCP `verify_narration`) to reject unsigned, cross-session, or replayed receipts before supervision runs.
 - **OpenTelemetry & Langfuse observability export (zero extra deps):** Pass `otel_span=span` to `ReceiptRecorder` or call `attach_otel_evidence(span, receipts=recorder.receipts, verdict=verdict, merkle_root=merkle.merkle_root())` to stamp `AER-1` digests, Ed25519 signatures, Merkle roots, and supervision verdicts directly onto OTel / Langfuse traces.
 - **Streaming SSE / voice pipelines:** `sup.stream(receipts=...)` checks each clause as `.`, `!`, `?`, `;`, or `\n` arrives so generation can stop before trailing tokens reach the user.
-- **Router dispatch & AER-1 interop:** `recorder.dispatch(fn, raw_json_args)` records signed `executed=False, ok=False` receipts when JSON parsing or signature binding fails before entering the tool body. `ToolReceipt.from_aer1(...)` and `receipt.to_aer1()` import and export `AER-1` (`draft-zambo-aer1`) receipts with `canonical_bytes` SHA-256 verification.
-- **Chat message lists:** `verify_chat_turn(messages)` checks OpenAI/Anthropic `tool_calls` + `role="tool"` histories directly.
+- **Output-value witnesses & split-conformal calibration (`v0.6.0`):** `OutputValueGuard` checks JSON scalar values and leaf strings returned inside `ToolReceipt.output` against assistant prose, while `ConformalCalibrator` fits distribution-free finite-sample thresholds (`q_hat`) targeting explicit `fnr` or `fpr` error rates.
+- **Router dispatch & AER-1 interop:** `recorder.dispatch(fn, raw_json_args)` records signed `executed=False, ok=False` receipts when JSON parsing or signature binding fails before entering the tool body. `ToolReceipt.from_aer1(...)`, `receipt.to_aer1()`, and `verify_aer1_receipt(...)` import, export, and verify `AER-1` (`draft-zambo-aer1-26`, `146/146` `v1.5.7` conformance checks) receipts and `-07` chains.
+- **Universal SDK, LiteLLM & OpenTelemetry adapters:** `verify_chat_turn(messages, assistant_text, registered_mcp_tools=...)` auto-extracts tool calls across OpenAI, Anthropic (`tool_use`/`tool_result`), and Google Gemini (`functionCall`/`functionResponse`); `EpistemicGuardLiteLLM` hooks LiteLLM completions; and `verify_otel_spans(spans, assistant_text)` supervises OpenTelemetry `gen_ai.*` traces directly.
 
 ---
 
@@ -192,7 +205,7 @@ All four optional neural classifiers run via OpenVINO INT8 (`CPU`, `GPU`, or `NP
 | Component | INT8 Size | CPU p50 Latency | Held-Out Result | Known Limitations |
 | :--- | :---: | :---: | :--- | :--- |
 | **`web_evidence_int8` + `nli_int8`** (`corroborate_sources`) | `23.1 MB` + `91.1 MB` | `3.0 ms` / `9.9 ms` | **`47/64 (73.4%)` burden accuracy & `56/64 (87.5%)` dispute accuracy** on pre-registered live-scraped web (`real_web_v2`, `246` archived `.html.gz` pages, 3 blinded LLM raters $\kappa = 0.91\text{–}1.00$); `60/64 (93.8%)` dispute accuracy on `real_web_v1`; `30/30 (100%)` wire/sybil collapse on `R-33`; `88/120 (73.3%)` on `nli_holdout_v2_120` | Implicit cross-article disagreements without lexical or single-sentence NLI opposition remain `17/64` (`26.6%`) of open-web cases. |
-| **`action_claim_int8`** (`ReceiptSupervisor`) | `82.7 MB` | `8.6 ms` (clause) / `17.9 ms` (turn) | **`233/250 (93.2%)` across 3 held-out sets** (`91/100` live LLM completions `H100`, `92/100` `BLIND42_COH_100`, `50/50` `LOCKED_COH_50`); `297/300 (99.0%)` 10-class speech-act val (`99.7%` FP16 parity) | Code blocks, blockquotes, attributed dialogue, and creative/translation `user_prompt` contexts are masked automatically; strict `args` target-binding rejects bare zero-argument receipts when prose names concrete file/identifier targets. |
+| **`action_claim_int8`** (`ReceiptSupervisor`) | `82.7 MB` | `8.6 ms` (clause) / `17.9 ms` (turn) | **`234/250 (93.6%)` (`v0.6.0`) / `233/250 (93.2%)` (`v0.5.2`) across 3 held-out sets** (`H100`, `BLIND42_COH_100`, `LOCKED_COH_50`); **`58/60 (96.7%, 2.94% FPR)` on live MCP fault-injection (`Live-60`, `v0.6.0` with dynamic `tools/list` binding, up from `46/60` [`38.24%` FPR] in `v0.5.2`)** | Code blocks, blockquotes, attributed dialogue, contrastive failure reports (*"I tried X, but it failed"*), and non-first-person obligations are handled automatically; strict `args` target-binding rejects bare zero-argument receipts when prose names concrete file/identifier targets. |
 | **`hazard_int8`** (`OpenVINOHazardClassifier`) | `82.7 MB` | `3.2 ms` | **`128/130 (98.5%)` safe tier assignment** on multi-clause `R-21` (2 blinded LLM raters); `44/50 (88.0%)` exact on `HZD_50` | Over-escalates ~12–15% of benign technical queries containing clinical or security nouns to higher proof tiers. |
 | **`ProvenanceGate` (Ed25519)** | `0 MB` | `< 0.3 ms` | **`0/100 (0.0%)` natural self-poisoning** (vs `100/100` unguarded RAG and `11/100` natural / `100/100` adversarial under soft metadata tags) with **`0/200 (0.0%)` false rejections on valid writes** | Verifies cryptographic origin (`USER_EXPLICIT`, `TOOL_VERIFIED`), not whether an authenticated user stated a true fact. |
 
@@ -204,7 +217,8 @@ Evaluated across `LOCKED_COH_50` (`50`), `BLIND42_COH_100` (`100`), and `Organic
 
 | System | Hardware & Memory | Accuracy (`[95% Wilson CI]`) | Recall / FPR | Turn p50 Latency | `Organic_Heldout_H100` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`epistemic-guard` (`action_claim_int8`)** | **CPU (`0 MiB` VRAM, `82.7 MB` RAM)** | **`233/250 (93.2% [89.4%, 95.7%])`** | `96.7%` / `10.2%` | **`17.9 ms`** | **`91/100 (91.0%)`** |
+| **`epistemic-guard` (`action_claim_int8`, `v0.6.0` / `v0.5.2`)** | **CPU (`0 MiB` VRAM, `82.7 MB` RAM)** | **`234/250 (93.6%)` / `233/250 (93.2% [89.4%, 95.7%])`** | `96.7%` / `9.4%` (`10.2%` `v0.5.2`) | **`17.9 ms`** | **`91/100 (91.0%)`** |
+| **`Qwen3-30B-A3B` (`Q4_K_M` MoE Judge)** | GPU (`~18.5 GiB` VRAM) | `232/250 (92.8% [88.9%, 95.4%])` | `95.9%` / `10.2%` | `141.8 ms` | `90/100 (90.0%)` |
 | **`Mistral-Nemo-Instruct-12B` (`Q5_K_M` Judge)** | GPU (`8,844 MiB` VRAM) | `217/250 (86.8% [82.0%, 90.4%])` | `87.7%` / `14.1%` | `80.6 ms` | `84/100 (84.0%)` |
 | **`Microsoft Phi-4-14B` (`Q6_K` Judge)** | GPU (`12,214 MiB` VRAM) | `216/250 (86.4% [81.6%, 90.1%])` | **`100.0%`** / `26.6%` | `76.2 ms` | `79/100 (79.0%)` |
 | **Off-the-shelf `DeBERTa-v3-xsmall` NLI** | CPU (`0 MiB` VRAM, `91.1 MB` RAM) | `132/250 (52.8% [46.6%, 58.9%])` | `24.6%` / `20.3%` | `22.4 ms` | `51/100 (51.0%)` |
