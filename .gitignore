@@ -14,3 +14,5 @@ uv.lock
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+paper/*.tar.gz
