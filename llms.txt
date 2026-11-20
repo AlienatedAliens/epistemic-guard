@@ -5,7 +5,7 @@
 - Repository: https://github.com/AlienatedAliens/epistemic-guard
 - PyPI: https://pypi.org/project/epistemic-guard/
 - Official MCP Registry: `io.github.AlienatedAliens/epistemic-guard`
-- Models (INT8 ONNX/OpenVINO): https://huggingface.co/RollSolo/epistemic-guard-models
+- Models (INT8 ONNX/OpenVINO): https://huggingface.co/RollSolo/epistemic-guard-int8
 - Benchmarks (`N=250` & `Live-60`): https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks
 - License: MIT
 
