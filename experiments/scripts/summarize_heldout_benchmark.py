@@ -25,6 +25,32 @@ def main() -> None:
     det_abl = abl["deterministic_regex_with_receipts_cpu"]
     s1_abl = abl["stage1_neural_encoder_without_receipts_cpu"]
     prov = raw["dataset_provenance"]
+    e2e = raw["live_mcp_e2e_60"]
+    e2e_sys = e2e["systems"]
+    e2e_eg = e2e_sys["epistemic_guard_cpu_int8"]
+    e2e_s1 = e2e_sys["stage1_neural_without_receipts_cpu"]
+    e2e_det = e2e_sys["deterministic_regex_with_receipts_cpu"]
+    e2e_deb = e2e_sys["deberta_v3_xsmall_nli_cpu"]
+    e2e_nemo = e2e_sys["mistral_nemo_12b_q5_k_m_gpu"]
+    e2e_phi = e2e_sys["phi_4_14b_q6_k_gpu"]
+    e2e_mcn = e2e["paired_mcnemar"]
+
+    e2e_path = (
+        Path(sys.argv[2])
+        if len(sys.argv) > 2
+        else Path("benchmarks/live_mcp_e2e_60.jsonl")
+    )
+    e2e_rows = {
+        r["id"]: r
+        for r in (json.loads(ln) for ln in e2e_path.read_text(encoding="utf-8").splitlines() if ln.strip())
+    }
+    err_ids = e2e["epistemic_guard_error_ids"]
+    fp_ok_clean_unmapped = sum(
+        1 for eid in err_ids if not e2e_rows[eid]["gold_should_block"] and e2e_rows[eid]["regime"] == "ok_clean"
+    )
+    fp_failed_turn_clauses = sum(
+        1 for eid in err_ids if not e2e_rows[eid]["gold_should_block"] and e2e_rows[eid]["regime"] != "ok_clean"
+    )
 
     positive_cases = eg["tp"] + eg["fn"]
     negative_cases = eg["tn"] + eg["fp"]
@@ -169,6 +195,9 @@ def main() -> None:
             "deterministic_regex_organic_correct": det_abl["by_split"]["Organic_Heldout_H100"][
                 "correct"
             ],
+            "deterministic_regex_organic_accuracy_pct": det_abl["by_split"]["Organic_Heldout_H100"][
+                "accuracy_pct"
+            ],
             "stage1_no_receipts_correct": s1_abl["correct"],
             "stage1_no_receipts_accuracy_pct": s1_abl["accuracy_pct"],
             "stage1_no_receipts_ci95_low": s1_abl["accuracy_wilson_95ci"][0],
@@ -179,6 +208,83 @@ def main() -> None:
             "stage1_no_receipts_organic_correct": s1_abl["by_split"]["Organic_Heldout_H100"][
                 "correct"
             ],
+            "stage1_no_receipts_organic_accuracy_pct": s1_abl["by_split"]["Organic_Heldout_H100"][
+                "accuracy_pct"
+            ],
+        },
+        "live_mcp_e2e_60": {
+            "n_total": e2e["n_total"],
+            "n_positive_ungrounded": e2e["n_positive_ungrounded"],
+            "n_negative_grounded": e2e["n_negative_grounded"],
+            "gemma_4_e4b_turns": e2e["generators"]["gemma_4_e4b_turns"],
+            "nemotron_3_5_30b_turns": e2e["generators"]["nemotron_3_5_30b_turns"],
+            "eg_correct": e2e_eg["correct"],
+            "eg_accuracy_pct": e2e_eg["accuracy_pct"],
+            "eg_ci95_low": e2e_eg["accuracy_wilson_95ci"][0],
+            "eg_ci95_high": e2e_eg["accuracy_wilson_95ci"][1],
+            "eg_tp": e2e_eg["tp"],
+            "eg_tn": e2e_eg["tn"],
+            "eg_fp": e2e_eg["fp"],
+            "eg_fn": e2e_eg["fn"],
+            "eg_fp_unmapped_tool_stems": fp_ok_clean_unmapped,
+            "eg_fp_failed_turn_clauses": fp_failed_turn_clauses,
+            "eg_recall_pct": e2e_eg["recall_pct"],
+            "eg_fpr_pct": e2e_eg["fpr_pct"],
+            "eg_p50_ms": e2e_eg["latency_p50_ms"],
+            "eg_p95_ms": e2e_eg["latency_p95_ms"],
+            "stage1_correct": e2e_s1["correct"],
+            "stage1_accuracy_pct": e2e_s1["accuracy_pct"],
+            "stage1_recall_pct": e2e_s1["recall_pct"],
+            "stage1_fpr_pct": e2e_s1["fpr_pct"],
+            "regex_correct": e2e_det["correct"],
+            "regex_accuracy_pct": e2e_det["accuracy_pct"],
+            "regex_recall_pct": e2e_det["recall_pct"],
+            "deberta_correct": e2e_deb["correct"],
+            "deberta_accuracy_pct": e2e_deb["accuracy_pct"],
+            "deberta_recall_pct": e2e_deb["recall_pct"],
+            "deberta_fn": e2e_deb["fn"],
+            "nemo_correct": e2e_nemo["correct"],
+            "nemo_accuracy_pct": e2e_nemo["accuracy_pct"],
+            "nemo_recall_pct": e2e_nemo["recall_pct"],
+            "nemo_fpr_pct": e2e_nemo["fpr_pct"],
+            "nemo_p50_ms": e2e_nemo["latency_p50_ms"],
+            "phi4_correct": e2e_phi["correct"],
+            "phi4_accuracy_pct": e2e_phi["accuracy_pct"],
+            "phi4_recall_pct": e2e_phi["recall_pct"],
+            "phi4_fpr_pct": e2e_phi["fpr_pct"],
+            "phi4_fp": e2e_phi["fp"],
+            "phi4_p50_ms": e2e_phi["latency_p50_ms"],
+            "delta_vs_stage1_pp": round(e2e_eg["accuracy_pct"] - e2e_s1["accuracy_pct"], 2),
+            "delta_vs_phi4_pp": round(e2e_eg["accuracy_pct"] - e2e_phi["accuracy_pct"], 2),
+            "speedup_vs_nemo_x": round(e2e_nemo["latency_p50_ms"] / e2e_eg["latency_p50_ms"], 2),
+            "speedup_vs_phi4_x": round(e2e_phi["latency_p50_ms"] / e2e_eg["latency_p50_ms"], 2),
+            "mcnemar_vs_stage1_eg_only": e2e_mcn["vs_stage1_no_receipts"][
+                "epistemic_guard_only_correct"
+            ],
+            "mcnemar_vs_stage1_base_only": e2e_mcn["vs_stage1_no_receipts"][
+                "baseline_only_correct"
+            ],
+            "mcnemar_vs_stage1_p": round(
+                e2e_mcn["vs_stage1_no_receipts"]["p_value_two_sided"], 4
+            ),
+            "mcnemar_vs_nemo_eg_only": e2e_mcn["vs_mistral_nemo_12b"][
+                "epistemic_guard_only_correct"
+            ],
+            "mcnemar_vs_nemo_base_only": e2e_mcn["vs_mistral_nemo_12b"][
+                "baseline_only_correct"
+            ],
+            "mcnemar_vs_nemo_p": round(
+                e2e_mcn["vs_mistral_nemo_12b"]["p_value_two_sided"], 4
+            ),
+            "mcnemar_vs_phi4_eg_only": e2e_mcn["vs_phi_4_14b"][
+                "epistemic_guard_only_correct"
+            ],
+            "mcnemar_vs_phi4_base_only": e2e_mcn["vs_phi_4_14b"][
+                "baseline_only_correct"
+            ],
+            "mcnemar_vs_phi4_p": round(
+                e2e_mcn["vs_phi_4_14b"]["p_value_two_sided"], 4
+            ),
         },
         "dataset_provenance": {
             "v030_pre_hardening_correct": prov["v030_pre_hardening_correct"],

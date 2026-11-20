@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -98,11 +99,20 @@ def _bench_merkle_and_tamper() -> dict[str, int | float]:
 
 
 def _bench_aer1_interop() -> dict[str, int | float]:
+    ref_spec = importlib.util.spec_from_file_location(
+        "aer1_reference_verifier", ROOT / "benchmarks" / "aer1_reference_verifier.py"
+    )
+    if ref_spec is None or ref_spec.loader is None:
+        raise RuntimeError("Missing benchmarks/aer1_reference_verifier.py")
+    ref_mod = importlib.util.module_from_spec(ref_spec)
+    ref_spec.loader.exec_module(ref_mod)
+
     factory = SignerFactory.from_master_key(_deterministic_key("aer1-interop"))
     signer = factory.tool_verified()
     gate = ProvenanceGate(factory.public_keys())
     n_cases = 50
     valid_roundtrips = 0
+    ref_verifier_passed = 0
     tampered_rejected = 0
     for idx in range(n_cases):
         executed_flag = idx % 7 != 0
@@ -118,6 +128,11 @@ def _bench_aer1_interop() -> dict[str, int | float]:
             timestamp_utc="2026-11-18T00:00:00+00:00",
         )
         aer1_doc = rec.to_aer1()
+        ref_core_errs = ref_mod.check(aer1_doc)
+        ref_bind_errs, _ = ref_mod.check_version_and_binding(aer1_doc)
+        ref_prof_errs = ref_mod.check_reference_profile(aer1_doc)
+        if not ref_core_errs and not ref_bind_errs and not ref_prof_errs:
+            ref_verifier_passed += 1
         restored = ToolReceipt.from_aer1(aer1_doc)
         signed_restored = signer.sign_receipt(restored)
         if (
@@ -161,6 +176,8 @@ def _bench_aer1_interop() -> dict[str, int | float]:
         "n_aer1_cases": n_cases,
         "valid_roundtrips": valid_roundtrips,
         "valid_roundtrip_pct": round(100.0 * valid_roundtrips / n_cases, 1),
+        "reference_verifier_exports_passed": ref_verifier_passed,
+        "reference_verifier_exports_pct": round(100.0 * ref_verifier_passed / n_cases, 1),
         "digest_mismatches_rejected": tampered_rejected,
         "digest_rejection_pct": round(100.0 * tampered_rejected / n_cases, 1),
         "official_kit_vectors": official_total,
