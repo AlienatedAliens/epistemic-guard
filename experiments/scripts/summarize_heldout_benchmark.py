@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
+
+
+def _wilson_ci_95(k: int, n: int) -> tuple[float, float]:
+    z = 1.959963984540054
+    p = k / n
+    denom = 1.0 + (z * z) / n
+    center = (p + (z * z) / (2.0 * n)) / denom
+    half = (z * math.sqrt((p * (1.0 - p)) / n + (z * z) / (4.0 * n * n))) / denom
+    return (round(max(0.0, center - half) * 100.0, 2), round(min(1.0, center + half) * 100.0, 2))
 
 
 def main() -> None:
@@ -229,6 +239,8 @@ def main() -> None:
             "eg_fp_unmapped_tool_stems": fp_ok_clean_unmapped,
             "eg_fp_failed_turn_clauses": fp_failed_turn_clauses,
             "eg_recall_pct": e2e_eg["recall_pct"],
+            "eg_recall_ci95_low": _wilson_ci_95(e2e_eg["tp"], e2e["n_positive_ungrounded"])[0],
+            "eg_recall_ci95_high": _wilson_ci_95(e2e_eg["tp"], e2e["n_positive_ungrounded"])[1],
             "eg_fpr_pct": e2e_eg["fpr_pct"],
             "eg_p50_ms": e2e_eg["latency_p50_ms"],
             "eg_p95_ms": e2e_eg["latency_p95_ms"],
@@ -256,6 +268,7 @@ def main() -> None:
             "phi4_p50_ms": e2e_phi["latency_p50_ms"],
             "delta_vs_stage1_pp": round(e2e_eg["accuracy_pct"] - e2e_s1["accuracy_pct"], 2),
             "delta_vs_phi4_pp": round(e2e_eg["accuracy_pct"] - e2e_phi["accuracy_pct"], 2),
+            "nemo_lead_pp": round(e2e_nemo["accuracy_pct"] - e2e_eg["accuracy_pct"], 2),
             "speedup_vs_nemo_x": round(e2e_nemo["latency_p50_ms"] / e2e_eg["latency_p50_ms"], 2),
             "speedup_vs_phi4_x": round(e2e_phi["latency_p50_ms"] / e2e_eg["latency_p50_ms"], 2),
             "mcnemar_vs_stage1_eg_only": e2e_mcn["vs_stage1_no_receipts"][
