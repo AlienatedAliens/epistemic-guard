@@ -8,6 +8,7 @@ from epistemic_guard.aer1 import (
     aer1_anchor_report,
     aer1_chain_entry_digest_v07,
     aer1_merkle_root,
+    aer1_workflow_merkle_root_versioned,
     check_aer1_core,
     check_aer1_disinterested_tier,
     check_aer1_reference_profile,
@@ -21,6 +22,7 @@ from epistemic_guard.aer1 import (
     verify_aer1_receipt,
     verify_aer1_unicode_vector,
     verify_aer1_workflow,
+    verify_aer1_workflow_merkle_vector,
 )
 from epistemic_guard.conformal import (
     CalibrationSample,
@@ -216,6 +218,7 @@ __all__ = [
     "aer1_anchor_report",
     "aer1_chain_entry_digest_v07",
     "aer1_merkle_root",
+    "aer1_workflow_merkle_root_versioned",
     "attach_otel_evidence",
     "check_aer1_core",
     "check_aer1_disinterested_tier",
@@ -261,6 +264,7 @@ __all__ = [
     "verify_aer1_receipt",
     "verify_aer1_unicode_vector",
     "verify_aer1_workflow",
+    "verify_aer1_workflow_merkle_vector",
     "verify_chat_turn",
     "verify_model_dir",
     "verify_otel_spans",

@@ -23,6 +23,7 @@ from epistemic_guard import (
     verify_aer1_receipt,
     verify_aer1_unicode_vector,
     verify_aer1_workflow,
+    verify_aer1_workflow_merkle_vector,
 )
 
 
@@ -346,8 +347,27 @@ def test_aer1_full_146_vector_conformance_corpus() -> None:
         )
         _assert_check(ok, f"anchor {v['name']}: {ar}")
 
-    assert total == 146
-    assert passed == 146
+    for v in json.loads(
+        base64.b64decode(fb["workflow-merkle-seq-output-v1.json"]).decode("utf-8")
+    )["vectors"]:
+        fs = verify_aer1_workflow_merkle_vector(v)
+        _assert_check(not fs, f"workflow-merkle {v['name']}: {fs}")
+
+    # Verify exact v1.5.7 evaluated_set_digest across all 72 official corpus files
+    v157_entries: list[str] = []
+    for k, b64 in sorted(fb.items()):
+        if k.startswith("tests/metadata-probes/"):
+            continue
+        rel = k if k == "workflow-merkle-seq-output-v1.json" else f"base/{k}"
+        digest_hex = hashlib.sha256(base64.b64decode(b64)).hexdigest()
+        v157_entries.append(f"{rel}\0{digest_hex}\n")
+    v157_entries.sort()
+    v157_set_digest = "sha256:" + hashlib.sha256("".join(v157_entries).encode("utf-8")).hexdigest()
+    assert v157_set_digest == "sha256:60bf73f325793e16843370cfa24903bb0d017525cb297e42bebc35857e2db0d2"
+
+    # 146 official v1.5.7 checks + 8 metadata-binding tamper probes = 154 checks
+    assert total == 154
+    assert passed == 154
 
     # Verify native ToolReceipt -> -07 chain + Section 7.3 commitment roundtrip
     sample_receipts = [

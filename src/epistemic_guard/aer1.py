@@ -560,6 +560,81 @@ def aer1_merkle_root(receipt_ids: Sequence[str]) -> str:
     return level[0].hex()
 
 
+def aer1_workflow_merkle_root_versioned(
+    steps: Sequence[Mapping[str, Any]], merkle_version: str
+) -> str:
+    """Compute versioned workflow Merkle root (`receipt-id-v0` or `seq-output-v1`, fail-closed)."""
+    if not steps:
+        raise ValueError("workflow steps must be non-empty")
+    level: list[bytes] = []
+    for idx, step in enumerate(steps, start=1):
+        seq = step.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq != idx:
+            raise ValueError(f"noncontiguous step seq at index {idx}: {seq!r}")
+        if merkle_version == "receipt-id-v0":
+            rid = step.get("receipt_id")
+            if not isinstance(rid, str) or not rid:
+                raise ValueError(f"step {idx} missing receipt_id")
+            leaf = rid
+        elif merkle_version == "seq-output-v1":
+            raw_oh = step.get("output_hash")
+            if not isinstance(raw_oh, str) or not raw_oh:
+                raise ValueError("missing output_hash: seq-output-v1 leaf cannot be formed")
+            oh = raw_oh.removeprefix("sha256:").lower()
+            if not _HEX64_RE.match(oh):
+                raise ValueError(f"step {idx} invalid output_hash")
+            leaf = f"{idx}:{oh}"
+        else:
+            raise ValueError(f"unsupported merkle_version: {merkle_version!r}")
+        level.append(hashlib.sha256(leaf.encode("utf-8")).digest())
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+        level = [
+            hashlib.sha256(level[i] + level[i + 1]).digest()
+            for i in range(0, len(level), 2)
+        ]
+    return level[0].hex()
+
+
+def verify_aer1_workflow_merkle_vector(vector: Mapping[str, Any]) -> list[str]:
+    """Verify a `v1.5.7` versioned workflow-root vector + optional cross-version must-fail block."""
+    steps = vector.get("steps")
+    merkle_version = vector.get("merkle_version")
+    merkle_root = vector.get("merkle_root")
+    if not isinstance(steps, list) or not isinstance(merkle_version, str):
+        return ["invalid workflow merkle vector structure"]
+    failures: list[str] = []
+    try:
+        computed = aer1_workflow_merkle_root_versioned(steps, merkle_version)
+    except ValueError as exc:
+        if vector.get("expected_verdict") == "valid":
+            failures.append(str(exc))
+    else:
+        is_match = computed == merkle_root
+        if vector.get("expected_verdict") == "valid" and not is_match:
+            failures.append(f"merkle_root mismatch: {computed} != {merkle_root}")
+        elif vector.get("expected_verdict") == "invalid" and is_match:
+            failures.append("merkle_root unexpectedly matched invalid vector")
+
+    xver = vector.get("cross_version_evaluation")
+    if isinstance(xver, Mapping):
+        xv_ver = str(xver.get("merkle_version", ""))
+        must_not = xver.get("must_not_equal")
+        exp_comp = xver.get("computed_root")
+        try:
+            xv_root: str | None = aer1_workflow_merkle_root_versioned(steps, xv_ver)
+        except ValueError:
+            xv_root = None
+        if exp_comp is None and xv_root is not None:
+            failures.append(f"cross-version {xv_ver} failed to fail closed: got {xv_root}")
+        elif isinstance(exp_comp, str) and xv_root != exp_comp:
+            failures.append(f"cross-version {xv_ver} root {xv_root!r} != {exp_comp!r}")
+        if xv_root is not None and xv_root == must_not:
+            failures.append(f"cross-version {xv_ver} root equaled must_not_equal {must_not!r}")
+    return failures
+
+
 def verify_aer1_workflow(workflow: object) -> list[str]:
     """Section 8.2 offline workflow receipt verification (including `MM-1` duplicate-ID rule)."""
     if not isinstance(workflow, Mapping):
