@@ -180,20 +180,92 @@ _DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] =
 )
 
 _HEDGE_OR_NEGATION_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:if\s+I|would\s+have|could\s+have|should\s+have|cannot|can't|did\s+not|didn't|"
-    r"haven't|have\s+not|has\s+not|hasn't|not\s+yet|unable\s+to|"
+    r"(?:^\s*(?:#{1,6}\s*|\*{1,2})?[^\n.!]{1,70}\b"
+    r"(?:failed|error|rejected|denied|aborted|unsuccessful|timed\s+out)\b[\s*!:]*$|"
+    r"\b(?:if\s+I|would\s+have|could\s+have|should\s+have|cannot|can't|could\s+not|couldn't|"
+    r"did\s+not|didn't|haven't|have\s+not|has\s+not|hasn't|not\s+yet|unable\s+to|"
+    r"failed\s+(?:to|due\s+to|because|with)|(?:has|have)\s+failed\b|"
     r"(?:attempted|tried)\s+to\b(?![^.!?\n]*\b(?:succeeded|worked)\b)|"
-    r"(?:was|were|is|are)\s+not\s+(?:removed|deleted|erased|wiped|created|saved|written|"
-    r"sent|emailed|dispatched|updated|modified|applied|executed|dropped|committed|opened)\b|"
+    r"(?:was|were|is|are)\s+not\s+(?:be\s+)?\w+(?:ed|en)\b|"
+    r"no\s+[\w-]+\s+(?:was|were|has\s+been|have\s+been)\s+\w+(?:ed|en)\b|"
+    r"(?:rejected|denied|refused)\s+(?:the\s+)?(?:request|call|operation|action|attempt|command)\b|"
+    r"(?:reported|returned|encountered)\s+an?\s+[^\n.!?]{0,35}\b(?:error|failure|exit|crash|timeout)\b|"
+    r"(?:received|with)\s+invalid\s+parameters?\b|"
+    r"(?:server|process|tool)\s+(?:crashed|terminated\s+unexpectedly|exited\s+prematurely)\b|"
+    r"^\s*\*{0,2}#{0,6}\s*failure\s+report\*{0,2}\s*$|"
     r"(?:is|was|remains?)\s+(?:currently\s+)?(?:deferred|aborted|skipped|unchanged|untouched)\b|"
-    r"(?:operation|execution|tool|email|query|sql\s+execution|file\s+operation|request|call)\s+"
+    r"(?:operation|execution|tool|email|query|sql\s+execution|file\s+operation|request|call|"
+    r"attempt|command|action|process)\s+"
     r"(?:failed|errored|aborted|timed\s+out|was\s+(?:rejected|denied|refused|aborted))\b|"
     r"suppose\s+I|imagine\s+I|pretend\s+I|for\s+example|for\s+instance|e\.g\.|"
     r"in\s+\*{0,2}(?:active|passive)\s+voice\*{0,2}|the\s+corrected\s+sentence\s+is|"
     r"it\s+translates\s+to|"
-    r"let\s+me\s+know\s+if\s+you\s+want\s+me\s+to|would\s+you\s+like\s+me\s+to)\b",
+    r"let\s+me\s+know\s+if\s+you\s+want\s+me\s+to|would\s+you\s+like\s+me\s+to)\b)",
     re.IGNORECASE,
 )
+
+_GROUNDING_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "that",
+        "this",
+        "with",
+        "from",
+        "into",
+        "have",
+        "been",
+        "will",
+        "were",
+        "your",
+        "their",
+        "there",
+        "about",
+        "after",
+        "before",
+        "would",
+        "could",
+        "should",
+        "using",
+        "used",
+        "tool",
+        "call",
+        "action",
+        "successfully",
+        "completed",
+        "done",
+        "status",
+        "result",
+        "true",
+        "false",
+        "none",
+        "null",
+    }
+)
+
+
+def _extract_content_tokens(text: str) -> frozenset[str]:
+    """Extract lowercase alphanumeric stems (`len >= 4`) for general tool/clause grounding."""
+    raw = re.findall(r"[a-z0-9]{4,}", text.lower().replace("_", " ").replace("-", " "))
+    return frozenset(tok for tok in raw if tok not in _GROUNDING_STOPWORDS)
+
+
+def _extract_mcp_tool_tokens(
+    mcp_tools: Sequence[Mapping[str, Any]],
+) -> dict[str, frozenset[str]]:
+    """Build `{lowercased_tool_name: content_tokens}` from MCP `tools/list` metadata."""
+    out: dict[str, frozenset[str]] = {}
+    for item in mcp_tools:
+        raw_name = item.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        t_low = raw_name.strip().lower()
+        desc = str(item.get("description") or "")
+        schema = item.get("inputSchema")
+        prop_names: list[str] = []
+        if isinstance(schema, Mapping) and isinstance(schema.get("properties"), Mapping):
+            prop_names = [str(k) for k in schema["properties"]]
+        blob = f"{t_low} {desc} {' '.join(prop_names)}"
+        out[t_low] = _extract_content_tokens(blob)
+    return out
 
 _FIRST_PERSON_PROMISE_SUBJECT_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:I|I'll|I'm|I'd|I\s+will|I\s+am|we|we'll|we're|we\s+will|let\s+me|allow\s+me)\b",
@@ -784,6 +856,9 @@ class ReceiptSupervisor:
         self._custom_tool_families: dict[str, tuple[str, ...]] = (
             infer_tool_families(mcp_tools) if mcp_tools else {}
         )
+        self._mcp_tool_tokens: dict[str, frozenset[str]] = (
+            _extract_mcp_tool_tokens(mcp_tools) if mcp_tools else {}
+        )
         self._output_guard: OutputValueGuard | None = (
             OutputValueGuard(device=device, warn_on_missing=False)
             if verify_output_values
@@ -847,8 +922,10 @@ class ReceiptSupervisor:
     ) -> dict[str, tuple[str, ...]]:
         """Auto-infer and register `CLAIM_*` families from an MCP `tools/list` schema array."""
         inferred = infer_tool_families(mcp_tools)
+        tokens = _extract_mcp_tool_tokens(mcp_tools)
         with self._lock:
             self._custom_tool_families.update(inferred)
+            self._mcp_tool_tokens.update(tokens)
         return dict(self._custom_tool_families)
 
     def _raw_speech_act_probs(
@@ -950,11 +1027,30 @@ class ReceiptSupervisor:
         *,
         extra_stems: Mapping[str, Sequence[str]] | None = None,
         custom_tool_families: Mapping[str, Sequence[str]] | None = None,
+        mcp_tool_tokens: Mapping[str, frozenset[str]] | None = None,
     ) -> bool:
         ok_receipts = [r for r in receipts if r.ok and r.executed]
         if not ok_receipts or family == "DEONTIC_CAPITULATION":
             return False
         cl_lower = clause.lower()
+
+        # Guard against partial compound hallucinations: if this clause explicitly names a
+        # concrete argument belonging to a FAILED receipt (and not to any succeeded receipt),
+        # never allow an unrelated ok=True receipt to ground it.
+        failed_receipts = [r for r in receipts if not (r.ok and r.executed)]
+        if failed_receipts:
+            ok_arg_vals = {
+                str(v).strip().lower()
+                for r in ok_receipts
+                for v in r.args.values()
+                if len(str(v).strip()) >= 4
+            }
+            for fr in failed_receipts:
+                for v in fr.args.values():
+                    v_low = str(v).strip().lower()
+                    if len(v_low) >= 4 and v_low not in ok_arg_vals and v_low in cl_lower:
+                        return False
+
         matching_rcpts = [
             rcpt
             for rcpt in ok_receipts
@@ -965,12 +1061,48 @@ class ReceiptSupervisor:
                 custom_tool_families=custom_tool_families,
             )
         ]
+
+        # Open-vocabulary fallback for unseen enterprise/SaaS tools outside the classic
+        # coding/filesystem/SQL taxonomy: ground directly against succeeded receipt arguments,
+        # tool schema tokens, and output text. Read-only tools and SQL/shell/file tools stay
+        # strictly governed by `_receipt_matches_family` so e.g. `read_file` or `SELECT` can
+        # never ground a `CLAIM_DELETE`.
+        if not matching_rcpts:
+            cl_tokens = _extract_content_tokens(cl_lower)
+            strict_read_stems = _FAMILY_TOOL_STEMS["CLAIM_SEARCH_READ"]
+            strict_file_re = re.compile(
+                r"(?:^|_)(?:file|dir|directory|path|fs|bash|shell|cmd|exec|sql|sqlite|postgres|mysql)(?:_|$)",
+                re.IGNORECASE,
+            )
+            for rcpt in ok_receipts:
+                t_low = rcpt.tool.lower()
+                if _SQL_OR_EXEC_TOOL_RE.search(t_low) or strict_file_re.search(t_low):
+                    continue
+                if any(
+                    re.search(rf"(?:^|_){re.escape(s)}(?:_|$)", t_low) for s in strict_read_stems
+                ):
+                    continue
+                arg_hit = any(
+                    len(str(v).strip()) >= 4 and str(v).strip().lower() in cl_lower
+                    for v in rcpt.args.values()
+                )
+                if arg_hit:
+                    matching_rcpts.append(rcpt)
+                    continue
+                rcpt_tokens = (
+                    _extract_content_tokens(t_low)
+                    | (mcp_tool_tokens.get(t_low, frozenset()) if mcp_tool_tokens else frozenset())
+                    | _extract_content_tokens(rcpt.output[:300])
+                )
+                if len(cl_tokens & rcpt_tokens) >= 2:
+                    matching_rcpts.append(rcpt)
+
         if not matching_rcpts:
             return False
 
         concrete_targets = re.findall(
-            r"(?:https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b"
-            r"|#[0-9]+|\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b)",
+            r"(?:https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b"
+            r"|#[0-9]+|\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b)",
             cl_lower,
         )
         if concrete_targets:
@@ -1036,6 +1168,7 @@ class ReceiptSupervisor:
                         receipts,
                         extra_stems=self._extra_tool_stems,
                         custom_tool_families=self._custom_tool_families,
+                        mcp_tool_tokens=self._mcp_tool_tokens,
                     ):
                         max_risk = max(max_risk, conf)
                 continue
@@ -1052,6 +1185,7 @@ class ReceiptSupervisor:
                     receipts,
                     extra_stems=self._extra_tool_stems,
                     custom_tool_families=self._custom_tool_families,
+                    mcp_tool_tokens=self._mcp_tool_tokens,
                 ):
                     max_risk = max(max_risk, claim_mass)
                 if (
@@ -1229,6 +1363,7 @@ class ReceiptSupervisor:
                     receipts,
                     extra_stems=self._extra_tool_stems,
                     custom_tool_families=self._custom_tool_families,
+                    mcp_tool_tokens=self._mcp_tool_tokens,
                 ):
                     unsupported_claims.append(cl_text)
                     unsupported_spans.append(
