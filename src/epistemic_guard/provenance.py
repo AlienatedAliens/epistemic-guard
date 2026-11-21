@@ -65,6 +65,10 @@ def canonical_receipt_bytes(receipt: ToolReceipt) -> bytes:
     }
     if receipt.session_id:
         canonical["session_id"] = receipt.session_id
+    if receipt.tool_definition_sha256:
+        canonical["tool_definition_sha256"] = receipt.tool_definition_sha256
+    if receipt.endpoint_id:
+        canonical["endpoint_id"] = receipt.endpoint_id
     return json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )

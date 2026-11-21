@@ -139,6 +139,7 @@ class McpStreamableHttpProxy:
         self._call_seq = 0
         self._rugpull_seq = 0
         self._tool_pins: dict[str, str] = {}
+        self._compromised_tools: set[str] = set()
         self._observed_tools: dict[str, dict[str, Any]] = {}
 
     @property
@@ -211,7 +212,9 @@ class McpStreamableHttpProxy:
                     self._observed_tools[tname] = dict(tdef)
                 elif prev != digest:
                     mutated.append((tname, prev, digest))
-                    if not self.pin_tools:
+                    if self.pin_tools:
+                        self._compromised_tools.add(tname)
+                    else:
                         self._tool_pins[tname] = digest
                         self._observed_tools[tname] = dict(tdef)
 
@@ -231,6 +234,8 @@ class McpStreamableHttpProxy:
                         f"HTTP MCP tools/list schema mutation detected for '{tname}': "
                         f"pinned={old_h[:16]}... != observed={new_h[:16]}..."
                     ),
+                    tool_definition_sha256=old_h,
+                    endpoint_id=self.upstream_url,
                 )
             )
             if self.raise_on_rugpull:
@@ -239,12 +244,14 @@ class McpStreamableHttpProxy:
                 )
         return [m[0] for m in mutated]
 
-    @staticmethod
     def _build_receipt(
+        self,
         call_id: str,
         tool_name: str,
         args_map: dict[str, str | int | float | bool],
         response_obj: Mapping[str, object],
+        *,
+        tool_def_sha256: str = "",
     ) -> ToolReceipt:
         if "error" in response_obj:
             err = response_obj.get("error")
@@ -266,6 +273,8 @@ class McpStreamableHttpProxy:
                 error_code=f"jsonrpc_{code}",
                 args=args_map,
                 output=f"JSON-RPC {code}: {msg}",
+                tool_definition_sha256=tool_def_sha256,
+                endpoint_id=self.upstream_url,
             )
 
         ok, output_text, is_validation = _extract_mcp_result_text(response_obj.get("result"))
@@ -278,6 +287,8 @@ class McpStreamableHttpProxy:
                 error_code="",
                 args=args_map,
                 output=output_text,
+                tool_definition_sha256=tool_def_sha256,
+                endpoint_id=self.upstream_url,
             )
         return ToolReceipt(
             call_id=call_id,
@@ -287,6 +298,8 @@ class McpStreamableHttpProxy:
             error_code="invalid_tool_arguments" if is_validation else "mcp_tool_error",
             args=args_map,
             output=output_text,
+            tool_definition_sha256=tool_def_sha256,
+            endpoint_id=self.upstream_url,
         )
 
     def handle_post(
@@ -318,6 +331,7 @@ class McpStreamableHttpProxy:
         args_map: dict[str, str | int | float | bool] = {}
         op_key: str | None = None
         input_sha: str | None = None
+        tool_def_sha = ""
 
         if is_single_map and method == "tools/call":
             params = parsed_req.get("params")
@@ -332,6 +346,48 @@ class McpStreamableHttpProxy:
             else:
                 tool_name = "<invalid_params>"
                 args_map = {"_raw_params": _coerce_scalar(params)}
+
+            with self._lock:
+                tool_def_sha = self._tool_pins.get(tool_name, "")
+                is_compromised = self.pin_tools and tool_name in self._compromised_tools
+
+            if is_compromised:
+                refuse_cid = self._next_call_id("http-pin-refused")
+                self.writer.append(
+                    ToolReceipt(
+                        call_id=refuse_cid,
+                        tool=tool_name,
+                        ok=False,
+                        executed=False,
+                        error_code="mcp_tool_pin_refused",
+                        args=args_map,
+                        output=(
+                            f"Refused tools/call for '{tool_name}': tool definition changed "
+                            "mid-session from approved pin."
+                        ),
+                        tool_definition_sha256=tool_def_sha,
+                        endpoint_id=self.upstream_url,
+                    )
+                )
+                refuse_rpc = {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": {
+                        "code": -32603,
+                        "message": (
+                            f"MCP tool '{tool_name}' invocation refused: definition digest "
+                            "differs from approved session pin."
+                        ),
+                    },
+                }
+                return (
+                    409,
+                    {
+                        "Content-Type": "application/json",
+                        "X-Epistemic-Guard-Outcome": "refused_tool_pin_mismatch",
+                    },
+                    json.dumps(refuse_rpc, separators=(",", ":")).encode("utf-8"),
+                )
 
             op_key = _extract_operation_key(parsed_req, hdrs)
             if op_key is not None:
@@ -353,6 +409,8 @@ class McpStreamableHttpProxy:
                                     f"Operation key {op_key!r} already bound to a different "
                                     "tool/argument commitment."
                                 ),
+                                tool_definition_sha256=tool_def_sha,
+                                endpoint_id=self.upstream_url,
                             )
                         )
                         conflict_rpc = {
@@ -441,6 +499,8 @@ class McpStreamableHttpProxy:
                         error_code=f"mcp_http_{exc.code}",
                         args=args_map,
                         output=f"Upstream HTTP {exc.code}: {err_body}",
+                        tool_definition_sha256=tool_def_sha,
+                        endpoint_id=self.upstream_url,
                     )
                 )
             rpc_err = {
@@ -470,6 +530,8 @@ class McpStreamableHttpProxy:
                         error_code="mcp_http_upstream_indeterminate",
                         args=args_map,
                         output=f"Upstream connection failed before response: {exc}",
+                        tool_definition_sha256=tool_def_sha,
+                        endpoint_id=self.upstream_url,
                     )
                 )
             rpc_drop = {
@@ -545,7 +607,13 @@ class McpStreamableHttpProxy:
                         resp_body = json.dumps(active_resp, separators=(",", ":")).encode("utf-8")
 
                 cid = self._next_call_id("http-mcp")
-                rcpt = self._build_receipt(cid, tool_name, args_map, active_resp)
+                rcpt = self._build_receipt(
+                    cid,
+                    tool_name,
+                    args_map,
+                    active_resp,
+                    tool_def_sha256=tool_def_sha,
+                )
                 entry = self.writer.append(
                     rcpt,
                     operation_key=op_key,
@@ -555,6 +623,10 @@ class McpStreamableHttpProxy:
                 out_headers["X-Epistemic-Guard-Replayed"] = "false"
                 out_headers["X-Epistemic-Guard-Receipt-Id"] = entry.receipt.call_id
                 out_headers["X-Epistemic-Guard-Output-Sha256"] = entry.receipt.output_sha256
+                if entry.receipt.tool_definition_sha256:
+                    out_headers["X-Epistemic-Guard-Tool-Def-Sha256"] = (
+                        entry.receipt.tool_definition_sha256
+                    )
 
         return (status_code, out_headers, resp_body)
 

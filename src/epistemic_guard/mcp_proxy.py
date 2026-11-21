@@ -155,6 +155,7 @@ class _PendingToolCall:
     call_id: str
     tool: str
     args: dict[str, str | int | float | bool]
+    tool_def_sha256: str = ""
 
 
 def _coerce_scalar(val: object) -> str | int | float | bool:
@@ -743,12 +744,14 @@ _WEB_SEARCH_TOOL_RE: Final[re.Pattern[str]] = re.compile(
 
 
 def compute_mcp_tool_sha256(tool_def: Mapping[str, Any]) -> str:
-    """Compute canonical SHA-256 over `(name, description, inputSchema)` of an MCP tool."""
-    canonical = {
+    """Compute canonical SHA-256 over `(name, description, inputSchema[, annotations])`."""
+    canonical: dict[str, Any] = {
         "name": str(tool_def.get("name") or ""),
         "description": str(tool_def.get("description") or ""),
         "inputSchema": tool_def.get("inputSchema") or {},
     }
+    if "annotations" in tool_def and tool_def["annotations"] is not None:
+        canonical["annotations"] = tool_def["annotations"]
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )
@@ -866,15 +869,18 @@ class McpStdioProxy:
         pin_tools: bool = False,
         raise_on_rugpull: bool = False,
         filter_web_results: bool = False,
+        endpoint_id: str = "",
     ) -> None:
         self._writer = writer
         self._pin_tools = pin_tools
         self._raise_on_rugpull = raise_on_rugpull
         self._filter_web_results = filter_web_results
+        self._endpoint_id = endpoint_id
         self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
         self._pending_tools_list: set[tuple[str, str]] = set()
         self._seen_rpc_counts: dict[tuple[str, str], int] = {}
         self._tool_pins: dict[str, str] = {}
+        self._compromised_tools: set[str] = set()
         self._observed_tools: dict[str, dict[str, Any]] = {}
         self._rugpull_count = 0
         self._lock = threading.Lock()
@@ -891,28 +897,42 @@ class McpStdioProxy:
         with self._lock:
             return dict(self._tool_pins)
 
-    def observe_client_line(self, raw_line: bytes) -> None:
-        """Inspect a client->server JSON-RPC line and register `tools/call` or `tools/list`."""
+    def process_client_line(self, raw_line: bytes) -> tuple[bytes, list[bytes]]:
+        """Inspect a client->server JSON-RPC line.
+
+        Returns `(bytes_to_forward_to_server, immediate_client_error_lines)`.
+        When `pin_tools=True` and a tool's definition previously mutated mid-session,
+        `tools/call` for that tool is refused pre-execution without forwarding upstream.
+        """
         stripped = raw_line.strip()
         if not stripped or stripped[:1] not in (b"{", b"["):
-            return
+            return (raw_line, [])
         try:
             payload = json.loads(stripped.decode("utf-8"))
         except Exception:
-            return
-        items = payload if isinstance(payload, list) else [payload]
+            return (raw_line, [])
+        is_batch = isinstance(payload, list)
+        items = payload if is_batch else [payload]
+        fwd_items: list[object] = []
+        refusal_lines: list[bytes] = []
+        intercepted = False
+
         for item in items:
             if not isinstance(item, Mapping):
+                fwd_items.append(item)
                 continue
             method = item.get("method")
             id_key = _rpc_id_key(item.get("id"))
             if id_key is None:
+                fwd_items.append(item)
                 continue
             if method == "tools/list":
                 with self._lock:
                     self._pending_tools_list.add(id_key)
+                fwd_items.append(item)
                 continue
             if method != "tools/call":
+                fwd_items.append(item)
                 continue
             params = item.get("params")
             if isinstance(params, Mapping):
@@ -937,13 +957,63 @@ class McpStdioProxy:
                 occ = self._seen_rpc_counts.get(id_key, 0) + 1
                 self._seen_rpc_counts[id_key] = occ
                 cid = f"mcp-{id_key[1]}" if occ == 1 else f"mcp-{id_key[1]}#{occ}"
-                self._pending.setdefault(id_key, []).append(
-                    _PendingToolCall(
+                pinned_sha = self._tool_pins.get(tool_name, "")
+                is_compromised = self._pin_tools and tool_name in self._compromised_tools
+                if not is_compromised:
+                    self._pending.setdefault(id_key, []).append(
+                        _PendingToolCall(
+                            call_id=cid,
+                            tool=tool_name,
+                            args=args_map,
+                            tool_def_sha256=pinned_sha,
+                        )
+                    )
+
+            if is_compromised:
+                intercepted = True
+                self._writer.append(
+                    ToolReceipt(
                         call_id=cid,
                         tool=tool_name,
+                        ok=False,
+                        executed=False,
+                        error_code="mcp_tool_pin_refused",
                         args=args_map,
+                        output=(
+                            f"Refused tools/call for '{tool_name}': tool definition changed "
+                            "mid-session from approved pin."
+                        ),
+                        tool_definition_sha256=pinned_sha,
+                        endpoint_id=self._endpoint_id,
                     )
                 )
+                err_resp = {
+                    "jsonrpc": "2.0",
+                    "id": item.get("id"),
+                    "error": {
+                        "code": -32603,
+                        "message": (
+                            f"MCP tool '{tool_name}' invocation refused: definition digest "
+                            "differs from approved session pin."
+                        ),
+                    },
+                }
+                refusal_lines.append(
+                    (json.dumps(err_resp, separators=(",", ":")) + "\n").encode("utf-8")
+                )
+            else:
+                fwd_items.append(item)
+
+        if not intercepted:
+            return (raw_line, [])
+        if not fwd_items:
+            return (b"", refusal_lines)
+        out_fwd = fwd_items if is_batch else fwd_items[0]
+        return ((json.dumps(out_fwd, separators=(",", ":")) + "\n").encode("utf-8"), refusal_lines)
+
+    def observe_client_line(self, raw_line: bytes) -> None:
+        """Inspect a client->server JSON-RPC line and register `tools/call` or `tools/list`."""
+        self.process_client_line(raw_line)
 
     def _inspect_tools_list_response(
         self, item: Mapping[str, object]
@@ -970,7 +1040,9 @@ class McpStdioProxy:
                     self._observed_tools[raw_name] = dict(tdef)
                 elif prev_digest != digest:
                     mutations.append((raw_name, prev_digest, digest))
-                    if not self._pin_tools:
+                    if self._pin_tools:
+                        self._compromised_tools.add(raw_name)
+                    else:
                         self._tool_pins[raw_name] = digest
                         self._observed_tools[raw_name] = dict(tdef)
         for tname, old_h, new_h in mutations:
@@ -989,6 +1061,8 @@ class McpStdioProxy:
                         f"MCP tools/list schema mutation detected for '{tname}': "
                         f"pinned={old_h[:16]}... != observed={new_h[:16]}..."
                     ),
+                    tool_definition_sha256=old_h,
+                    endpoint_id=self._endpoint_id,
                 )
             )
             if self._raise_on_rugpull:
@@ -1089,11 +1163,13 @@ class McpStdioProxy:
                     error_code="mcp_server_eof",
                     args=pending.args,
                     output=f"MCP server exited (code {exit_code}) before responding.",
+                    tool_definition_sha256=pending.tool_def_sha256,
+                    endpoint_id=self._endpoint_id,
                 )
             )
 
-    @staticmethod
     def _build_receipt_from_response(
+        self,
         pending: _PendingToolCall,
         response: Mapping[str, object],
     ) -> ToolReceipt:
@@ -1119,6 +1195,8 @@ class McpStdioProxy:
                 error_code=f"jsonrpc_{code}",
                 args=pending.args,
                 output=f"JSON-RPC {code}: {msg}",
+                tool_definition_sha256=pending.tool_def_sha256,
+                endpoint_id=self._endpoint_id,
             )
 
         ok, output_text, is_validation = _extract_mcp_result_text(response.get("result"))
@@ -1131,6 +1209,8 @@ class McpStdioProxy:
                 error_code="",
                 args=pending.args,
                 output=output_text,
+                tool_definition_sha256=pending.tool_def_sha256,
+                endpoint_id=self._endpoint_id,
             )
         return ToolReceipt(
             call_id=pending.call_id,
@@ -1140,6 +1220,8 @@ class McpStdioProxy:
             error_code="invalid_tool_arguments" if is_validation else "mcp_tool_error",
             args=pending.args,
             output=output_text,
+            tool_definition_sha256=pending.tool_def_sha256,
+            endpoint_id=self._endpoint_id,
         )
 
 
@@ -1177,12 +1259,14 @@ def run_mcp_stdio_proxy(
         writer,
         pin_tools=pin_tools,
         filter_web_results=filter_web_results,
+        endpoint_id=f"stdio:{Path(server_cmd[0]).name}",
     )
 
     child_env = _scrub_child_env(os.environ)
 
     in_stream = client_in if client_in is not None else sys.stdin.buffer
     out_stream = client_out if client_out is not None else sys.stdout.buffer
+    out_lock = threading.Lock()
 
     proc = subprocess.Popen(
         list(server_cmd),
@@ -1202,9 +1286,15 @@ def run_mcp_stdio_proxy(
                 line = in_stream.readline()
                 if not line:
                     break
-                proxy.observe_client_line(line)
-                child_stdin.write(line)
-                child_stdin.flush()
+                fwd_line, immediate_replies = proxy.process_client_line(line)
+                if immediate_replies:
+                    with out_lock:
+                        for rep in immediate_replies:
+                            out_stream.write(rep)
+                        out_stream.flush()
+                if fwd_line:
+                    child_stdin.write(fwd_line)
+                    child_stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
         finally:
@@ -1220,8 +1310,9 @@ def run_mcp_stdio_proxy(
             if not line:
                 break
             out_line = proxy.process_server_line(line)
-            out_stream.write(out_line)
-            out_stream.flush()
+            with out_lock:
+                out_stream.write(out_line)
+                out_stream.flush()
     except (BrokenPipeError, OSError):
         pass
     finally:

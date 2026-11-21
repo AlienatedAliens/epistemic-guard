@@ -472,6 +472,8 @@ class ToolReceipt(BaseModel):
     args: dict[str, str | int | float | bool] = Field(default_factory=dict)
     output: str = ""
     output_sha256: str = ""
+    tool_definition_sha256: str = ""
+    endpoint_id: str = ""
     timestamp_utc: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     session_id: str = ""
     signature: str = ""
