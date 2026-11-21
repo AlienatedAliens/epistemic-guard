@@ -230,19 +230,31 @@ Evaluated across `LOCKED_COH_50` (`50`), `BLIND42_COH_100` (`100`), and `Organic
 
 ---
 
+## Threat Model & Non-Goals
+
+`epistemic-guard` is a **signed-evidence MCP proxy plus a lightweight statistical prose checker**, not a sandbox or full enterprise firewall.
+
+- **What signed receipts prove:** `mcp-proxy` and `mcp-http-proxy` prove what JSON-RPC request/response crossed the MCP wire, which tool definition (`tool_definition_sha256` + `endpoint_id`) was active, and that the append-only RFC 6962 Merkle log has not been tampered with or reordered.
+- **What signed receipts do NOT prove:** They do not prove that a buggy or malicious upstream MCP server actually mutated external state after returning `200 OK` / `isError: false`. Checking real side effects out-of-band (e.g., local filesystem `stat`/hash probes) is planned for `v0.7`.
+- **Statistical checker & enforcement boundary:** `ReceiptSupervisor` is a probabilistic classifier over signed receipts, not a formal proof. If an agent process bypasses `ReceiptSupervisor` or streams unbuffered tokens directly to the user before `verify_narration()` runs, the proxy log still records ground-truth tool execution, but the user may already have seen an unverified claim. Recommended rollout: run the deterministic proxy and Merkle log in enforcement mode immediately, and run `ReceiptSupervisor` in **flag/shadow mode** until calibrated to your real-traffic false-positive tolerance.
+- **OS key isolation:** Keep `--key-file` (and `--pubkey-file` during `verify-log`) outside directories writable by the untrusted agent or child MCP server; run the proxy under a separate OS user or container on shared hosts.
+
+---
+
 ## Ecosystem Comparison & Disclosures
 
 - **OWASP Top 10 for Agentic Applications (2026) coverage:**
-  - **`ASI02` (Tool Misuse & Phantom Execution):** `mcp-proxy`, `@recorder.tool`, and `ReceiptSupervisor` verify assistant prose against signed `ToolReceipt` logs (`executed`, `ok`, `error_code`) so unexecuted or failed tool calls cannot be reported as completed.
+  - **`ASI02` (Tool Misuse & Phantom Execution):** `mcp-proxy`, `@recorder.tool`, and `ReceiptSupervisor` check assistant prose against signed `ToolReceipt` logs (`executed`, `ok`, `error_code`) so unexecuted or failed tool calls are flagged when reported as completed.
   - **`ASI06` (Memory & Context Poisoning):** `ProvenanceGate` and `SQLiteProvenanceStore` reject unsigned writes and `LLM_NARRATION` at the database trigger layer, and `corroborate_sources` collapses syndicated wire/Sybil echoes before synthesis.
-  - **`ASI08` (Cascading Hallucinations Across Trust Boundaries):** Append-only RFC 6962 Merkle logs and `AER-1` receipt export preserve verifiable provenance across multi-agent and MCP boundaries.
-- **Scope vs adjacent projects:**
-  - **[Pipelock](https://github.com/pipelab-org/pipelock):** Go egress/MCP proxy that scans outbound network traffic for SSRF/exfiltration and emits mediator-signed receipts; `epistemic-guard` adds post-turn clause-level prose verification (`ReceiptSupervisor`), Ed25519 SQLite memory write-gating, and syndicated RAG source deduplication in Python (`0 MiB` VRAM).
-  - **[NabaOS](https://github.com/nabaos/nabaos):** Full Rust agent runtime with OS sandboxing and Ed25519-signed static constitutions. `epistemic-guard` is a standalone Python package and MCP stdio proxy (`pip install epistemic-guard`) for existing stacks.
-  - **Pre-execution firewalls (`NeMo Guardrails`, `LlamaFirewall`, `Guardrails AI`):** Gate inputs and tool calls *before* execution; `epistemic-guard` verifies post-execution assistant prose against signed `ToolReceipt` records.
+  - **`ASI08` (Cascading Hallucinations Across Trust Boundaries):** Append-only RFC 6962 Merkle logs and optional `AER-1` receipt export preserve verifiable provenance across multi-agent and MCP boundaries.
+- **Scope vs adjacent projects & literature:**
+  - **[NabaOS](https://github.com/nabaos/nabaos) (`arXiv:2603.10060`):** Rust agent runtime using HMAC-signed tool receipts, cooperative receipt-ID claim tagging (reporting `94.2%` on synthetic fabricated receipt-ID injection), and URL/computation cross-checking. `epistemic-guard` differs by using asymmetric `Ed25519` + `RFC 6962` Merkle logs in a separate OS process (public-key-only verification), wrapping unmodified MCP servers as a standalone `pip` package, checking plain uncooperative prose without receipt-ID tags, and adding an Ed25519 SQLite memory write-gate.
+  - **[Pipelock](https://github.com/pipelab-org/pipelock):** Go egress/MCP proxy covering SSRF/exfiltration, content injection scanning, `tools/list` SHA-256 drift/rug-pull detection, and Ed25519 action receipts over Streamable HTTP. `epistemic-guard` overlaps on MCP proxy receipts and `tools/list` pinning, and adds post-turn prose-vs-receipt checking, Ed25519 SQLite memory write-gating, and syndicated RAG wire-copy deduplication in Python (`0 MiB` VRAM).
+  - **`Halluci-Action` (Mao et al., NeurIPS 2026 Workshop):** Offline evaluation framework measuring bidirectional claim-vs-action misalignment across `2,843` enterprise trajectories (Odoo / AppWorld; peak `45.9%` Halluci-Action Rate, `>50%` of goal-complete trajectories affected). `epistemic-guard` targets runtime detection of the phantom-claim direction (with unrequested-mutation checks scoped for `v0.7`).
+  - **Pre-execution firewalls (`NeMo Guardrails`, `LlamaFirewall`, `Guardrails AI`):** Gate inputs and tool calls *before* execution; `epistemic-guard` checks post-execution assistant prose against signed `ToolReceipt` records.
   - **RAG faithfulness (`Vectara HHEM`, `Bespoke-MiniCheck`, `Patronus Lynx`):** Score summary-to-chunk entailment (`epistemic-guard` has not been benchmarked on RAG summarization leaderboards).
-  - **Receipt formats (`AER-1` / `draft-zambo-aer1`):** Define portable hash-committed tool receipts; `epistemic-guard` signs receipts locally with Ed25519 (`mcp-proxy` or `@recorder.tool`), supports `AER-1` import/export, and checks assistant prose against those receipts.
-- **Disclosures:** Neural models are English-only. Benchmarks ran on a single workstation; pre-registrations use git + OpenTimestamps SHA-256 locks ([dataset & `.ots` proofs](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)), and $\kappa$ agreement figures come from blinded LLM raters rather than human crowdworkers.
+  - **Receipt formats (`AER-1`):** Portable hash-committed tool-receipt envelope; `epistemic-guard` signs receipts locally with Ed25519 (`mcp-proxy`, `mcp-http-proxy`, or `@recorder.tool`), supports optional `AER-1` import/export (`--aer1`), and checks assistant prose against those receipts.
+- **Disclosures:** Neural models are English-only. Benchmarks ran on a single workstation; pre-registrations use git + OpenTimestamps SHA-256 locks ([dataset & `.ots` proofs](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)), and $\kappa$ agreement figures come from blinded LLM raters rather than human crowdworkers. Next validation step: a frozen-commit, pre-registered frontier-model holdout (`Claude`, `GPT`, `Gemini`) with external human double-annotation.
 
 ---
 
