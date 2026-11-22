@@ -750,6 +750,7 @@ class SupervisionVerdict(BaseModel):
     unsupported_claims: list[str] = Field(default_factory=list)
     unsupported_spans: list[UnsupportedClaimSpan] = Field(default_factory=list)
     unfulfilled_promises: list[str] = Field(default_factory=list)
+    undisclosed_mutations: list[str] = Field(default_factory=list)
     structured_actions: list[StructuredActionTag] = Field(default_factory=list)
 
     def to_retry_prompt(self, executed_receipts: Sequence[ToolReceipt] | None = None) -> str:

@@ -830,8 +830,10 @@ class ReceiptSupervisor:
         device: str | None = None,
         claim_threshold: float = 0.55,
         flag_unfulfilled_promises: bool = False,
+        flag_undisclosed_mutations: bool = False,
         allow_creative_context: bool = True,
         verify_output_values: bool = False,
+        verify_discourse_nli: bool = True,
         extra_tool_stems: Mapping[str, Sequence[str]] | None = None,
         mcp_tools: Sequence[Mapping[str, Any]] | None = None,
         verify_hashes: bool = True,
@@ -844,8 +846,13 @@ class ReceiptSupervisor:
         self._lock = threading.Lock()
         self.claim_threshold = claim_threshold
         self.flag_unfulfilled_promises = flag_unfulfilled_promises
+        self.flag_undisclosed_mutations = flag_undisclosed_mutations
         self.allow_creative_context = allow_creative_context
         self.verify_output_values = verify_output_values
+        self.verify_discourse_nli = verify_discourse_nli
+        self._requested_device = device
+        self._discourse_nli: OpenVINONLIVerifier | None = None
+        self._discourse_nli_attempted = False
         self.gate = gate
         self.expected_session_id = expected_session_id
         self.max_receipt_age_seconds = max_receipt_age_seconds
@@ -1205,6 +1212,7 @@ class ReceiptSupervisor:
         base_char_offset: int = 0,
         allow_creative_context: bool | None = None,
         verify_output_values: bool | None = None,
+        flag_undisclosed_mutations: bool | None = None,
         gate: ProvenanceGate | None = None,
         expected_session_id: str | None = None,
         max_receipt_age_seconds: float | None = None,
@@ -1284,8 +1292,34 @@ class ReceiptSupervisor:
             output_guard = self._output_guard
 
         ok_receipts = [r for r in receipts if r.ok and r.executed]
+        failed_receipts = [r for r in receipts if not (r.ok and r.executed)]
         family_counts: dict[str, int] = {}
-        prose_spans = split_into_clauses_with_spans(masked)
+        raw_spans = split_into_clauses_with_spans(masked)
+        prose_spans: list[tuple[str, int, int]] = []
+        if ok_receipts and failed_receipts:
+            coord_re = re.compile(
+                r"\s+and\s+(?=(?:also\s+|then\s+|successfully\s+|have\s+|has\s+)?"
+                r"(?:[a-z]{3,}ed|sent|wrote|written|ran|made|put|set|done)\b)",
+                re.IGNORECASE,
+            )
+            for cl_t, s_c, e_c in raw_spans:
+                parts = list(coord_re.finditer(cl_t))
+                if not parts:
+                    prose_spans.append((cl_t, s_c, e_c))
+                    continue
+                cur = 0
+                for m in parts:
+                    seg = cl_t[cur : m.start()].strip()
+                    if seg:
+                        lead = len(cl_t[cur : m.start()]) - len(cl_t[cur : m.start()].lstrip())
+                        prose_spans.append((seg, s_c + cur + lead, s_c + cur + lead + len(seg)))
+                    cur = m.end()
+                tail = cl_t[cur:].strip()
+                if tail:
+                    lead = len(cl_t[cur:]) - len(cl_t[cur:].lstrip())
+                    prose_spans.append((tail, s_c + cur + lead, s_c + cur + lead + len(tail)))
+        else:
+            prose_spans = raw_spans
         for cl_text, s_char, e_char in prose_spans:
             stripped = cl_text.strip(".,!?;: ").lower()
             if stripped in ("", "done", "ok", "okay", "completed"):
@@ -1376,8 +1410,113 @@ class ReceiptSupervisor:
                         )
                     )
 
-        is_ok = len(unsupported_claims) == 0 and (
-            not self.flag_unfulfilled_promises or len(unfulfilled) == 0
+        # Stage-2 discourse NLI cascade (lazy-loaded, 0 ms on clean turns): resolves
+        # multi-sentence honest failure reports and mixed-receipt partial-compound lies
+        # using full-reply context rather than isolated clauses.
+        has_soac_violation = any(not t.grounded for t in structured)
+        if self.verify_discourse_nli and not has_soac_violation and failed_receipts:
+            need_fp_check = (not ok_receipts) and bool(unsupported_claims)
+            need_compound_check = bool(ok_receipts) and (not unsupported_claims)
+            if need_fp_check or need_compound_check:
+                if not self._discourse_nli_attempted:
+                    self._discourse_nli_attempted = True
+                    dev = (
+                        self._requested_device
+                        if self._requested_device is not None
+                        else (self.active_device if self.available else "CPU")
+                    )
+                    cand = OpenVINONLIVerifier(device=dev, warn_on_missing=False)
+                    if cand.available:
+                        self._discourse_nli = cand
+                if self._discourse_nli is not None:
+                    if need_fp_check:
+                        nli_res = self._discourse_nli.infer_pair(
+                            narration, "The requested operation succeeded."
+                        )
+                        if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
+                            unsupported_claims.clear()
+                            unsupported_spans.clear()
+                    elif need_compound_check:
+                        nli_res = self._discourse_nli.infer_pair(
+                            narration, "One of the requested actions failed."
+                        )
+                        if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
+                            unsupported_claims.append(narration.strip())
+                            unsupported_spans.append(
+                                UnsupportedClaimSpan(
+                                    text=narration.strip(),
+                                    start_char=base_char_offset,
+                                    end_char=base_char_offset + len(narration.strip()),
+                                    claimed_family="PARTIAL_COMPOUND_NLI_CONTRADICTION",
+                                    reason=(
+                                        "Reply contradicts failed ToolReceipt in a mixed-outcome "
+                                        f"turn (p_contradiction={nli_res.contradiction:.2f})."
+                                    ),
+                                )
+                            )
+
+        # Direction 2 (Halluci-Action): detect executed mutating tools that the assistant
+        # never disclosed in its reply (e.g. silent side effects from indirect prompt injection).
+        undisclosed: list[str] = []
+        narr_low = narration.lower()
+        narr_tokens = _extract_content_tokens(narr_low)
+        read_only_stems = _FAMILY_TOOL_STEMS["CLAIM_SEARCH_READ"]
+        for rcpt in ok_receipts:
+            t_low = rcpt.tool.lower()
+            is_read_only = any(
+                re.search(rf"(?:^|_){re.escape(s)}(?:_|$)", t_low) for s in read_only_stems
+            )
+            if _SQL_OR_EXEC_TOOL_RE.search(t_low) and rcpt.args:
+                joined_sql = " ".join(str(v) for v in rcpt.args.values())
+                if (
+                    _SQL_READ_ARG_RE.search(joined_sql)
+                    and not _SQL_DELETE_ARG_RE.search(joined_sql)
+                    and not _SQL_WRITE_ARG_RE.search(joined_sql)
+                ):
+                    is_read_only = True
+            if is_read_only:
+                continue
+
+            disclosed = False
+            for aval in rcpt.args.values():
+                v_str = str(aval).strip().lower()
+                if len(v_str) >= 4:
+                    base = Path(v_str).name if ("/" in v_str or "\\" in v_str) else v_str
+                    if v_str in narr_low or (len(base) >= 4 and base in narr_low):
+                        disclosed = True
+                        break
+            if not disclosed:
+                tool_toks = _extract_content_tokens(t_low) | self._mcp_tool_tokens.get(
+                    t_low, frozenset()
+                )
+                if narr_tokens & tool_toks:
+                    disclosed = True
+            if not disclosed:
+                args_preview = ", ".join(f"{k}={v!r}" for k, v in list(rcpt.args.items())[:3])
+                desc = f"{rcpt.tool}({args_preview})"
+                undisclosed.append(desc)
+
+        flag_undisc = (
+            self.flag_undisclosed_mutations
+            if flag_undisclosed_mutations is None
+            else flag_undisclosed_mutations
+        )
+        if flag_undisc and undisclosed:
+            for desc in undisclosed:
+                unsupported_spans.append(
+                    UnsupportedClaimSpan(
+                        text=narration.strip()[:160],
+                        start_char=base_char_offset,
+                        end_char=base_char_offset + min(len(narration.strip()), 160),
+                        claimed_family="UNDISCLOSED_MUTATION",
+                        reason=f"Mutating tool receipt '{desc}' executed without disclosure.",
+                    )
+                )
+
+        is_ok = (
+            len(unsupported_claims) == 0
+            and (not self.flag_unfulfilled_promises or len(unfulfilled) == 0)
+            and (not flag_undisc or len(undisclosed) == 0)
         )
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return SupervisionVerdict(
@@ -1388,6 +1527,7 @@ class ReceiptSupervisor:
             unsupported_claims=unsupported_claims,
             unsupported_spans=unsupported_spans,
             unfulfilled_promises=unfulfilled,
+            undisclosed_mutations=undisclosed,
             structured_actions=structured,
         )
 
