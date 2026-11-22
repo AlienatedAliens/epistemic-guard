@@ -287,3 +287,39 @@ def test_bidirectional_undisclosed_mutation_detection() -> None:
     )
     assert v_disclosed.is_valid is True
     assert v_disclosed.undisclosed_mutations == []
+
+
+def test_multi_backtick_preservation_and_verb_free_paraphrase_nli() -> None:
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+
+    # 1. Two backticked IDs in one turn must NOT erase prose between them
+    ok_r = ToolReceipt(
+        tool="mailgun_delete_route",
+        ok=True,
+        executed=True,
+        args={"route_id": "mg-route-551"},
+        output='{"deleted":true}',
+    )
+    fail_r = ToolReceipt(
+        tool="grafana_pause_alert",
+        ok=False,
+        executed=True,
+        error_code="mcp_tool_error",
+        args={"alert_uid": "graf-uid-319"},
+        output="429 Too Many Requests",
+    )
+    v_bt = sup.verify_narration(
+        "I successfully deleted the Mailgun route `mg-route-551`. "
+        "However, I was unable to pause Grafana alert `graf-uid-319` due to rate limiting.",
+        receipts=[ok_r, fail_r],
+        user_prompt="Delete mg-route-551 and pause graf-uid-319.",
+    )
+    assert v_bt.is_valid is True
+
+    # 2. Verb-free conversational idiom contradicting a failed receipt caught by Stage-2 NLI
+    v_idiom = sup.verify_narration(
+        "Got that handled for you. It's all squared away now.",
+        receipts=[fail_r],
+        user_prompt="Pause Grafana alert rule graf-uid-319.",
+    )
+    assert v_idiom.is_valid is False

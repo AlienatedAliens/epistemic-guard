@@ -340,7 +340,7 @@ _FENCED_CODE_RE: Final[re.Pattern[str]] = re.compile(
     r"```[\s\S]*?```|~~~[\s\S]*?~~~|```[^\n]*\n[\s\S]*$"
 )
 _BLOCKQUOTE_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^[ \t]*>[^\n]*")
-_INLINE_CODE_MULTIWORD_RE: Final[re.Pattern[str]] = re.compile(r"`[^`\n]*\s+[^`\n]*`")
+_INLINE_CODE_SPAN_RE: Final[re.Pattern[str]] = re.compile(r"`[^`\n]+`")
 _PRE_ATTRIBUTED_QUOTE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:\b(?:said|says|stated|states|wrote|writes|claimed|claims|replied|replies|asked|asks|"
     r"whispered|muttered|shouted|reads?|message|email|log|output|error|prints?|example|"
@@ -474,8 +474,12 @@ def mask_non_assertive_spans(text: str) -> str:
     quotations/dialogue with equal-length spaces so assertive prose offsets stay exact.
     """
     masked = text
-    for block_re in (_FENCED_CODE_RE, _BLOCKQUOTE_RE, _INLINE_CODE_MULTIWORD_RE):
+    for block_re in (_FENCED_CODE_RE, _BLOCKQUOTE_RE):
         masked = block_re.sub(lambda m: " " * (m.end() - m.start()), masked)
+    masked = _INLINE_CODE_SPAN_RE.sub(
+        lambda m: " " * (m.end() - m.start()) if re.search(r"\s", m.group(0)) else m.group(0),
+        masked,
+    )
     for m in list(_PRE_ATTRIBUTED_QUOTE_RE.finditer(masked)):
         masked = _mask_span_preserving_offsets(masked, m.start(1), m.end(1))
     for m in list(_POST_ATTRIBUTED_QUOTE_RE.finditer(masked)):
@@ -1416,8 +1420,9 @@ class ReceiptSupervisor:
         has_soac_violation = any(not t.grounded for t in structured)
         if self.verify_discourse_nli and not has_soac_violation and failed_receipts:
             need_fp_check = (not ok_receipts) and bool(unsupported_claims)
+            need_paraphrase_check = (not ok_receipts) and (not unsupported_claims)
             need_compound_check = bool(ok_receipts) and (not unsupported_claims)
-            if need_fp_check or need_compound_check:
+            if need_fp_check or need_paraphrase_check or need_compound_check:
                 if not self._discourse_nli_attempted:
                     self._discourse_nli_attempted = True
                     dev = (
@@ -1436,6 +1441,25 @@ class ReceiptSupervisor:
                         if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
                             unsupported_claims.clear()
                             unsupported_spans.clear()
+                    elif need_paraphrase_check:
+                        nli_res = self._discourse_nli.infer_pair(
+                            narration, "The action failed."
+                        )
+                        if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
+                            unsupported_claims.append(narration.strip())
+                            unsupported_spans.append(
+                                UnsupportedClaimSpan(
+                                    text=narration.strip(),
+                                    start_char=base_char_offset,
+                                    end_char=base_char_offset + len(narration.strip()),
+                                    claimed_family="PARAPHRASE_NLI_CONTRADICTION",
+                                    reason=(
+                                        "Reply contradicts failed ToolReceipt via indirect "
+                                        "completion phrasing "
+                                        f"(p_contradiction={nli_res.contradiction:.2f})."
+                                    ),
+                                )
+                            )
                     elif need_compound_check:
                         nli_res = self._discourse_nli.infer_pair(
                             narration, "One of the requested actions failed."
