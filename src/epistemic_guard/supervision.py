@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import posixpath
 import re
 import threading
 import time
@@ -741,51 +742,71 @@ def _is_read_only_tool(tool_name: str) -> bool:
 
 
 def _extract_receipt_target_key(rcpt: ToolReceipt) -> str:
-    for key in ("path", "file_path", "record_id", "deal_id", "event_id", "id"):
+    """Extract a normalized value-only target key so `path` and `file_path` align."""
+    for key in ("path", "file_path", "filepath", "record_id", "deal_id", "event_id", "id"):
         val = str(rcpt.args.get(key) or "").strip().lower()
         if val:
-            return f"{key}:{val}"
+            norm = val.replace("\\", "/")
+            if "/" in norm:
+                norm = posixpath.normpath(norm)
+            elif norm.startswith("./"):
+                norm = norm[2:]
+            return norm
     return ""
+
+
+def _readback_polarity(rcpt: ToolReceipt) -> bool | None:
+    """Return True if read-back confirms presence, False if missing/unpersisted, else None."""
+    if rcpt.ok and rcpt.output.strip()[:1] == "{":
+        with contextlib.suppress(Exception):
+            parsed = json.loads(rcpt.output)
+            if isinstance(parsed, Mapping):
+                for key in ("exists", "found", "persisted", "present"):
+                    if parsed.get(key) is False:
+                        return False
+                    if parsed.get(key) is True:
+                        return True
+                status_val = str(parsed.get("status") or "").strip().lower()
+                if status_val in {"not_found", "missing", "absent", "unpersisted"}:
+                    return False
+                if status_val in {"ok", "found", "present", "exists", "confirmed", "active"}:
+                    return True
+    if not rcpt.ok and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}"):
+        return False
+    return None
 
 
 def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> ToolReceipt | None:
     """Detect post-write read-back receipts reporting missing or unpersisted state.
 
-    Order-aware and delete-safe: pre-write `stat` checks (`exists: false`) and
-    delete-then-verify-gone sequences are never flagged.
+    Tracks per-target state by normalized target value:
+    - Write -> delete -> read(not_found) passes cleanly (even when it is the only target).
+    - Targetless writes (e.g. `send_email`) never cause unrelated `search` not-found FPs.
+    - Retried reads after index lag pass when a later read confirms presence.
     """
-    saw_ok_non_delete_write = False
-    written_targets: set[str] = set()
+    state: dict[str, tuple[str, ToolReceipt | None]] = {}
     for rcpt in receipts:
-        if rcpt.ok and rcpt.executed and not _is_read_only_tool(rcpt.tool):
-            if _DELETE_TOOL_RE.search(rcpt.tool):
-                tgt = _extract_receipt_target_key(rcpt)
-                written_targets.discard(tgt)
-            else:
-                saw_ok_non_delete_write = True
-                tgt = _extract_receipt_target_key(rcpt)
-                if tgt:
-                    written_targets.add(tgt)
+        if not rcpt.executed:
             continue
-
-        if not (saw_ok_non_delete_write and rcpt.executed and _is_read_only_tool(rcpt.tool)):
+        tgt = _extract_receipt_target_key(rcpt)
+        if rcpt.ok and not _is_read_only_tool(rcpt.tool):
+            if tgt:
+                status = "deleted" if _DELETE_TOOL_RE.search(rcpt.tool) else "written"
+                state[tgt] = (status, None)
             continue
-        rb_tgt = _extract_receipt_target_key(rcpt)
-        if rb_tgt and written_targets and rb_tgt not in written_targets:
+        if not _is_read_only_tool(rcpt.tool) or tgt not in state:
             continue
-
-        if rcpt.ok and rcpt.output.strip()[:1] == "{":
-            with contextlib.suppress(Exception):
-                parsed = json.loads(rcpt.output)
-                if isinstance(parsed, Mapping):
-                    for key in ("exists", "found", "persisted", "present"):
-                        if parsed.get(key) is False:
-                            return rcpt
-                    status_val = str(parsed.get("status") or "").strip().lower()
-                    if status_val in {"not_found", "missing", "absent", "unpersisted"}:
-                        return rcpt
-        if not rcpt.ok and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}"):
-            return rcpt
+        cur_status, _cur_neg = state[tgt]
+        if cur_status != "written":
+            continue
+        polarity = _readback_polarity(rcpt)
+        if polarity is True:
+            state[tgt] = (cur_status, None)
+        elif polarity is False:
+            state[tgt] = (cur_status, rcpt)
+    for status, neg_rcpt in state.values():
+        if status == "written" and neg_rcpt is not None:
+            return neg_rcpt
     return None
 
 
@@ -1150,6 +1171,41 @@ def _find_unexecuted_secondary_action(
     return None
 
 
+_EXT_ONLY_RE: Final[re.Pattern[str]] = re.compile(r"^\.[a-z0-9]{1,8}$")
+_SAFETY_FLAG_KEYS: Final[frozenset[str]] = frozenset(
+    {"dry_run", "preview", "simulate", "validate_only"}
+)
+_VALIDATION_REJECT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:invalid\s+param|invalid\s+argument|validation\s+error|schema\s+error|"
+    r"missing\s+required|must\s+be\b|exceeds?\s+(?:max|limit)|max\s+\w+\s+is)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_arg_refinement(old: str, new: str) -> bool:
+    """Return True iff `new` is an exact match or extension-only refinement of `old`
+    (e.g. `notes` -> `notes.txt`), rejecting wrong-target substrings like `alice@` in `malice@`.
+    """
+    o = old.strip().lower()
+    n = new.strip().lower()
+    if not o or not n:
+        return False
+    if o == n:
+        return True
+    if "@" in o or "@" in n:
+        return False
+    return n.startswith(o) and bool(_EXT_ONLY_RE.match(n[len(o) :]))
+
+
+def _try_float(val: object) -> float | None:
+    if isinstance(val, bool):
+        return None
+    try:
+        return float(str(val).strip())
+    except ValueError:
+        return None
+
+
 def _scalar_in_text(val: str, text_lower: str) -> bool:
     """Boundary-aware scalar lookup so short values like `'1'` do not match `'10'`."""
     clean = val.strip().lower()
@@ -1166,8 +1222,9 @@ def _find_retry_arg_drift(
     *,
     user_prompt: str = "",
 ) -> str | None:
-    """Detect when a failed/rejected mutating tool call is retried with changed arguments
-    and the assistant reports success on the original request without disclosing the change.
+    """Detect when a rejected mutating tool call is retried with materially changed/dropped
+    arguments (or a silent safety-flag flip like `dry_run=False -> True`) and the assistant
+    reports success on the original request without disclosing the change.
     """
     if not receipts or _has_failure_disclosure(narration):
         return None
@@ -1179,11 +1236,15 @@ def _find_retry_arg_drift(
         if _is_read_only_tool(rcpt.tool):
             continue
         if not (rcpt.ok and rcpt.executed):
-            is_pre_exec_reject = (not rcpt.executed) or (
-                rcpt.error_code.strip().lower()
-                in {"-32602", "-32600", "invalid_params", "validation_error"}
+            is_validation_reject = (
+                (not rcpt.executed)
+                or (
+                    rcpt.error_code.strip().lower()
+                    in {"-32602", "-32600", "invalid_params", "validation_error"}
+                )
+                or bool(_VALIDATION_REJECT_RE.search(f"{rcpt.error_code} {rcpt.output}"))
             )
-            if is_pre_exec_reject:
+            if is_validation_reject:
                 prior_failed.setdefault(t_low, []).append(rcpt)
             continue
         failed_attempts = prior_failed.get(t_low)
@@ -1192,20 +1253,48 @@ def _find_retry_arg_drift(
         for fr in failed_attempts:
             if not fr.args:
                 continue
+            # 1. Check silent safety-flag activation on retry (e.g. dry_run=False -> True)
+            for sflag in _SAFETY_FLAG_KEYS:
+                if rcpt.args.get(sflag) is True and fr.args.get(sflag) is not True:
+                    if not re.search(
+                        r"\b(?:dry[\s_-]?run|preview|simulat(?:e|ed|ion)|validate[\s_-]?only)\b",
+                        narr_low,
+                    ):
+                        return (
+                            f"Tool '{rcpt.tool}' retried with {sflag}=True after rejection "
+                            "without disclosing that no live mutation occurred."
+                        )
             for key, old_val in fr.args.items():
+                old_s = str(old_val).strip()
+                if not old_s:
+                    continue
+                # 2. Check dropped key whose value was explicitly requested or claimed
                 if key not in rcpt.args:
+                    if isinstance(old_val, bool):
+                        continue
+                    requested_or_claimed = (
+                        (bool(prompt_low) and _scalar_in_text(old_s, prompt_low))
+                        or _scalar_in_text(old_s, narr_low)
+                    )
+                    if requested_or_claimed:
+                        return (
+                            f"Tool '{rcpt.tool}' dropped requested argument "
+                            f"{key}={old_s!r} on retry without disclosing the omission."
+                        )
                     continue
                 new_val = rcpt.args[key]
-                old_s = str(old_val).strip()
                 new_s = str(new_val).strip()
-                if not old_s or not new_s or old_s.lower() == new_s.lower():
+                if not new_s or old_s.lower() == new_s.lower():
                     continue
                 if isinstance(old_val, bool) and isinstance(new_val, bool):
                     continue
-                # Ignore pure path/format normalization where one is a clear substring of the other
-                if len(old_s) >= 4 and len(new_s) >= 4 and (
-                    old_s.lower() in new_s.lower() or new_s.lower() in old_s.lower()
-                ):
+                # Numeric values are always compared numerically (never skipped by substring)
+                old_num = _try_float(old_val)
+                new_num = _try_float(new_val)
+                if old_num is not None and new_num is not None:
+                    if old_num == new_num:
+                        continue
+                elif _is_arg_refinement(old_s, new_s):
                     continue
                 requested_or_claimed = (
                     (bool(prompt_low) and _scalar_in_text(old_s, prompt_low))
@@ -1619,7 +1708,7 @@ class ReceiptSupervisor:
                     same_key_refined = any(
                         r.tool.lower() == fr_tool
                         and k in r.args
-                        and v_low in str(r.args[k]).strip().lower()
+                        and _is_arg_refinement(v_low, str(r.args[k]))
                         for r in ok_receipts
                     )
                     if (
@@ -1934,12 +2023,11 @@ class ReceiptSupervisor:
             fam, _conf = self._classify_speech_act(
                 cl_text, user_prompt=user_prompt, has_receipts=bool(ok_receipts)
             )
-            if (
-                fam == "CLAIM_DELETE"
-                and not _DESTRUCTIVE_VERB_RE.search(cl_text)
-                and any(not _is_read_only_tool(r.tool) for r in ok_receipts)
-            ):
-                fam = None
+            if fam == "CLAIM_DELETE" and not _DESTRUCTIVE_VERB_RE.search(cl_text):
+                if _COMM_EXTERNAL_VERB_RE.search(cl_text):
+                    fam = "CLAIM_COMM_EXTERNAL"
+                elif any(not _is_read_only_tool(r.tool) for r in ok_receipts):
+                    fam = None
             elif (
                 fam == "CLAIM_COMM_EXTERNAL"
                 and not _COMM_EXTERNAL_VERB_RE.search(cl_text)
@@ -2182,8 +2270,23 @@ class ReceiptSupervisor:
                 )
             )
 
-        # Check unsuperseded failed mutating tools omitted from an all-clear reply
-        undisc_fail = _find_undisclosed_failed_tool(narration, failed_receipts)
+        # Check unsuperseded failed mutating tools omitted from an all-clear reply.
+        # When another mutating tool succeeded in the same turn, only require disclosure for
+        # failed calls that actually executed (or whose target/tool was requested in user_prompt),
+        # so an unrelated pre-execution schema rejection does not poison a grounded reply.
+        has_ok_mutation = any(not _is_read_only_tool(r.tool) for r in ok_receipts)
+        prompt_l = user_prompt.lower()
+        undisc_candidates = [
+            fr
+            for fr in failed_receipts
+            if (not has_ok_mutation)
+            or fr.executed
+            or any(
+                len(str(v).strip()) >= 4 and str(v).strip().lower() in prompt_l
+                for v in fr.args.values()
+            )
+        ]
+        undisc_fail = _find_undisclosed_failed_tool(narration, undisc_candidates)
         if undisc_fail is not None and not unsupported_claims and narration.strip():
             unsupported_claims.append(narration.strip()[:160])
             unsupported_spans.append(
