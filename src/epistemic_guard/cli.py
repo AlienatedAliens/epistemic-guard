@@ -168,6 +168,60 @@ def _cmd_demo() -> int:
         f"    Hazard: {burden.hazard.value} | Required: '{req_std}' | "
         f"Meets burden: {burden.meets_casual_burden}"
     )
+
+    # 5. Out-of-process Filesystem Effect Probe (--probe-fs) catching a silent no-op MCP server
+    import tempfile  # noqa: PLC0415
+
+    from epistemic_guard.mcp_proxy import McpStdioProxy, ReceiptLogWriter  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory(prefix="eg-demo-") as tmp_dir:
+        tmp_p = Path(tmp_dir)
+        ws = tmp_p / "ws"
+        ws.mkdir()
+        (ws / "secrets.txt").write_text("sensitive", encoding="utf-8")
+        demo_writer = ReceiptLogWriter(tmp_p / "demo.jsonl", factory.tool_verified(), truncate=True)
+        demo_proxy = McpStdioProxy(demo_writer, endpoint_id="stdio:demo", probe_fs_root=ws)
+        demo_proxy.observe_client_line(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "delete_file", "arguments": {"path": "secrets.txt"}},
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        # Lying server returns isError: false while leaving secrets.txt on disk!
+        demo_proxy.process_server_line(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{"type": "text", "text": "deleted secrets.txt"}],
+                            "isError": False,
+                        },
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        probe_rcpt = verify_receipt_log_file(tmp_p / "demo.jsonl").receipts[0]
+        probe_verdict = sup.verify_narration(
+            "I deleted secrets.txt.",
+            receipts=[probe_rcpt],
+            user_prompt="Delete secrets.txt.",
+        )
+        print("\n[5] Out-of-Process Disk Effect Probe (`--probe-fs`)")
+        print(
+            f"    Server returned isError=false, disk probe: {probe_rcpt.evidence_tier} "
+            f"({(probe_rcpt.effect_observation or {}).get('reason')})"
+        )
+        print(f"    LLM claim 'I deleted secrets.txt.' valid : {probe_verdict.is_valid}")
     print("=" * 68)
     return 0
 
@@ -218,6 +272,8 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             prev_log_path=args.prev_log,
             prev_pubkey_file=args.prev_pubkey_file,
             probe_fs_root=args.probe_fs,
+            probe_git_repo=args.probe_git,
+            probe_sqlite_path=args.probe_sqlite,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
@@ -253,6 +309,7 @@ def wrap_mcp_config_dict(
     log_dir: Path,
     pin_tools: bool = False,
     filter_web_results: bool = False,
+    probe_fs: str | None = None,
     unwrap: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Wrap or unwrap `mcpServers` entries in Cursor / Claude Desktop / Claude Code JSON configs."""
@@ -294,6 +351,8 @@ def wrap_mcp_config_dict(
             proxy_args.append("--pin-tools")
         if filter_web_results:
             proxy_args.append("--filter-web-results")
+        if probe_fs:
+            proxy_args.extend(["--probe-fs", probe_fs])
         proxy_args.extend(["--", cmd, *arg_list])
         ent["command"] = "epistemic-guard"
         ent["args"] = proxy_args
@@ -350,6 +409,7 @@ def _cmd_wrap_config(args: argparse.Namespace) -> int:
         log_dir=log_dir,
         pin_tools=args.pin_tools,
         filter_web_results=args.filter_web_results,
+        probe_fs=args.probe_fs,
         unwrap=args.unwrap,
     )
     rendered = json.dumps(updated, indent=2) + "\n"
@@ -391,6 +451,12 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             print(f"TAMPER OR KEY ERROR: {exc}", file=sys.stderr)
         return 2
 
+    tier_counts: dict[str, int] = {}
+    for r in verified.receipts:
+        if r.evidence_tier:
+            tier_counts[r.evidence_tier] = tier_counts.get(r.evidence_tier, 0) + 1
+    contradicted_effects = tier_counts.get("effect_contradicted", 0)
+
     if narration_text is None:
         if args.json:
             print(
@@ -404,20 +470,29 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                         "session_id": verified.session_id,
                         "public_key_hex": verified.public_key_hex,
                         "key_pinned": verified.key_pinned,
+                        "evidence_tiers": tier_counts,
+                        "effect_contradictions": contradicted_effects,
                     },
                     sort_keys=True,
                 )
             )
         else:
             pin_note = "pinned" if verified.key_pinned else "unpinned (self-declared)"
+            tier_note = (
+                f" | probes={tier_counts}" if tier_counts else ""
+            )
             print(
                 f"OK: verified {verified.entry_count} receipt(s) | "
-                f"merkle_root={verified.merkle_root[:24]}... | key={pin_note}"
+                f"merkle_root={verified.merkle_root[:24]}... | key={pin_note}{tier_note}"
             )
         return 0
 
     active_receipts = verified.receipts[since_seq:]
-    sup = ReceiptSupervisor(device=args.device, warn_on_missing=False)
+    sup = ReceiptSupervisor(
+        device=args.device,
+        flag_undisclosed_mutations=args.flag_undisclosed,
+        warn_on_missing=False,
+    )
     verdict = sup.verify_narration(
         narration_text,
         receipts=active_receipts,
@@ -431,9 +506,12 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                     "entry_count": verified.entry_count,
                     "merkle_root": verified.merkle_root,
                     "key_pinned": verified.key_pinned,
+                    "evidence_tiers": tier_counts,
+                    "effect_contradictions": contradicted_effects,
                     "narration_valid": verdict.is_valid,
                     "device": verdict.device,
                     "unsupported_claims": list(verdict.unsupported_claims),
+                    "undisclosed_mutations": list(verdict.undisclosed_mutations),
                     "retry_prompt": (
                         "" if verdict.is_valid else verdict.to_retry_prompt(active_receipts)
                     ),
@@ -451,6 +529,11 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             f"NARRATION UNGROUNDED ({len(verdict.unsupported_spans)} span(s) flagged):",
             file=sys.stderr,
         )
+        if verdict.undisclosed_mutations:
+            print(
+                f"  Undisclosed mutating tools: {verdict.undisclosed_mutations}",
+                file=sys.stderr,
+            )
         print(verdict.to_retry_prompt(active_receipts), file=sys.stderr)
     return 0 if verdict.is_valid else 1
 
@@ -542,6 +625,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     mp.add_argument(
+        "--probe-git",
+        default=None,
+        help=(
+            "Git repository path for out-of-process read-only HEAD/status effect probes "
+            "(catches silent no-op git_commit/git_reset servers)"
+        ),
+    )
+    mp.add_argument(
+        "--probe-sqlite",
+        default=None,
+        help=(
+            "Local SQLite DB path for out-of-process read-only PRAGMA/stat effect probes "
+            "(catches silent no-op execute_sql mutations)"
+        ),
+    )
+    mp.add_argument(
         "server_cmd",
         nargs=argparse.REMAINDER,
         help="Target MCP server command and arguments (place after '--')",
@@ -587,6 +686,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     vl.add_argument("--prompt", default=None, help="Optional user prompt context for supervision")
     vl.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
+    vl.add_argument(
+        "--flag-undisclosed",
+        action="store_true",
+        help="Fail verification if executed mutating tools were omitted from --narration",
+    )
     vl.add_argument("--json", action="store_true", help="Emit JSON output")
 
     ms = sub.add_parser(
@@ -636,6 +740,11 @@ def main(argv: list[str] | None = None) -> int:
         "--filter-web-results",
         action="store_true",
         help="Enable --filter-web-results on wrapped servers",
+    )
+    wc.add_argument(
+        "--probe-fs",
+        default=None,
+        help="Enable --probe-fs <dir> out-of-process disk verification on wrapped servers",
     )
     wc.add_argument("--unwrap", action="store_true", help="Restore unwrapped server commands")
     wc.add_argument("--dry-run", action="store_true", help="Print updated JSON without writing")

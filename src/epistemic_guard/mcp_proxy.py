@@ -8,6 +8,8 @@ import json
 import math
 import os
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -157,6 +159,8 @@ class _PendingToolCall:
     args: dict[str, str | int | float | bool]
     tool_def_sha256: str = ""
     fs_probe: tuple[str, Path, dict[str, Any]] | None = None
+    git_probe: tuple[Path, dict[str, Any]] | None = None
+    sqlite_probe: tuple[Path, dict[str, Any]] | None = None
 
 
 _FS_WRITE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
@@ -282,6 +286,152 @@ def _evaluate_fs_probe(
         "reason": reason,
     }
     return (verified, observation)
+
+
+_GIT_MUTATING_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)git_(?:commit|checkout|reset|branch|merge|revert|tag|stash|add|cherry_pick)(?:_|$)",
+    re.IGNORECASE,
+)
+_SQLITE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:sql|sqlite|db|database|query)(?:_|$)",
+    re.IGNORECASE,
+)
+_SQLITE_MUTATING_QUERY_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from|drop\s+(?:table|index|view)|"
+    r"create\s+(?:table|index|view)|alter\s+table|replace\s+into|upsert|truncate)\b",
+    re.IGNORECASE,
+)
+
+
+def _snapshot_git_repo(repo_path: Path) -> dict[str, Any]:
+    """Read-only git HEAD + porcelain status snapshot outside the MCP server's trust domain."""
+    head = ""
+    status_sha = ""
+    ok = False
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        return {"ok": False, "head": "", "status_sha256": ""}
+    try:
+        r_head = subprocess.run(
+            [git_bin, "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        r_stat = subprocess.run(
+            [git_bin, "-C", str(repo_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if r_stat.returncode == 0:
+            ok = True
+            head = r_head.stdout.strip() if r_head.returncode == 0 else ""
+            status_sha = hashlib.sha256(r_stat.stdout.encode("utf-8")).hexdigest()[:16]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"ok": ok, "head": head, "status_sha256": status_sha}
+
+
+def _arm_git_probe(repo_path: Path, tool_name: str) -> tuple[Path, dict[str, Any]] | None:
+    if not _GIT_MUTATING_TOOL_RE.search(tool_name):
+        return None
+    snap = _snapshot_git_repo(repo_path)
+    return (repo_path, snap) if snap.get("ok") else None
+
+
+def _evaluate_git_probe(
+    repo_path: Path, before: Mapping[str, Any]
+) -> tuple[bool, dict[str, Any]]:
+    after = _snapshot_git_repo(repo_path)
+    changed = bool(after.get("ok")) and (
+        before.get("head") != after.get("head")
+        or before.get("status_sha256") != after.get("status_sha256")
+    )
+    reason = "git_state_mutated" if changed else "git_state_unchanged_after_ok"
+    return (
+        changed,
+        {
+            "observer": "epistemic_guard.mcp_proxy.git_probe",
+            "kind": "git",
+            "target_path": str(repo_path),
+            "before": dict(before),
+            "after": after,
+            "verified": changed,
+            "reason": reason,
+        },
+    )
+
+
+def _snapshot_sqlite_db(db_path: Path) -> dict[str, Any]:
+    """Read-only SQLite snapshot (`PRAGMA data_version` + DB/WAL stat)."""
+    snap: dict[str, Any] = {"exists": db_path.exists()}
+    if not db_path.exists():
+        return snap
+    try:
+        st = db_path.stat()
+        snap["size"] = int(st.st_size)
+        snap["mtime_ns"] = int(st.st_mtime_ns)
+    except OSError:
+        pass
+    wal_p = Path(f"{db_path}-wal")
+    if wal_p.exists():
+        with contextlib.suppress(OSError):
+            wst = wal_p.stat()
+            snap["wal_size"] = int(wst.st_size)
+            snap["wal_mtime_ns"] = int(wst.st_mtime_ns)
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as conn:
+            row = conn.execute("PRAGMA data_version").fetchone()
+            if row:
+                snap["data_version"] = int(row[0])
+            chg = conn.execute("PRAGMA schema_version").fetchone()
+            if chg:
+                snap["schema_version"] = int(chg[0])
+            snap["sha256"] = _stat_and_hash_file(db_path).get("sha256", "")
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    return snap
+
+
+def _arm_sqlite_probe(
+    db_path: Path,
+    tool_name: str,
+    args: Mapping[str, str | int | float | bool],
+) -> tuple[Path, dict[str, Any]] | None:
+    if not _SQLITE_TOOL_RE.search(tool_name):
+        return None
+    joined_args = " ".join(str(v) for v in args.values())
+    if not _SQLITE_MUTATING_QUERY_RE.search(joined_args):
+        return None
+    snap = _snapshot_sqlite_db(db_path)
+    return (db_path, snap) if snap.get("exists") else None
+
+
+def _evaluate_sqlite_probe(
+    db_path: Path, before: Mapping[str, Any]
+) -> tuple[bool, dict[str, Any]]:
+    after = _snapshot_sqlite_db(db_path)
+    changed = any(
+        before.get(k) != after.get(k)
+        for k in ("size", "mtime_ns", "wal_size", "wal_mtime_ns", "schema_version", "sha256")
+    )
+    reason = "sqlite_mutated" if changed else "sqlite_unchanged_after_ok"
+    return (
+        changed,
+        {
+            "observer": "epistemic_guard.mcp_proxy.sqlite_probe",
+            "kind": "sqlite",
+            "target_path": str(db_path),
+            "before": dict(before),
+            "after": after,
+            "verified": changed,
+            "reason": reason,
+        },
+    )
 
 
 def _coerce_scalar(val: object) -> str | int | float | bool:
@@ -997,6 +1147,8 @@ class McpStdioProxy:
         filter_web_results: bool = False,
         endpoint_id: str = "",
         probe_fs_root: Path | str | None = None,
+        probe_git_repo: Path | str | None = None,
+        probe_sqlite_path: Path | str | None = None,
     ) -> None:
         self._writer = writer
         self._pin_tools = pin_tools
@@ -1005,6 +1157,12 @@ class McpStdioProxy:
         self._endpoint_id = endpoint_id
         self._probe_fs_root: Path | None = (
             Path(probe_fs_root).resolve() if probe_fs_root is not None else None
+        )
+        self._probe_git_repo: Path | None = (
+            Path(probe_git_repo).resolve() if probe_git_repo is not None else None
+        )
+        self._probe_sqlite_path: Path | None = (
+            Path(probe_sqlite_path).resolve() if probe_sqlite_path is not None else None
         )
         self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
         self._pending_tools_list: set[tuple[str, str]] = set()
@@ -1095,6 +1253,16 @@ class McpStdioProxy:
                         if self._probe_fs_root is not None
                         else None
                     )
+                    armed_git = (
+                        _arm_git_probe(self._probe_git_repo, tool_name)
+                        if self._probe_git_repo is not None
+                        else None
+                    )
+                    armed_sqlite = (
+                        _arm_sqlite_probe(self._probe_sqlite_path, tool_name, args_map)
+                        if self._probe_sqlite_path is not None
+                        else None
+                    )
                     self._pending.setdefault(id_key, []).append(
                         _PendingToolCall(
                             call_id=cid,
@@ -1102,6 +1270,8 @@ class McpStdioProxy:
                             args=args_map,
                             tool_def_sha256=pinned_sha,
                             fs_probe=armed_probe,
+                            git_probe=armed_git,
+                            sqlite_probe=armed_sqlite,
                         )
                     )
 
@@ -1336,10 +1506,25 @@ class McpStdioProxy:
             )
 
         ok, output_text, is_validation = _extract_mcp_result_text(response.get("result"))
+        any_probe_enabled = (
+            self._probe_fs_root is not None
+            or self._probe_git_repo is not None
+            or self._probe_sqlite_path is not None
+        )
         if ok:
+            probe_result: tuple[bool, dict[str, Any]] | None = None
             if pending.fs_probe is not None:
                 exp_op, target_path, before_snap = pending.fs_probe
-                verified, obs = _evaluate_fs_probe(exp_op, target_path, before_snap)
+                probe_result = _evaluate_fs_probe(exp_op, target_path, before_snap)
+            elif pending.git_probe is not None:
+                repo_path, before_git = pending.git_probe
+                probe_result = _evaluate_git_probe(repo_path, before_git)
+            elif pending.sqlite_probe is not None:
+                db_path, before_db = pending.sqlite_probe
+                probe_result = _evaluate_sqlite_probe(db_path, before_db)
+
+            if probe_result is not None:
+                verified, obs = probe_result
                 if verified:
                     return ToolReceipt(
                         call_id=pending.call_id,
@@ -1377,7 +1562,7 @@ class McpStdioProxy:
                 output=output_text,
                 tool_definition_sha256=pending.tool_def_sha256,
                 endpoint_id=self._endpoint_id,
-                evidence_tier="server_reported" if self._probe_fs_root is not None else "",
+                evidence_tier="server_reported" if any_probe_enabled else "",
             )
         return ToolReceipt(
             call_id=pending.call_id,
@@ -1390,9 +1575,7 @@ class McpStdioProxy:
             tool_definition_sha256=pending.tool_def_sha256,
             endpoint_id=self._endpoint_id,
             evidence_tier=(
-                ("attempted" if is_validation else "server_reported")
-                if self._probe_fs_root is not None
-                else ""
+                ("attempted" if is_validation else "server_reported") if any_probe_enabled else ""
             ),
         )
 
@@ -1411,6 +1594,8 @@ def run_mcp_stdio_proxy(
     prev_log_path: Path | str | None = None,
     prev_pubkey_file: Path | str | None = None,
     probe_fs_root: Path | str | None = None,
+    probe_git_repo: Path | str | None = None,
+    probe_sqlite_path: Path | str | None = None,
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -1434,6 +1619,8 @@ def run_mcp_stdio_proxy(
         filter_web_results=filter_web_results,
         endpoint_id=f"stdio:{Path(server_cmd[0]).name}",
         probe_fs_root=probe_fs_root,
+        probe_git_repo=probe_git_repo,
+        probe_sqlite_path=probe_sqlite_path,
     )
 
     child_env = _scrub_child_env(os.environ)

@@ -323,3 +323,91 @@ def test_multi_backtick_preservation_and_verb_free_paraphrase_nli() -> None:
         user_prompt="Pause Grafana alert rule graf-uid-319.",
     )
     assert v_idiom.is_valid is False
+
+
+def test_git_and_sqlite_effect_probes(tmp_path: Path) -> None:
+    import sqlite3
+    import subprocess
+
+    # --- 1. Git probe: real commit vs silent no-op git_commit ---
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "a.txt").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True
+    )
+
+    # --- 2. SQLite probe: real INSERT vs silent no-op execute_sql ---
+    db_path = tmp_path / "app.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.commit()
+
+    log_path = tmp_path / "multi_probe.jsonl"
+    signer = SignerFactory.from_master_key(b"\x66" * 32).tool_verified()
+    writer = ReceiptLogWriter(log_path, signer, truncate=True)
+    proxy = McpStdioProxy(
+        writer,
+        endpoint_id="stdio:dev",
+        probe_git_repo=repo,
+        probe_sqlite_path=db_path,
+    )
+
+    # Silent no-op git_commit
+    proxy.observe_client_line(_rpc_call(1, "git_commit", {"message": "ghost commit"}))
+    proxy.process_server_line(_rpc_ok(1, "committed"))
+
+    # Real git commit
+    (repo / "a.txt").write_text("v2\n", encoding="utf-8")
+    proxy.observe_client_line(_rpc_call(2, "git_commit", {"message": "real commit"}))
+    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "real commit"], check=True, capture_output=True
+    )
+    proxy.process_server_line(_rpc_ok(2, "committed"))
+
+    # Silent no-op execute_sql INSERT
+    proxy.observe_client_line(
+        _rpc_call(3, "execute_sql", {"query": "INSERT INTO items(name) VALUES ('ghost')"})
+    )
+    proxy.process_server_line(_rpc_ok(3, "1 row inserted"))
+
+    # Real execute_sql INSERT
+    proxy.observe_client_line(
+        _rpc_call(4, "execute_sql", {"query": "INSERT INTO items(name) VALUES ('real')"})
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO items(name) VALUES ('real')")
+        conn.commit()
+    proxy.process_server_line(_rpc_ok(4, "1 row inserted"))
+
+    verified = verify_receipt_log_file(log_path, expected_pubkey_hex=signer.public_key_bytes.hex())
+    r_git_noop, r_git_ok, r_sql_noop, r_sql_ok = verified.receipts
+
+    assert r_git_noop.ok is False
+    assert r_git_noop.evidence_tier == "effect_contradicted"
+    assert (r_git_noop.effect_observation or {}).get("reason") == "git_state_unchanged_after_ok"
+
+    assert r_git_ok.ok is True
+    assert r_git_ok.evidence_tier == "independently_verified"
+    assert (r_git_ok.effect_observation or {}).get("reason") == "git_state_mutated"
+
+    assert r_sql_noop.ok is False
+    assert r_sql_noop.evidence_tier == "effect_contradicted"
+    assert (r_sql_noop.effect_observation or {}).get("reason") == "sqlite_unchanged_after_ok"
+
+    assert r_sql_ok.ok is True
+    assert r_sql_ok.evidence_tier == "independently_verified"
+    assert (r_sql_ok.effect_observation or {}).get("reason") == "sqlite_mutated"
