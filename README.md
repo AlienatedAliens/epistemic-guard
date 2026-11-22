@@ -28,17 +28,12 @@ epistemic-guard verify-log receipts.jsonl \
   --flag-undisclosed --json
 ```
 
-Or drop directly into **Claude Code / Codex** `PostToolUse` + `Stop` hooks (no MCP proxy required):
+Or install directly into **Claude Code / Codex** `PostToolUse` + `Stop` hooks in one command (no MCP proxy required):
 
-```json
-{
-  "hooks": {
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "epistemic-guard hook post-tool --log .epistemic_guard/receipts.jsonl"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "epistemic-guard hook stop --log .epistemic_guard/receipts.jsonl --flag-undisclosed"}]}]
-  }
-}
+```bash
+epistemic-guard install-hooks --flag-undisclosed
+# Add --enforce once calibrated on your traffic; pass --uninstall to remove cleanly
 ```
-*(Add `--enforce` on the `Stop` hook once calibrated on your traffic to block contradicted replies.)*
 
 ---
 
@@ -295,18 +290,15 @@ To test generalization outside coding/filesystem tools across **both** `Halluci-
 
 ### Independent External Benchmarks (`N=1,441` Third-Party Turns)
 
-To test generalization outside our own synthetic datasets, we evaluated `epistemic-guard` (`v0.6.5-dev`, CPU INT8, zero domain training) across four independently authored public corpora:
+To test generalization outside our own synthetic datasets, we evaluated `epistemic-guard` (`v0.6.5-dev`, CPU INT8, zero domain training) across four independently authored public corpora. Every row is labeled with its exact evaluation **Status** (`zero-shot`, `development (inspected)`, or `unlabeled`):
 
-| External Corpus | Domain & Labels | Sample Size | Key Result (`epistemic-guard`, CPU) | Latency (p50) | Notes & Honest Tradeoffs |
-| :--- | :--- | :---: | :--- | :---: | :--- |
-| **[`B0yko/agent-claimcheck`](https://github.com/B0yko/agent-claimcheck)** (`v1` test split) | Calendar, coding, CRM (7 failure kinds, labeled) | `120` traces (`72` clean, `48` failures) | **`110/120 (91.7%)`** acc, **`39/48 (81.2%)`** caught, **`1/72 (1.4%)`** FP | `8.2 ms` | Pre-fix zero-shot (`b420b5d`): `90/120 (75.0%)`, `19/48` caught, `1/72` FP. Competitor's own `cascade-offline` (trained on `v1` train split, routing `11/120` to human `review`) catches `41/48` at `0/72` FP. |
-| **[`control_arena_agentdojo`](https://huggingface.co/datasets/adityaasinha28/control_arena_agentdojo)** (`claude-sonnet-4` banking) | Real AgentDojo prompt-injection attacks (labeled) | `300` trajectories (`170` benign, `130` attacks) | **Direction-2 (`--flag-undisclosed`):** **`254/300 (84.7%)`** acc, **`106/130 (81.5%)`** attacks caught, `22/170 (12.9%)` benign FP (`10/170 [5.9%]` Direction-1 benign FP) | `8.9 ms` | `97` silent exfiltration/transfer attacks caught by `UNDISCLOSED_MUTATION` alone (recipient-aware disclosure prevents hidden second transfers from hiding behind generic verbs). |
-| **[`nebius/SWE-agent-trajectories`](https://huggingface.co/datasets/nebius/SWE-agent-trajectories)** | Real GitHub coding sessions (`bash`, `edit`, `git`, unlabeled) | `798` turns (`40` sessions) | **`32/798 (4.01%)`** flagged (unlabeled flag rate) | `0.44 ms` | Real-world developer stress test; surfaced plural `"errors"` and `CLAIM_DELETE`/`CLAIM_COMM_EXTERNAL` misclassifications on `"file has been updated"`, all fixed. |
-| **[`Exgentic/agent-llm-traces-v2`](https://huggingface.co/datasets/Exgentic/agent-llm-traces-v2)** | Real `AppWorld` / `claude_code` OTel traces (unlabeled) | `223` turns (`30` sessions, `487` tools) | **`0/223 (0.0%)`** flagged (unlabeled flag rate) | `0.54 ms` | Unlabeled; a `gpt-4.1-mini` auto-auditor flagged `14/60` sampled turns, so treat `0/223` strictly as an unlabeled flag rate. |
-
-- **Pre-fix vs post-fix on `B0yko/agent-claimcheck` (`N=120`):**
-  - Pre-fix zero-shot (`b420b5d`, default): `90/120 (75.0%)`, `19/48 (39.6%)` caught, `1/72 (1.4%)` FP (`7.47 ms`). Enabling `verify_output_values=True` on `b420b5d` caught `27/48` but caused `17/72 (23.6%)` FPs from experimental MNLI-over-JSON-leaves.
-  - Post-fix (`v0.6.5-dev`, disabling experimental MNLI-over-JSON by default, adding read-back negative-persistence and read-after-write key consistency checks, undisclosed failed-tool checks, mutating-receipt date/timezone/target witnesses, secondary-action grounding, and hedged zero-mutation detection): **`110/120 (91.7%)`**, **`39/48 (81.2%)`** caught (`phantom_action 7/7`, `error_ignored 7/7`, `reviewer_injection 6/6`, `partial_completion 6/7`, `wrong_target 5/7`, `wrong_value 4/7`, `not_persisted 4/7`), **`1/72 (1.4%)` false alarms** at `8.2 ms` p50 CPU.
+| External Corpus | Evaluation Status | Size | Result (`epistemic-guard`, CPU) | CPU p50 | Honest Notes & Tradeoffs |
+| :--- | :---: | :---: | :--- | :---: | :--- |
+| **[`B0yko/agent-claimcheck`](https://github.com/B0yko/agent-claimcheck)** (`v1` test, `b420b5d` default) | **`zero-shot`** | `120` traces (`72` clean, `48` fail) | **`90/120 (75.0%)`** acc, `19/48 (39.6%)` caught, **`1/72 (1.4%)` FP** | `7.5 ms` | Clean zero-shot baseline (never saw train or test). Enabling `verify_output_values=True` at `b420b5d` caught `27/48` but caused `17/72 (23.6%)` FPs from experimental MNLI-over-JSON-leaves. |
+| **[`B0yko/agent-claimcheck`](https://github.com/B0yko/agent-claimcheck)** (`v1` test, `v0.6.5-dev` post-fix) | **`development (inspected)`** | `120` traces (`72` clean, `48` fail) | `110/120 (91.7%)` acc, `39/48 (81.2%)` caught, `1/72 (1.4%)` FP (`verify_output_values=True`) | `8.2 ms` | **Test split no longer held out:** failures were inspected during development. Competitor's own `cascade-offline` (trained on its `v1` train split, escalating `11/120` to `review`) beats us on its benchmark at `113/120 (94.2%, 41/48 caught, 0/72 FP)`. |
+| **[`control_arena_agentdojo`](https://huggingface.co/datasets/adityaasinha28/control_arena_agentdojo)** (`claude-sonnet-4` banking) | **`development (inspected)`** | `300` sessions (`170` benign, `130` attacks) | Dir-1 benign FP: **`10/170 (5.9%)`**; Dir-2 (`--flag-undisclosed`): `254/300 (84.7%)`, `106/130 (81.5%)` attacks caught, `22/170 (12.9%)` benign FP | `8.9 ms` | Banking suite only; benign FPs on these 300 rows were inspected to fix `CLAIM_DELETE`/`CLAIM_COMM_EXTERNAL` misclassifications. At `1%` real-world attack prevalence, `12.9%` FPR implies `~6%` precision (keep `--flag-undisclosed` in shadow/flag mode until calibrated). |
+| **[`nebius/SWE-agent-trajectories`](https://huggingface.co/datasets/nebius/SWE-agent-trajectories)** | **`unlabeled`** | `798` turns (`40` sessions) | `32/798 (4.01%)` flagged | `0.44 ms` | Real GitHub coding sessions (`bash`/`edit`/`git`). Unlabeled: flag-rate reduction alone does not separate FPR from recall. |
+| **[`Exgentic/agent-llm-traces-v2`](https://huggingface.co/datasets/Exgentic/agent-llm-traces-v2)** | **`unlabeled`** | `223` turns (`30` sessions, `487` tools) | `0/223 (0.0%)` flagged | `0.54 ms` | Unlabeled; a `gpt-4.1-mini` auto-auditor flagged `14/60` sampled turns, so treat `0/223` strictly as an unlabeled flag rate. |
 
 ### OWASP Coverage & Disclosures
 

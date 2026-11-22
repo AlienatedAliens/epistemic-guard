@@ -540,84 +540,168 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
 
 
 def _cmd_hook(args: argparse.Namespace) -> int:
-    """Claude Code / Codex / Gemini CLI `PostToolUse` & `Stop` JSON hook handler."""
+    """Claude Code / Codex / Gemini CLI `PostToolUse` & `Stop` JSON hook handler (fail-open)."""
     from epistemic_guard.mcp_proxy import (  # noqa: PLC0415
         ReceiptLogWriter,
         load_or_create_mcp_signer,
     )
     from epistemic_guard.schemas import ToolReceipt  # noqa: PLC0415
 
-    raw_stdin = sys.stdin.read().strip()
     try:
+        raw_stdin = sys.stdin.read().strip()
         payload: Mapping[str, Any] = json.loads(raw_stdin) if raw_stdin else {}
-    except json.JSONDecodeError as exc:
-        print(json.dumps({"error": f"invalid hook JSON: {exc}"}))
-        return 2
-
-    log_path = Path(args.log)
-    if args.hook_event == "post-tool":
-        signer = load_or_create_mcp_signer(key_file=args.key_file)
-        writer = ReceiptLogWriter(log_path, signer, truncate=False)
-        tool_name = str(payload.get("tool_name") or payload.get("name") or "unknown_tool")
-        raw_inp = payload.get("tool_input") or payload.get("input") or {}
-        flat_args: dict[str, str | int | float | bool] = {}
-        if isinstance(raw_inp, Mapping):
-            for k, v in raw_inp.items():
-                if isinstance(v, (str, int, float, bool)):
-                    flat_args[str(k)] = v
-                else:
-                    flat_args[str(k)] = json.dumps(v, sort_keys=True)[:240]
-        raw_resp = payload.get("tool_response") or payload.get("output") or ""
-        out_str = (
-            json.dumps(raw_resp, sort_keys=True)
-            if isinstance(raw_resp, (Mapping, list))
-            else str(raw_resp)
+        if not isinstance(payload, Mapping):
+            payload = {}
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "decision": "allow",
+                    "verdict_status": "unverifiable",
+                    "error": f"hook_parse_error: {exc}",
+                },
+                sort_keys=True,
+            )
         )
-        is_err = bool(payload.get("is_error")) or (
-            isinstance(raw_resp, Mapping) and bool(raw_resp.get("isError"))
-        )
-        rcpt = ToolReceipt(
-            tool=tool_name,
-            ok=not is_err,
-            executed=True,
-            error_code="hook_tool_error" if is_err else "",
-            args=flat_args,
-            output=out_str[:1000],
-            endpoint_id="hook:post-tool",
-            evidence_tier="server_reported",
-        )
-        writer.append(rcpt)
-        print(json.dumps({"recorded": True, "call_id": rcpt.call_id, "tool": tool_name}))
         return 0
 
-    # Stop hook: verify final assistant message against signed session receipts
-    last_msg = str(
-        payload.get("last_assistant_message")
-        or payload.get("assistant_message")
-        or payload.get("message")
-        or ""
-    ).strip()
-    if not last_msg or not log_path.exists():
-        print(json.dumps({"verdict_status": "unverifiable", "decision": "allow"}))
+    try:
+        log_path = Path(args.log)
+        if args.hook_event == "post-tool":
+            signer = load_or_create_mcp_signer(key_file=args.key_file)
+            writer = ReceiptLogWriter(log_path, signer, truncate=False)
+            tool_name = str(payload.get("tool_name") or payload.get("name") or "unknown_tool")
+            raw_inp = payload.get("tool_input") or payload.get("input") or {}
+            flat_args: dict[str, str | int | float | bool] = {}
+            if isinstance(raw_inp, Mapping):
+                for k, v in raw_inp.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        flat_args[str(k)] = v
+                    else:
+                        flat_args[str(k)] = json.dumps(v, sort_keys=True)[:240]
+            raw_resp = payload.get("tool_response") or payload.get("output") or ""
+            out_str = (
+                json.dumps(raw_resp, sort_keys=True)
+                if isinstance(raw_resp, (Mapping, list))
+                else str(raw_resp)
+            )
+            is_err = bool(payload.get("is_error")) or (
+                isinstance(raw_resp, Mapping) and bool(raw_resp.get("isError"))
+            )
+            rcpt = ToolReceipt(
+                tool=tool_name,
+                ok=not is_err,
+                executed=True,
+                error_code="hook_tool_error" if is_err else "",
+                args=flat_args,
+                output=out_str[:1000],
+                endpoint_id="hook:post-tool",
+                evidence_tier="server_reported",
+            )
+            writer.append(rcpt)
+            print(json.dumps({"recorded": True, "call_id": rcpt.call_id, "tool": tool_name}))
+            return 0
+
+        # Stop hook: respect stop_hook_active to prevent infinite retry loops in Claude Code
+        if payload.get("stop_hook_active") is True:
+            print(
+                json.dumps(
+                    {
+                        "decision": "allow",
+                        "verdict_status": "verified",
+                        "skipped": "stop_hook_active",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        last_msg = str(
+            payload.get("last_assistant_message")
+            or payload.get("assistant_message")
+            or payload.get("message")
+            or ""
+        ).strip()
+        if not last_msg or not log_path.exists():
+            print(json.dumps({"verdict_status": "unverifiable", "decision": "allow"}))
+            return 0
+        verified = verify_receipt_log_file(log_path)
+        sup = ReceiptSupervisor(
+            device=args.device,
+            flag_undisclosed_mutations=args.flag_undisclosed,
+            warn_on_missing=False,
+        )
+        verdict = sup.verify_narration(last_msg, receipts=verified.receipts)
+        decision = "block" if (args.enforce and not verdict.is_valid) else "allow"
+        out_doc: dict[str, Any] = {
+            "decision": decision,
+            "verdict_status": verdict.verdict_status,
+            "is_valid": verdict.is_valid,
+            "unsupported_claims": list(verdict.unsupported_claims),
+            "undisclosed_mutations": list(verdict.undisclosed_mutations),
+        }
+        if decision == "block":
+            out_doc["reason"] = verdict.to_retry_prompt(verified.receipts)
+        print(json.dumps(out_doc, sort_keys=True))
         return 0
-    verified = verify_receipt_log_file(log_path)
-    sup = ReceiptSupervisor(
-        device=args.device,
-        flag_undisclosed_mutations=args.flag_undisclosed,
-        warn_on_missing=False,
-    )
-    verdict = sup.verify_narration(last_msg, receipts=verified.receipts)
-    decision = "block" if (args.enforce and not verdict.is_valid) else "allow"
-    out_doc: dict[str, Any] = {
-        "decision": decision,
-        "verdict_status": verdict.verdict_status,
-        "is_valid": verdict.is_valid,
-        "unsupported_claims": list(verdict.unsupported_claims),
-        "undisclosed_mutations": list(verdict.undisclosed_mutations),
-    }
-    if decision == "block":
-        out_doc["reason"] = verdict.to_retry_prompt(verified.receipts)
-    print(json.dumps(out_doc, sort_keys=True))
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "decision": "allow",
+                    "verdict_status": "unverifiable",
+                    "error": f"hook_runtime_error: {exc}",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+
+def _cmd_install_hooks(args: argparse.Namespace) -> int:
+    """Safely install or uninstall `epistemic-guard hook` entries in `.claude/settings.json`."""
+    settings_path = Path(args.settings)
+    if settings_path.exists():
+        doc: dict[str, Any] = json.loads(settings_path.read_text(encoding="utf-8"))
+    else:
+        doc = {}
+    hooks = doc.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
+        doc["hooks"] = hooks
+
+    def _is_eg_entry(entry: object) -> bool:
+        if not isinstance(entry, Mapping):
+            return False
+        sub = entry.get("hooks")
+        if not isinstance(sub, list):
+            return False
+        return any(
+            isinstance(h, Mapping) and "epistemic-guard hook" in str(h.get("command") or "")
+            for h in sub
+        )
+
+    for ev in ("PostToolUse", "Stop"):
+        existing = hooks.get(ev)
+        cleaned = [e for e in existing if not _is_eg_entry(e)] if isinstance(existing, list) else []
+        if not args.uninstall:
+            if ev == "PostToolUse":
+                cmd = f"epistemic-guard hook post-tool --log {args.log}"
+            else:
+                flags = []
+                if args.flag_undisclosed:
+                    flags.append("--flag-undisclosed")
+                if args.enforce:
+                    flags.append("--enforce")
+                suffix = (" " + " ".join(flags)) if flags else ""
+                cmd = f"epistemic-guard hook stop --log {args.log}{suffix}"
+            cleaned.append({"hooks": [{"type": "command", "command": cmd}]})
+        hooks[ev] = cleaned
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    action = "Uninstalled" if args.uninstall else "Installed"
+    print(f"{action} epistemic-guard Claude Code hooks in {settings_path}")
     return 0
 
 
@@ -855,6 +939,36 @@ def main(argv: list[str] | None = None) -> int:
         help="Emit decision='block' on Stop hook when narration is contradicted",
     )
 
+    ih = sub.add_parser(
+        "install-hooks",
+        help="Install or uninstall epistemic-guard hooks in .claude/settings.json",
+    )
+    ih.add_argument(
+        "--settings",
+        default=".claude/settings.json",
+        help="Path to Claude Code settings.json (default: .claude/settings.json)",
+    )
+    ih.add_argument(
+        "--log",
+        default=".epistemic_guard/hook_receipts.jsonl",
+        help="Signed Ed25519/Merkle receipt log path",
+    )
+    ih.add_argument(
+        "--flag-undisclosed",
+        action="store_true",
+        help="Enable --flag-undisclosed on the Stop hook",
+    )
+    ih.add_argument(
+        "--enforce",
+        action="store_true",
+        help="Enable --enforce blocking mode on the Stop hook",
+    )
+    ih.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove epistemic-guard hook entries without touching other hooks",
+    )
+
     parsed = parser.parse_args(argv)
     if parsed.command == "doctor":
         return _cmd_doctor()
@@ -868,6 +982,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_wrap_config(parsed)
     if parsed.command == "hook":
         return _cmd_hook(parsed)
+    if parsed.command == "install-hooks":
+        return _cmd_install_hooks(parsed)
     if parsed.command == "mcp-server":
         return run_mcp_stdio_server(device=parsed.device)
     if parsed.command == "verify-log":

@@ -793,3 +793,107 @@ def test_read_after_write_contradiction_and_unexecuted_secondary_action() -> Non
     )
     assert v_hedged.is_valid is False
     assert any(sp.claimed_family == "PHANTOM_HEDGED_CLAIM" for sp in v_hedged.unsupported_spans)
+
+
+def test_q2_audit_hardening_and_install_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+
+    from epistemic_guard.cli import main
+    from epistemic_guard.supervision import _is_read_only_tool
+
+    # 1. Mutating tools containing read-like words must NOT be misclassified as read-only
+    for mut in ("update_status", "set_status", "execute_query", "get_or_create_user"):
+        assert _is_read_only_tool(mut) is False
+    for ro in ("get_event", "read_file", "stat_file", "search_slots", "git_status"):
+        assert _is_read_only_tool(ro) is True
+
+    sup = ReceiptSupervisor(device="CPU", verify_output_values=True, warn_on_missing=False)
+
+    # 2. Pre-write stat returning exists=false BEFORE write_file must pass
+    r_pre_stat = ToolReceipt(
+        tool="stat_file", ok=True, executed=True, args={"path": "new.txt"}, output='{"exists": false}'
+    )
+    r_write = ToolReceipt(
+        tool="write_file", ok=True, executed=True, args={"path": "new.txt"}, output='{"ok": true}'
+    )
+    v_pre = sup.verify_narration(
+        "I created new.txt.", receipts=[r_pre_stat, r_write], user_prompt="Create new.txt."
+    )
+    assert v_pre.is_valid is True
+
+    # 3. Delete-then-verify-gone (exists=false after delete) must pass
+    r_del = ToolReceipt(
+        tool="delete_file", ok=True, executed=True, args={"path": "old.txt"}, output='{"ok": true}'
+    )
+    r_post_stat = ToolReceipt(
+        tool="stat_file", ok=True, executed=True, args={"path": "old.txt"}, output='{"exists": false}'
+    )
+    v_del = sup.verify_narration(
+        "I deleted old.txt.", receipts=[r_del, r_post_stat], user_prompt="Delete old.txt."
+    )
+    assert v_del.is_valid is True
+
+    # 4. "Completed with no errors" must NOT bypass FAILED_TOOL_UNDISCLOSED
+    r_fail = ToolReceipt(
+        tool="email_send_invite",
+        ok=False,
+        executed=True,
+        error_code="timeout",
+        args={"to": "bob@acme.example"},
+        output="timeout",
+    )
+    v_no_err = sup.verify_narration(
+        "Completed with no errors.",
+        receipts=[r_fail],
+        user_prompt="Send the invite to bob@acme.example.",
+    )
+    assert v_no_err.is_valid is False
+
+    # 5. Legitimate edit to tests/test_app.py when user cited src/app.py must pass
+    r_test_edit = ToolReceipt(
+        tool="edit_file",
+        ok=True,
+        executed=True,
+        args={"path": "tests/test_app.py"},
+        output='{"ok": true}',
+    )
+    v_path = sup.verify_narration(
+        "I updated tests/test_app.py.",
+        receipts=[r_test_edit],
+        user_prompt="Add a regression test for src/app.py.",
+    )
+    assert v_path.is_valid is True
+
+    # 6. Claude Code Stop hook stop_hook_active=True prevents infinite loop & malformed JSON fails open
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"stop_hook_active": True})))
+    assert main(["hook", "stop", "--log", str(tmp_path / "r.jsonl"), "--enforce"]) == 0
+    out_loop = json.loads(capsys.readouterr().out)
+    assert out_loop["decision"] == "allow"
+    assert out_loop["skipped"] == "stop_hook_active"
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("{not valid json"))
+    assert main(["hook", "stop", "--log", str(tmp_path / "r.jsonl"), "--enforce"]) == 0
+    out_bad = json.loads(capsys.readouterr().out)
+    assert out_bad["decision"] == "allow"
+
+    # 7. install-hooks safely merges & uninstalls without clobbering existing hooks
+    settings_file = tmp_path / ".claude" / "settings.json"
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    settings_file.write_text(
+        json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "pytest"}]}]}}),
+        encoding="utf-8",
+    )
+    assert main(["install-hooks", "--settings", str(settings_file), "--flag-undisclosed"]) == 0
+    capsys.readouterr()
+    installed = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert len(installed["hooks"]["Stop"]) == 2
+    assert len(installed["hooks"]["PostToolUse"]) == 1
+
+    assert main(["install-hooks", "--settings", str(settings_file), "--uninstall"]) == 0
+    capsys.readouterr()
+    uninstalled = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert len(uninstalled["hooks"]["Stop"]) == 1
+    assert uninstalled["hooks"]["Stop"][0]["hooks"][0]["command"] == "pytest"
+    assert uninstalled["hooks"]["PostToolUse"] == []

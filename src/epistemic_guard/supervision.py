@@ -712,23 +712,69 @@ def _extract_numeric_set(text: str) -> set[float]:
 
 
 _READBACK_TOOL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:^|_)(?:get|read|search|query|fetch|check|verify|inspect|stat|status|scan|lookup|probe|list|find)(?:_|$)",
+    r"(?:^|_)(?:get|read|search|query|fetch|check|verify|inspect|stat|status|scan|lookup|probe|list|find|show)(?:_|$)",
+    re.IGNORECASE,
+)
+_MUTATING_TOOL_VERB_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:create|write|edit|update|set|put|post|patch|delete|remove|drop|insert|add|"
+    r"append|send|email|mail|invite|pay|transfer|refund|book|schedule|commit|push|merge|"
+    r"deploy|exec|execute|run|bash|shell|kill|stop|start|restart|enable|disable|toggle|"
+    r"revoke|cancel|archive|wipe|purge|move|rename|copy|upload|publish|assign|protect)(?:_|$)",
+    re.IGNORECASE,
+)
+_DELETE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:delete|remove|unlink|drop|purge|wipe|erase|cancel|revoke|rm)(?:_|$)",
     re.IGNORECASE,
 )
 _NOT_FOUND_ERR_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:not_found|not\s+found|enoent|no\s+such\s+file|does\s+not\s+exist|"
-    r"no\s+\w+\s+with\s+that\s+id|missing|unpersisted|404)\b",
+    r"no\s+\w+\s+with\s+that\s+id|unpersisted|404)\b",
     re.IGNORECASE,
 )
 
 
+def _is_read_only_tool(tool_name: str) -> bool:
+    """Return True iff `tool_name` is a read/query/probe tool with no mutating verb."""
+    return bool(_READBACK_TOOL_RE.search(tool_name)) and not bool(
+        _MUTATING_TOOL_VERB_RE.search(tool_name)
+    )
+
+
+def _extract_receipt_target_key(rcpt: ToolReceipt) -> str:
+    for key in ("path", "file_path", "record_id", "deal_id", "event_id", "id"):
+        val = str(rcpt.args.get(key) or "").strip().lower()
+        if val:
+            return f"{key}:{val}"
+    return ""
+
+
 def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> ToolReceipt | None:
-    """Detect read-back/probe receipts reporting missing or unpersisted state."""
-    saw_ok_mutation = False
+    """Detect post-write read-back receipts reporting missing or unpersisted state.
+
+    Order-aware and delete-safe: pre-write `stat` checks (`exists: false`) and
+    delete-then-verify-gone sequences are never flagged.
+    """
+    saw_ok_non_delete_write = False
+    written_targets: set[str] = set()
     for rcpt in receipts:
-        if rcpt.ok and rcpt.executed and not _READBACK_TOOL_RE.search(rcpt.tool):
-            saw_ok_mutation = True
-        if rcpt.ok and rcpt.executed and rcpt.output.strip()[:1] == "{":
+        if rcpt.ok and rcpt.executed and not _is_read_only_tool(rcpt.tool):
+            if _DELETE_TOOL_RE.search(rcpt.tool):
+                tgt = _extract_receipt_target_key(rcpt)
+                written_targets.discard(tgt)
+            else:
+                saw_ok_non_delete_write = True
+                tgt = _extract_receipt_target_key(rcpt)
+                if tgt:
+                    written_targets.add(tgt)
+            continue
+
+        if not (saw_ok_non_delete_write and rcpt.executed and _is_read_only_tool(rcpt.tool)):
+            continue
+        rb_tgt = _extract_receipt_target_key(rcpt)
+        if rb_tgt and written_targets and rb_tgt not in written_targets:
+            continue
+
+        if rcpt.ok and rcpt.output.strip()[:1] == "{":
             with contextlib.suppress(Exception):
                 parsed = json.loads(rcpt.output)
                 if isinstance(parsed, Mapping):
@@ -738,13 +784,7 @@ def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> Tool
                     status_val = str(parsed.get("status") or "").strip().lower()
                     if status_val in {"not_found", "missing", "absent", "unpersisted"}:
                         return rcpt
-        if (
-            saw_ok_mutation
-            and rcpt.executed
-            and not rcpt.ok
-            and _READBACK_TOOL_RE.search(rcpt.tool)
-            and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}")
-        ):
+        if not rcpt.ok and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}"):
             return rcpt
     return None
 
@@ -804,9 +844,18 @@ _ISO_DATE_ONLY_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{
 _EMAIL_ADDR_RE: Final[re.Pattern[str]] = re.compile(
     r"\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})\b", re.IGNORECASE
 )
-_REL_PATH_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]{1,8})(?![A-Za-z0-9_.-])"
+
+
+_NO_ERROR_PHRASE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:no|zero|without(?:\s+any)?)\s+(?:errors?|issues?|problems?|warnings?|failures?|bugs?)\b",
+    re.IGNORECASE,
 )
+
+
+def _has_failure_disclosure(narration: str) -> bool:
+    """Return True if narration genuinely discloses an error/failure/caveat."""
+    cleaned = _NO_ERROR_PHRASE_RE.sub(" ", narration)
+    return bool(_FAILURE_DISCLOSURE_RE.search(cleaned))
 
 
 def _find_mutating_date_mismatch(
@@ -818,7 +867,7 @@ def _find_mutating_date_mismatch(
         return None
     mut_dates: set[str] = set()
     for rcpt in ok_receipts:
-        if _READBACK_TOOL_RE.search(rcpt.tool):
+        if _is_read_only_tool(rcpt.tool):
             continue
         blob = " ".join(str(v) for v in rcpt.args.values()) + " " + rcpt.output
         mut_dates.update(_ISO_DATE_ONLY_RE.findall(blob))
@@ -835,32 +884,21 @@ def _find_mutating_date_mismatch(
 def _find_prompt_target_mismatch(
     user_prompt: str, ok_receipts: Sequence[ToolReceipt]
 ) -> str | None:
-    """Detect when mutating ok receipts target a different email or file path than user_prompt."""
+    """Detect when mutating ok receipts target a different email than user_prompt."""
     if not user_prompt.strip():
         return None
-    mut_rcpts = [r for r in ok_receipts if not _READBACK_TOOL_RE.search(r.tool)]
+    mut_rcpts = [r for r in ok_receipts if not _is_read_only_tool(r.tool)]
     if not mut_rcpts:
         return None
     mut_blob = " ".join(
         " ".join(str(v) for v in r.args.values()) + " " + r.output for r in mut_rcpts
     )
-
-    # 1. Explicit email target mismatch
     prompt_emails = {e.lower() for e in _EMAIL_ADDR_RE.findall(user_prompt)}
     mut_emails = {e.lower() for e in _EMAIL_ADDR_RE.findall(mut_blob)}
     if prompt_emails and mut_emails and prompt_emails.isdisjoint(mut_emails):
         return (
             f"Mutating ToolReceipt targeted email(s) {sorted(mut_emails)} instead of "
             f"user-requested {sorted(prompt_emails)}."
-        )
-
-    # 2. Explicit multi-segment file path target mismatch
-    prompt_paths = {p.lower() for p in _REL_PATH_RE.findall(user_prompt)}
-    mut_paths = {p.lower() for p in _REL_PATH_RE.findall(mut_blob)}
-    if prompt_paths and mut_paths and prompt_paths.isdisjoint(mut_paths):
-        return (
-            f"Mutating ToolReceipt targeted path(s) {sorted(mut_paths)} instead of "
-            f"user-requested {sorted(prompt_paths)}."
         )
     return None
 
@@ -869,14 +907,14 @@ def _find_undisclosed_failed_tool(
     narration: str, failed_receipts: Sequence[ToolReceipt]
 ) -> ToolReceipt | None:
     """Detect unsuperseded failed mutating tools omitted from an all-clear completion reply."""
-    if not failed_receipts or _FAILURE_DISCLOSURE_RE.search(narration):
+    if not failed_receipts or _has_failure_disclosure(narration):
         return None
     if _FORWARD_PLANNING_RE.search(narration) and not _CLAUSE_ACTION_OR_STATE_SIGNAL_RE.search(
         narration
     ):
         return None
     for fr in failed_receipts:
-        if not _READBACK_TOOL_RE.search(fr.tool):
+        if not _is_read_only_tool(fr.tool):
             return fr
     return None
 
@@ -900,7 +938,7 @@ def _find_read_after_write_contradiction(ok_receipts: Sequence[ToolReceipt]) -> 
     for rcpt in ok_receipts:
         if not (rcpt.ok and rcpt.executed):
             continue
-        is_read = bool(_READBACK_TOOL_RE.search(rcpt.tool)) or "show_head" in rcpt.tool.lower()
+        is_read = _is_read_only_tool(rcpt.tool) or "show_head" in rcpt.tool.lower()
         raw_out = rcpt.output.strip()
         out_obj: Mapping[str, Any] = {}
         if raw_out[:1] == "{":
@@ -1012,7 +1050,7 @@ def _expected_tz_offsets(tz_name: str) -> tuple[float, ...] | None:
 def _find_timezone_offset_mismatch(ok_receipts: Sequence[ToolReceipt]) -> str | None:
     """Detect mutating receipts whose ISO-8601 UTC offset contradicts their declared timezone."""
     for rcpt in ok_receipts:
-        if _READBACK_TOOL_RE.search(rcpt.tool):
+        if _is_read_only_tool(rcpt.tool):
             continue
         tz_raw = str(rcpt.args.get("timezone") or "").strip()
         if not tz_raw:
@@ -1048,10 +1086,10 @@ def _find_hedged_zero_mutation_claim(
     narration: str, ok_receipts: Sequence[ToolReceipt]
 ) -> str | None:
     """Detect hedged completion claims when zero mutating tools executed in the turn."""
-    if _FAILURE_DISCLOSURE_RE.search(narration) or not _HEDGED_COMPLETION_RE.search(narration):
+    if _has_failure_disclosure(narration) or not _HEDGED_COMPLETION_RE.search(narration):
         return None
     has_ok_mutation = any(
-        r.ok and r.executed and not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts
+        r.ok and r.executed and not _is_read_only_tool(r.tool) for r in ok_receipts
     )
     if not has_ok_mutation:
         return "Hedged completion claim asserted with zero executed mutating ToolReceipts."
@@ -1100,7 +1138,7 @@ def _find_unexecuted_secondary_action(
     narration: str, ok_receipts: Sequence[ToolReceipt]
 ) -> tuple[str, str] | None:
     """Detect explicit secondary completion claims lacking any matching executed receipt."""
-    if not ok_receipts or _FAILURE_DISCLOSURE_RE.search(narration):
+    if not ok_receipts or _has_failure_disclosure(narration):
         return None
     tool_names = [r.tool for r in ok_receipts]
     for family, claim_re, tool_re in _SECONDARY_ACTION_CHECKS:
@@ -1777,13 +1815,13 @@ class ReceiptSupervisor:
             if (
                 fam == "CLAIM_DELETE"
                 and not _DESTRUCTIVE_VERB_RE.search(cl_text)
-                and any(not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts)
+                and any(not _is_read_only_tool(r.tool) for r in ok_receipts)
             ):
                 fam = None
             elif (
                 fam == "CLAIM_COMM_EXTERNAL"
                 and not _COMM_EXTERNAL_VERB_RE.search(cl_text)
-                and any(not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts)
+                and any(not _is_read_only_tool(r.tool) for r in ok_receipts)
             ):
                 fam = None
             if fam == "UNFULFILLED_PROMISE":
@@ -2005,7 +2043,7 @@ class ReceiptSupervisor:
         if (
             neg_persist is not None
             and not unsupported_claims
-            and not _FAILURE_DISCLOSURE_RE.search(narration)
+            and not _has_failure_disclosure(narration)
             and narration.strip()
         ):
             unsupported_claims.append(narration.strip()[:160])
@@ -2039,49 +2077,50 @@ class ReceiptSupervisor:
                 )
             )
 
-        # Check mutating-receipt ISO date and explicit prompt email/path target mismatches
-        if not unsupported_claims and not _FAILURE_DISCLOSURE_RE.search(narration):
-            date_mismatch = _find_mutating_date_mismatch(narration, ok_receipts)
-            if date_mismatch is not None:
+        # Core invariants (always active) + opt-in value heuristics (verify_output_values=True)
+        if not unsupported_claims and not _has_failure_disclosure(narration):
+            raw_contradiction = _find_read_after_write_contradiction(ok_receipts)
+            if raw_contradiction is not None and narration.strip():
                 unsupported_claims.append(narration.strip()[:160])
                 unsupported_spans.append(
                     UnsupportedClaimSpan(
                         text=narration.strip()[:160],
                         start_char=base_char_offset,
                         end_char=base_char_offset + min(len(narration.strip()), 160),
-                        claimed_family="OUTPUT_VALUE_MISMATCH",
-                        reason=date_mismatch,
+                        claimed_family="READ_AFTER_WRITE_CONTRADICTION",
+                        reason=raw_contradiction,
                     )
                 )
             else:
-                target_mismatch = _find_prompt_target_mismatch(user_prompt, ok_receipts)
-                if target_mismatch is not None:
+                sec_missing = _find_unexecuted_secondary_action(narration, ok_receipts)
+                if sec_missing is not None:
+                    sec_fam, sec_reason = sec_missing
                     unsupported_claims.append(narration.strip()[:160])
                     unsupported_spans.append(
                         UnsupportedClaimSpan(
                             text=narration.strip()[:160],
                             start_char=base_char_offset,
                             end_char=base_char_offset + min(len(narration.strip()), 160),
-                            claimed_family="WRONG_TARGET_MUTATION",
-                            reason=target_mismatch,
+                            claimed_family=sec_fam,
+                            reason=sec_reason,
                         )
                     )
                 else:
-                    raw_contradiction = _find_read_after_write_contradiction(ok_receipts)
-                    if raw_contradiction is not None and narration.strip():
+                    hedged_zero = _find_hedged_zero_mutation_claim(narration, ok_receipts)
+                    if hedged_zero is not None:
                         unsupported_claims.append(narration.strip()[:160])
                         unsupported_spans.append(
                             UnsupportedClaimSpan(
                                 text=narration.strip()[:160],
                                 start_char=base_char_offset,
                                 end_char=base_char_offset + min(len(narration.strip()), 160),
-                                claimed_family="READ_AFTER_WRITE_CONTRADICTION",
-                                reason=raw_contradiction,
+                                claimed_family="PHANTOM_HEDGED_CLAIM",
+                                reason=hedged_zero,
                             )
                         )
-                    else:
-                        tz_mismatch = _find_timezone_offset_mismatch(ok_receipts)
-                        if tz_mismatch is not None and narration.strip():
+                    elif check_values:
+                        date_mismatch = _find_mutating_date_mismatch(narration, ok_receipts)
+                        if date_mismatch is not None:
                             unsupported_claims.append(narration.strip()[:160])
                             unsupported_spans.append(
                                 UnsupportedClaimSpan(
@@ -2089,13 +2128,12 @@ class ReceiptSupervisor:
                                     start_char=base_char_offset,
                                     end_char=base_char_offset + min(len(narration.strip()), 160),
                                     claimed_family="OUTPUT_VALUE_MISMATCH",
-                                    reason=tz_mismatch,
+                                    reason=date_mismatch,
                                 )
                             )
                         else:
-                            sec_missing = _find_unexecuted_secondary_action(narration, ok_receipts)
-                            if sec_missing is not None:
-                                sec_fam, sec_reason = sec_missing
+                            target_mismatch = _find_prompt_target_mismatch(user_prompt, ok_receipts)
+                            if target_mismatch is not None:
                                 unsupported_claims.append(narration.strip()[:160])
                                 unsupported_spans.append(
                                     UnsupportedClaimSpan(
@@ -2103,15 +2141,13 @@ class ReceiptSupervisor:
                                         start_char=base_char_offset,
                                         end_char=base_char_offset
                                         + min(len(narration.strip()), 160),
-                                        claimed_family=sec_fam,
-                                        reason=sec_reason,
+                                        claimed_family="WRONG_TARGET_MUTATION",
+                                        reason=target_mismatch,
                                     )
                                 )
                             else:
-                                hedged_zero = _find_hedged_zero_mutation_claim(
-                                    narration, ok_receipts
-                                )
-                                if hedged_zero is not None:
+                                tz_mismatch = _find_timezone_offset_mismatch(ok_receipts)
+                                if tz_mismatch is not None and narration.strip():
                                     unsupported_claims.append(narration.strip()[:160])
                                     unsupported_spans.append(
                                         UnsupportedClaimSpan(
@@ -2119,8 +2155,8 @@ class ReceiptSupervisor:
                                             start_char=base_char_offset,
                                             end_char=base_char_offset
                                             + min(len(narration.strip()), 160),
-                                            claimed_family="PHANTOM_HEDGED_CLAIM",
-                                            reason=hedged_zero,
+                                            claimed_family="OUTPUT_VALUE_MISMATCH",
+                                            reason=tz_mismatch,
                                         )
                                     )
 
