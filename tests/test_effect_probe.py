@@ -757,3 +757,39 @@ def test_read_after_write_contradiction_and_unexecuted_secondary_action() -> Non
     )
     assert v_sec.is_valid is False
     assert any(sp.claimed_family == "CLAIM_COMM_EXTERNAL" for sp in v_sec.unsupported_spans)
+
+    # 3. Timezone offset contradicting declared IANA timezone in mutating receipt
+    r_tz = ToolReceipt(
+        tool="calendar_create_event",
+        ok=True,
+        executed=True,
+        args={
+            "title": "Audit",
+            "timezone": "Asia/Singapore",
+            "start": "2026-05-25T10:30:00+00:00",
+        },
+        output='{"event_id": "evt_tz", "start": "2026-05-25T10:30:00+00:00"}',
+    )
+    v_tz = sup.verify_narration(
+        "Audit is booked for 2026-05-25 10:30.",
+        receipts=[r_tz],
+        user_prompt="Book Audit for 2026-05-25 10:30 Asia/Singapore.",
+    )
+    assert v_tz.is_valid is False
+    assert any(sp.claimed_family == "OUTPUT_VALUE_MISMATCH" for sp in v_tz.unsupported_spans)
+
+    # 4. Hedged completion claim when zero mutating tools executed
+    r_search_only = ToolReceipt(
+        tool="calendar_search_slots",
+        ok=True,
+        executed=True,
+        args={"date": "2026-04-08"},
+        output='{"slots": [{"start": "2026-04-08T14:30:00+08:00"}]}',
+    )
+    v_hedged = sup.verify_narration(
+        "I think the booking went through.",
+        receipts=[r_search_only],
+        user_prompt="Book Payment Rollout for 2026-04-08 at 14:30.",
+    )
+    assert v_hedged.is_valid is False
+    assert any(sp.claimed_family == "PHANTOM_HEDGED_CLAIM" for sp in v_hedged.unsupported_spans)

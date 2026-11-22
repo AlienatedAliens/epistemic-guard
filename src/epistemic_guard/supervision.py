@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import openvino as ov
@@ -836,57 +837,180 @@ def _find_undisclosed_failed_tool(
     return None
 
 
+_RAW_TRACKED_SCALAR_KEYS: Final[tuple[str, ...]] = (
+    "content",
+    "stage",
+    "sha",
+    "title",
+    "owner",
+    "assignee",
+)
+
+
 def _find_read_after_write_contradiction(ok_receipts: Sequence[ToolReceipt]) -> str | None:
     """Detect read-after-write contradictions where a later read returns stale/empty state."""
-    written_file_content: dict[str, str] = {}
+    written_by_target: dict[str, dict[str, str]] = {}
     written_record_fields: dict[str, bool] = {}
+    last_git_sha: str | None = None
 
     for rcpt in ok_receipts:
         if not (rcpt.ok and rcpt.executed):
             continue
-        is_read = bool(_READBACK_TOOL_RE.search(rcpt.tool))
-        path_val = str(rcpt.args.get("path") or rcpt.args.get("file_path") or "").strip().lower()
-        rec_val = str(rcpt.args.get("record_id") or rcpt.args.get("id") or "").strip().lower()
+        is_read = bool(_READBACK_TOOL_RE.search(rcpt.tool)) or "show_head" in rcpt.tool.lower()
+        raw_out = rcpt.output.strip()
+        out_obj: Mapping[str, Any] = {}
+        if raw_out[:1] == "{":
+            with contextlib.suppress(Exception):
+                parsed = json.loads(raw_out)
+                if isinstance(parsed, Mapping):
+                    out_obj = parsed
+
+        targets: list[str] = []
+        for tkey in ("path", "file_path", "record_id", "deal_id", "event_id", "id"):
+            val = str(rcpt.args.get(tkey) or out_obj.get(tkey) or "").strip().lower()
+            if val:
+                targets.append(f"{tkey}:{val}")
 
         if not is_read:
-            if path_val and "content" in rcpt.args and isinstance(rcpt.args["content"], str):
-                written_file_content[path_val] = rcpt.args["content"]
+            for tgt in targets:
+                bucket = written_by_target.setdefault(tgt, {})
+                for skey in _RAW_TRACKED_SCALAR_KEYS:
+                    arg_v = rcpt.args.get(skey)
+                    out_v = out_obj.get(skey)
+                    if isinstance(arg_v, str):
+                        bucket[skey] = arg_v
+                    elif isinstance(out_v, str):
+                        bucket[skey] = out_v
+            rec_val = (
+                str(rcpt.args.get("record_id") or out_obj.get("record_id") or "").strip().lower()
+            )
             if rec_val and "fields" in rcpt.args:
                 raw_fields = str(rcpt.args["fields"]).strip()
                 if raw_fields and raw_fields not in {"{}", "[]", "null", "None"}:
                     written_record_fields[rec_val] = True
+            if "commit" in rcpt.tool.lower() and isinstance(out_obj.get("sha"), str):
+                last_git_sha = out_obj["sha"].strip().lower()
             continue
 
         # Read-back receipt: verify against prior writes
-        raw_out = rcpt.output.strip()
-        if raw_out[:1] != "{":
+        if not out_obj:
             continue
-        with contextlib.suppress(Exception):
-            parsed = json.loads(raw_out)
-            if not isinstance(parsed, Mapping):
+        if (
+            "show_head" in rcpt.tool.lower()
+            and last_git_sha
+            and isinstance(out_obj.get("sha"), str)
+            and out_obj["sha"].strip().lower() != last_git_sha
+        ):
+            return (
+                f"Read-back receipt '{rcpt.tool}' returned git sha '{out_obj['sha']}' "
+                f"contradicting prior commit sha '{last_git_sha}'."
+            )
+        for tgt in targets:
+            prior = written_by_target.get(tgt)
+            if not prior:
                 continue
-            out_path = str(parsed.get("path") or path_val).strip().lower()
-            if (
-                out_path
-                and out_path in written_file_content
-                and isinstance(parsed.get("content"), str)
-                and parsed["content"] != written_file_content[out_path]
-            ):
-                return (
-                    f"Read-back receipt '{rcpt.tool}' for '{out_path}' returned content "
-                    "contradicting the prior write receipt."
-                )
-            out_rec = str(parsed.get("record_id") or rec_val).strip().lower()
-            if (
-                out_rec
-                and out_rec in written_record_fields
-                and isinstance(parsed.get("fields"), Mapping)
-                and len(parsed["fields"]) == 0
-            ):
-                return (
-                    f"Read-back receipt '{rcpt.tool}' for '{out_rec}' returned empty fields "
-                    "after a non-empty update receipt."
-                )
+            for skey, wval in prior.items():
+                if skey in out_obj and isinstance(out_obj[skey], str) and out_obj[skey] != wval:
+                    return (
+                        f"Read-back receipt '{rcpt.tool}' for '{tgt}' returned "
+                        f"{skey}={out_obj[skey]!r} contradicting prior write {wval!r}."
+                    )
+        out_rec = str(out_obj.get("record_id") or rcpt.args.get("record_id") or "").strip().lower()
+        if (
+            out_rec
+            and out_rec in written_record_fields
+            and isinstance(out_obj.get("fields"), Mapping)
+            and len(out_obj["fields"]) == 0
+        ):
+            return (
+                f"Read-back receipt '{rcpt.tool}' for '{out_rec}' returned empty fields "
+                "after a non-empty update receipt."
+            )
+    return None
+
+
+_FALLBACK_IANA_OFFSETS_HOURS: Final[dict[str, tuple[float, ...]]] = {
+    "utc": (0.0,),
+    "etc/utc": (0.0,),
+    "europe/london": (0.0, 1.0),
+    "europe/berlin": (1.0, 2.0),
+    "europe/paris": (1.0, 2.0),
+    "america/new_york": (-5.0, -4.0),
+    "america/chicago": (-6.0, -5.0),
+    "america/denver": (-7.0, -6.0),
+    "america/los_angeles": (-8.0, -7.0),
+    "asia/singapore": (8.0,),
+    "asia/shanghai": (8.0,),
+    "asia/tokyo": (9.0,),
+    "asia/seoul": (9.0,),
+    "asia/kolkata": (5.5,),
+    "australia/sydney": (10.0, 11.0),
+    "pacific/auckland": (12.0, 13.0),
+}
+_ISO_OFFSET_DT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:\d{2}|Z)\b"
+)
+
+
+def _expected_tz_offsets(tz_name: str) -> tuple[float, ...] | None:
+    with contextlib.suppress(Exception):
+        zi = ZoneInfo(tz_name)
+        offs: set[float] = set()
+        for month in (1, 7):
+            td = datetime(2026, month, 15, tzinfo=zi).utcoffset()
+            if td is not None:
+                offs.add(round(td.total_seconds() / 3600.0, 2))
+        if offs:
+            return tuple(sorted(offs))
+    return _FALLBACK_IANA_OFFSETS_HOURS.get(tz_name.strip().lower())
+
+
+def _find_timezone_offset_mismatch(ok_receipts: Sequence[ToolReceipt]) -> str | None:
+    """Detect mutating receipts whose ISO-8601 UTC offset contradicts their declared timezone."""
+    for rcpt in ok_receipts:
+        if _READBACK_TOOL_RE.search(rcpt.tool):
+            continue
+        tz_raw = str(rcpt.args.get("timezone") or "").strip()
+        if not tz_raw:
+            continue
+        allowed_offsets = _expected_tz_offsets(tz_raw)
+        if not allowed_offsets:
+            continue
+        for key in ("start", "end", "datetime", "scheduled_at"):
+            val = str(rcpt.args.get(key) or "").strip()
+            if not val or not _ISO_OFFSET_DT_RE.search(val):
+                continue
+            with contextlib.suppress(Exception):
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                td = dt.utcoffset()
+                if td is not None:
+                    actual_h = round(td.total_seconds() / 3600.0, 2)
+                    if all(abs(actual_h - exp) > 0.05 for exp in allowed_offsets):
+                        return (
+                            f"Mutating receipt '{rcpt.tool}' wrote {key}={val!r} "
+                            f"(UTC{actual_h:+.1f}h) contradicting timezone {tz_raw!r}."
+                        )
+    return None
+
+
+_HEDGED_COMPLETION_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:I\s+(?:believe|think)|it\s+looks\s+like|should\s+have\s+(?:reached|gone\s+through))\b"
+    r".{0,100}\b(?:booked|confirmed|sent|committed|deleted|created|updated|saved|went\s+through|reached)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_hedged_zero_mutation_claim(
+    narration: str, ok_receipts: Sequence[ToolReceipt]
+) -> str | None:
+    """Detect hedged completion claims when zero mutating tools executed in the turn."""
+    if _FAILURE_DISCLOSURE_RE.search(narration) or not _HEDGED_COMPLETION_RE.search(narration):
+        return None
+    has_ok_mutation = any(
+        r.ok and r.executed and not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts
+    )
+    if not has_ok_mutation:
+        return "Hedged completion claim asserted with zero executed mutating ToolReceipts."
     return None
 
 
@@ -895,8 +1019,8 @@ _SECONDARY_ACTION_CHECKS: Final[tuple[tuple[str, re.Pattern[str], re.Pattern[str
         "CLAIM_COMM_EXTERNAL",
         re.compile(
             r"\b(?:sent\s+(?:the\s+|an?\s+)?(?:invite|email|message)|"
-            r"invite\s+(?:sent|went|has\s+been\s+sent)|has\s+the\s+invite|"
-            r"should\s+have\s+the\s+invite|invited\s+\S+@\S+)\b",
+            r"invite\s+(?:sent|went|has\s+been\s+sent|should\s+have\s+reached)|"
+            r"has\s+the\s+invite|should\s+have\s+the\s+invite|invited\s+\S+@\S+)\b",
             re.IGNORECASE,
         ),
         re.compile(r"(?:^|_)(?:send|email|mail|invite|notify|message)(?:_|$)", re.IGNORECASE),
@@ -1893,19 +2017,49 @@ class ReceiptSupervisor:
                             )
                         )
                     else:
-                        sec_missing = _find_unexecuted_secondary_action(narration, ok_receipts)
-                        if sec_missing is not None:
-                            sec_fam, sec_reason = sec_missing
+                        tz_mismatch = _find_timezone_offset_mismatch(ok_receipts)
+                        if tz_mismatch is not None and narration.strip():
                             unsupported_claims.append(narration.strip()[:160])
                             unsupported_spans.append(
                                 UnsupportedClaimSpan(
                                     text=narration.strip()[:160],
                                     start_char=base_char_offset,
                                     end_char=base_char_offset + min(len(narration.strip()), 160),
-                                    claimed_family=sec_fam,
-                                    reason=sec_reason,
+                                    claimed_family="OUTPUT_VALUE_MISMATCH",
+                                    reason=tz_mismatch,
                                 )
                             )
+                        else:
+                            sec_missing = _find_unexecuted_secondary_action(narration, ok_receipts)
+                            if sec_missing is not None:
+                                sec_fam, sec_reason = sec_missing
+                                unsupported_claims.append(narration.strip()[:160])
+                                unsupported_spans.append(
+                                    UnsupportedClaimSpan(
+                                        text=narration.strip()[:160],
+                                        start_char=base_char_offset,
+                                        end_char=base_char_offset
+                                        + min(len(narration.strip()), 160),
+                                        claimed_family=sec_fam,
+                                        reason=sec_reason,
+                                    )
+                                )
+                            else:
+                                hedged_zero = _find_hedged_zero_mutation_claim(
+                                    narration, ok_receipts
+                                )
+                                if hedged_zero is not None:
+                                    unsupported_claims.append(narration.strip()[:160])
+                                    unsupported_spans.append(
+                                        UnsupportedClaimSpan(
+                                            text=narration.strip()[:160],
+                                            start_char=base_char_offset,
+                                            end_char=base_char_offset
+                                            + min(len(narration.strip()), 160),
+                                            claimed_family="PHANTOM_HEDGED_CLAIM",
+                                            reason=hedged_zero,
+                                        )
+                                    )
 
         is_ok = (
             len(unsupported_claims) == 0
