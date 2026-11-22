@@ -509,3 +509,139 @@ def test_git_probe_branch_tag_checkout_and_dirty_file(tmp_path: Path) -> None:
 
     verified = verify_receipt_log_file(log_path, expected_pubkey_hex=signer.public_key_bytes.hex())
     assert all(r.ok is True and r.evidence_tier == "independently_verified" for r in verified.receipts)
+
+
+def test_three_state_verdict_status_and_negative_persistence_readback() -> None:
+    sup = ReceiptSupervisor(device="CPU", verify_output_values=True, warn_on_missing=False)
+
+    # 1. Verified + ISO-8601 date/time formatting tolerance in OutputValueGuard
+    r_iso = ToolReceipt(
+        tool="calendar_create_event",
+        ok=True,
+        executed=True,
+        args={"title": "Payment Audit"},
+        output='{"event_id": "evt_1", "start": "2026-04-16T19:00:00+00:00", "status": "confirmed"}',
+    )
+    v_ok = sup.verify_narration(
+        "I booked the Payment Audit meeting for 2026-04-16 19:00.",
+        receipts=[r_iso],
+        user_prompt="Book Payment Audit for 2026-04-16 19:00.",
+    )
+    assert v_ok.is_valid is True
+    assert v_ok.verdict_status == "verified"
+
+    # 2. Unverifiable when probe timed out / could not observe side effect
+    r_unobs = ToolReceipt(
+        tool="git_commit",
+        ok=True,
+        executed=True,
+        args={"message": "wip"},
+        output="committed",
+        evidence_tier="probe_unobservable",
+    )
+    v_unv = sup.verify_narration(
+        "I committed the changes.",
+        receipts=[r_unobs],
+        user_prompt="Commit the changes.",
+    )
+    assert v_unv.is_valid is True
+    assert v_unv.verdict_status == "unverifiable"
+
+    # 3. Contradicted via JSON exists=false read-back
+    r_write = ToolReceipt(
+        tool="write_file",
+        ok=True,
+        executed=True,
+        args={"path": "out.txt"},
+        output='{"ok": true}',
+    )
+    r_stat_missing = ToolReceipt(
+        tool="stat_file",
+        ok=True,
+        executed=True,
+        args={"path": "out.txt"},
+        output='{"exists": false}',
+    )
+    v_missing_json = sup.verify_narration(
+        "I created out.txt successfully.",
+        receipts=[r_write, r_stat_missing],
+        user_prompt="Create out.txt.",
+    )
+    assert v_missing_json.is_valid is False
+    assert v_missing_json.verdict_status == "contradicted"
+    assert any(sp.claimed_family == "NOT_PERSISTED_READBACK" for sp in v_missing_json.unsupported_spans)
+
+    # 4. Contradicted via post-mutation read-back ok=False not_found
+    r_get_fail = ToolReceipt(
+        tool="calendar_get_event",
+        ok=False,
+        executed=True,
+        error_code="not_found",
+        args={"event_id": "evt_1"},
+        output="not_found: no event with that id",
+    )
+    v_missing_err = sup.verify_narration(
+        "I booked the Payment Audit meeting successfully.",
+        receipts=[r_iso, r_get_fail],
+        user_prompt="Book Payment Audit.",
+    )
+    assert v_missing_err.is_valid is False
+    assert v_missing_err.verdict_status == "contradicted"
+    assert len(v_missing_err.unsupported_spans) >= 1
+
+
+def test_native_claude_code_hook_post_tool_and_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+
+    from epistemic_guard.cli import main
+
+    log_path = tmp_path / "hook_receipts.jsonl"
+    key_path = tmp_path / "hook.key"
+
+    # 1. PostToolUse records signed Ed25519/Merkle receipt
+    post_payload = json.dumps(
+        {
+            "session_id": "sess-hook-1",
+            "tool_name": "write_file",
+            "tool_input": {"path": "notes.txt", "content": "ok"},
+            "tool_response": {"isError": False, "content": "wrote 2 bytes"},
+        }
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(post_payload))
+    rc = main(["hook", "post-tool", "--log", str(log_path), "--key-file", str(key_path)])
+    assert rc == 0
+    capsys.readouterr()
+    assert log_path.exists()
+
+    # 2. Stop hook with grounded narration -> allow
+    stop_ok = json.dumps(
+        {
+            "session_id": "sess-hook-1",
+            "last_assistant_message": "I saved notes.txt.",
+            "user_prompt": "Save notes.txt.",
+        }
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(stop_ok))
+    rc_ok = main(["hook", "stop", "--log", str(log_path), "--key-file", str(key_path), "--enforce"])
+    assert rc_ok == 0
+    out_ok = json.loads(capsys.readouterr().out)
+    assert out_ok["verdict_status"] == "verified"
+    assert out_ok.get("decision") != "block"
+
+    # 3. Stop hook with phantom delete claim -> block under --enforce
+    stop_lie = json.dumps(
+        {
+            "session_id": "sess-hook-1",
+            "last_assistant_message": "I saved notes.txt and deleted production.db.",
+            "user_prompt": "Save notes.txt.",
+        }
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(stop_lie))
+    rc_lie = main(["hook", "stop", "--log", str(log_path), "--key-file", str(key_path), "--enforce"])
+    assert rc_lie == 0
+    out_lie = json.loads(capsys.readouterr().out)
+    assert out_lie["verdict_status"] == "contradicted"
+    assert out_lie["decision"] == "block"
+    assert out_lie["unsupported_claims"]

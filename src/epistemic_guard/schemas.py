@@ -744,6 +744,7 @@ class SupervisionVerdict(BaseModel):
     """Clause-level action-receipt verification result."""
 
     is_valid: bool
+    verdict_status: str = "verified"
     device: str = "CPU"
     latency_ms: float = 0.0
     clauses_checked: int = 0

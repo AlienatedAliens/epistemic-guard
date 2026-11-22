@@ -694,13 +694,58 @@ def _flatten_json_leaves(
     return acc
 
 
+_ISO_DATETIME_OR_TIME_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b|"
+    r"\b\d{1,2}:\d{2}(?::\d{2})?\b"
+)
+
+
 def _extract_numeric_set(text: str) -> set[float]:
+    cleaned = _ISO_DATETIME_OR_TIME_RE.sub(" ", text)
     nums: set[float] = set()
-    for m in _SCALAR_NUMBER_RE.finditer(text):
+    for m in _SCALAR_NUMBER_RE.finditer(cleaned):
         val = _normalize_numeric_token(m.group(0))
         if val is not None:
             nums.add(round(val, 6))
     return nums
+
+
+_READBACK_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:get|read|fetch|check|verify|inspect|stat|lookup|probe|list|find)(?:_|$)",
+    re.IGNORECASE,
+)
+_NOT_FOUND_ERR_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:not_found|not\s+found|enoent|no\s+such\s+file|does\s+not\s+exist|"
+    r"no\s+\w+\s+with\s+that\s+id|missing|unpersisted|404)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> ToolReceipt | None:
+    """Detect read-back/probe receipts reporting missing or unpersisted state."""
+    saw_ok_mutation = False
+    for rcpt in receipts:
+        if rcpt.ok and rcpt.executed and not _READBACK_TOOL_RE.search(rcpt.tool):
+            saw_ok_mutation = True
+        if rcpt.ok and rcpt.executed and rcpt.output.strip()[:1] == "{":
+            with contextlib.suppress(Exception):
+                parsed = json.loads(rcpt.output)
+                if isinstance(parsed, Mapping):
+                    for key in ("exists", "found", "persisted", "present"):
+                        if parsed.get(key) is False:
+                            return rcpt
+                    status_val = str(parsed.get("status") or "").strip().lower()
+                    if status_val in {"not_found", "missing", "absent", "unpersisted"}:
+                        return rcpt
+        if (
+            saw_ok_mutation
+            and rcpt.executed
+            and not rcpt.ok
+            and _READBACK_TOOL_RE.search(rcpt.tool)
+            and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}")
+        ):
+            return rcpt
+    return None
 
 
 @dataclass(frozen=True)
@@ -727,7 +772,7 @@ class OutputValueGuard:
         self,
         *,
         nli_verifier: OpenVINONLIVerifier | None = None,
-        use_nli: bool = True,
+        use_nli: bool = False,
         nli_contradiction_threshold: float = 0.80,
         device: str | None = None,
         warn_on_missing: bool = False,
@@ -1572,14 +1617,43 @@ class ReceiptSupervisor:
                     )
                 )
 
+        # Check read-back / state-probe receipts reporting missing/unpersisted state
+        neg_persist = _find_negative_persistence_readback(receipts)
+        if (
+            neg_persist is not None
+            and not unsupported_claims
+            and not _HEDGE_OR_NEGATION_RE.search(narration)
+            and _CLAUSE_ACTION_OR_STATE_SIGNAL_RE.search(narration)
+        ):
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="NOT_PERSISTED_READBACK",
+                    reason=(
+                        f"Read-back receipt '{neg_persist.tool}' reported missing/unpersisted "
+                        "state contradicting assistant success narration."
+                    ),
+                )
+            )
+
         is_ok = (
             len(unsupported_claims) == 0
             and (not self.flag_unfulfilled_promises or len(unfulfilled) == 0)
             and (not flag_undisc or len(undisclosed) == 0)
         )
+        if not is_ok:
+            v_status = "contradicted"
+        elif any(r.evidence_tier == "probe_unobservable" for r in receipts):
+            v_status = "unverifiable"
+        else:
+            v_status = "verified"
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return SupervisionVerdict(
             is_valid=is_ok,
+            verdict_status=v_status,
             device=self.active_device,
             latency_ms=elapsed_ms,
             clauses_checked=len(prose_spans),

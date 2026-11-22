@@ -2,32 +2,51 @@
 
 <!-- mcp-name: io.github.AlienatedAliens/epistemic-guard -->
 
-Signed tool receipts, out-of-process stdio & Streamable HTTP MCP receipt proxies, Ed25519 memory write-gating, and RAG source deduplication for autonomous agents.  
-Runs locally on CPU or NPU (`0 MiB` GPU VRAM, **8.6 ms** per clause / **17.9 ms** median turn latency). Zero LLM API calls. MIT License.
+**Check what an AI agent claims it did against cryptographically signed receipts of what actually happened.**  
+`epistemic-guard` wraps any MCP server (`mcp-proxy` / `mcp-http-proxy`) or Claude Code / Codex session (`hook`) to emit Ed25519 + RFC 6962 Merkle tool receipts, optionally verifies local side effects out-of-band (`--probe-fs`, `--probe-git`, `--probe-sqlite`), and checks post-turn replies locally on CPU (`~8-11 ms`, `0 MiB` VRAM, zero LLM API fees, MIT License) with three-state verdicts (`verified`, `contradicted`, `unverifiable`). Optional modules add Ed25519 SQLite memory write-gating and RAG source deduplication.
 
-[Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks (`N=1,033`)](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
+[Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
+
+---
+
+## Quick Start (One Command)
+
+```bash
+pip install epistemic-guard
+epistemic-guard download-models   # optional ~227 MB OpenVINO INT8 pack (SHA-256 verified)
+epistemic-guard demo              # local 5-part showcase including live lying-server --probe-fs demo
+```
+
+Wrap an MCP server with out-of-process signed receipts + local disk verification, then check any reply:
+
+```bash
+epistemic-guard mcp-proxy --log receipts.jsonl --probe-fs . --pin-tools -- \
+  npx -y @modelcontextprotocol/server-filesystem .
+
+epistemic-guard verify-log receipts.jsonl \
+  --narration "I saved notes.txt and deleted staging.db." \
+  --flag-undisclosed --json
+```
+
+Or drop directly into **Claude Code / Codex** `PostToolUse` + `Stop` hooks (no MCP proxy required):
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "epistemic-guard hook post-tool --log .epistemic_guard/receipts.jsonl"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "epistemic-guard hook stop --log .epistemic_guard/receipts.jsonl --flag-undisclosed"}]}]
+  }
+}
+```
+*(Add `--enforce` on the `Stop` hook once calibrated on your traffic to block contradicted replies.)*
 
 ---
 
 ## What It Fixes
 
-1. **Phantom tool claims in assistant replies:** A tool threw an HTTP 500, failed schema validation before execution, or was never called, yet the model replies *"I refunded order #8821 and emailed the receipt."* Pre-execution firewalls do not catch this when no tool call occurred.
-2. **Memory self-poisoning and prompt injection:** Writing raw assistant replies or untrusted web text into long-term memory (`vector_db.add(assistant_reply)`) lets hallucinations and injected pages persist across sessions.
-3. **Syndicated RAG echo chambers:** Multiple retrieved URLs reprinting the same wire-service paragraph get counted as independent sources on medical, legal, or security queries.
-
----
-
-## Install
-
-```bash
-pip install epistemic-guard
-
-# Optional: download the 4-model OpenVINO INT8 pack (~227 MB download / ~279 MB unpacked, SHA-256 verified)
-epistemic-guard download-models
-
-# Run the local 4-part verification showcase
-epistemic-guard demo
-```
+1. **Phantom tool claims & lying servers:** A tool threw an HTTP 500, was never called, or returned `isError: false` without mutating disk/git/SQLite, yet the model replies *"I saved the file and deleted staging.db."* Pre-execution firewalls do not catch post-turn prose hallucinations.
+2. **Silent undisclosed mutations:** A prompt-injected or over-eager agent calls `send_email` or `delete_file` and omits it from its reply (`--flag-undisclosed`).
+3. **Optional modules (Memory self-poisoning & RAG echo chambers):** Ed25519 SQLite write-gating (`ProvenanceGate` + `SQLiteProvenanceStore`) rejects unsigned or `LLM_NARRATION` memory writes at the DB trigger layer, and `corroborate_sources` collapses syndicated wire-copy duplicates.
 
 ---
 
@@ -241,7 +260,7 @@ To test generalization outside coding/filesystem tools across **both** `Halluci-
 
 - **Honest trajectory & caveats (read before extrapolating):**
   - **Iteration history across our evaluations:** `Live-60` (`v0.5.2`, real stdio proxy): `38.24%` FPR (`13/34`) → `Live-Frontier-180 v1` (`2c7cc3e`, first SaaS test): `50.8%` FPR → `v2` (`fe72761`, open-vocab grounding): `8.3%` FPR → `v3` (`0912019`, Stage-2 NLI): `5.1%` FPR → `Live-Frontier-360` (`d7128fb`): `0.46%` FPR. This benchmark is **synthetic, author-taxonomized, and saturated at parity** (`357/360` vs `claude-haiku-5.5` `357/360`; `321/324` vs `gpt-5.6-sol` `323/324` on the 324 non-undisclosed turns, where `gpt-5.6-sol` missed `9/36` on `undisclosed_mutation`). Also note that the underlying `nli_int8` checkpoint scores `73.3%` (`88/120`) on its own blinded cross-domain holdout (`nli_holdout_120`), so `99.17%` here reflects controlled synthetic fault injection, not a universal production guarantee.
-  - **External unlabeled traces (`Exgentic/agent-llm-traces-v2`):** Across `30` real `AppWorld`/`claude_code` OpenTelemetry sessions (`223` multi-turn replies, `487` tools) on Hugging Face, `epistemic-guard` flagged **`0/223` turns** (`0.54 ms` p50 — Stage-2 NLI rarely triggered because planning clauses lacked action claims). Because `Exgentic` has no human ground-truth labels and a `gpt-4.1-mini` auto-auditor flagged `14/60` sampled turns, treat `0/223` strictly as an **unlabeled flag rate**, not a proven false-positive or recall rate.
+  - **External unlabeled traces (`Exgentic/agent-llm-traces-v2`):** Across `30` real `AppWorld`/`claude_code` OpenTelemetry sessions (`223` multi-turn replies, `487` tools) on Hugging Face, `epistemic-guard` flagged **`0/223` turns** (`0.54 ms` p50; Stage-2 NLI rarely triggered because planning clauses lacked action claims). Because `Exgentic` has no human ground-truth labels and a `gpt-4.1-mini` auto-auditor flagged `14/60` sampled turns, treat `0/223` strictly as an **unlabeled flag rate**, not a proven false-positive or recall rate.
 - **Out-of-process local effect probes (`--probe-fs`, `--probe-git`, `--probe-sqlite`) & preconditions:** `mcp-proxy` takes read-only before/after snapshots outside the MCP server's trust domain (`stat` + SHA-256 for files; `--no-optional-locks -c core.fsmonitor=false` `HEAD`/`symbolic-ref`/`for-each-ref`/`status`/`diff`/`stash` for Git; file/WAL `stat` + SHA-256 + `schema_version` for SQLite) and emits three-state outcomes (`independently_verified`, `effect_contradicted`, or `probe_unobservable`). Supported scope: synchronous local mutations inside the probed workspace/repo/DB; does not cover async/queued jobs, concurrent writers, remote HTTP servers, or legitimate 0-row SQL `UPDATE`s.
 - **Recommended rollout:** Run the deterministic proxy, Merkle log, and `--probe-fs` in enforcement/audit mode, and run `ReceiptSupervisor` in **shadow/flag mode** until calibrated on your own production traffic.
 
@@ -249,29 +268,47 @@ To test generalization outside coding/filesystem tools across **both** `Halluci-
 
 ## Threat Model & Non-Goals
 
-`epistemic-guard` is a **signed-evidence MCP proxy plus a lightweight statistical prose checker**, not a sandbox or full enterprise firewall.
+`epistemic-guard` is a **signed-evidence MCP proxy / hook recorder plus a lightweight statistical prose checker**, not a sandbox or full enterprise firewall.
 
 - **What signed receipts prove:** `mcp-proxy` and `mcp-http-proxy` prove what JSON-RPC request/response crossed the MCP wire, which tool definition (`tool_definition_sha256` + `endpoint_id`) was active, and that the append-only RFC 6962 Merkle log has not been tampered with or reordered.
-- **What signed receipts do NOT prove:** They do not prove that a buggy or malicious upstream MCP server actually mutated external state after returning `200 OK` / `isError: false`. Checking real side effects out-of-band (e.g., local filesystem `stat`/hash probes) is planned for `v0.7`.
-- **Statistical checker & enforcement boundary:** `ReceiptSupervisor` is a probabilistic classifier over signed receipts, not a formal proof. If an agent process bypasses `ReceiptSupervisor` or streams unbuffered tokens directly to the user before `verify_narration()` runs, the proxy log still records ground-truth tool execution, but the user may already have seen an unverified claim. Recommended rollout: run the deterministic proxy and Merkle log in enforcement mode immediately, and run `ReceiptSupervisor` in **flag/shadow mode** until calibrated to your real-traffic false-positive tolerance.
+- **What out-of-process local effect probes (`--probe-fs`, `--probe-git`, `--probe-sqlite`) prove:** For synchronous local mutations inside the probed workspace, Git repository, or SQLite DB, `mcp-proxy` takes read-only before/after snapshots outside the MCP server's trust domain and signs `evidence_tier` (`independently_verified`, `effect_contradicted`, or `probe_unobservable`) into the receipt. Remote HTTP/SaaS tools, async/queued jobs, concurrent writers, and legitimate 0-row SQL `UPDATE`s remain `server_reported` or `probe_unobservable`.
+- **Statistical checker & enforcement boundary:** `ReceiptSupervisor` is a probabilistic classifier over signed receipts, not a formal proof, emitting three-state verdicts (`verified`, `contradicted`, `unverifiable`). If an agent streams unbuffered tokens directly to the user before `verify_narration()` runs, the proxy log still records ground-truth execution, but the user may already have seen an unverified claim. Recommended rollout: run the deterministic proxy, Merkle log, and `--probe-fs` in enforcement/audit mode immediately, and run `ReceiptSupervisor` (or `hook stop`) in **shadow/flag mode** until calibrated to your real-traffic false-positive tolerance.
 - **OS key isolation:** Keep `--key-file` (and `--pubkey-file` during `verify-log`) outside directories writable by the untrusted agent or child MCP server; run the proxy under a separate OS user or container on shared hosts.
 
 ---
 
-## Ecosystem Comparison & Disclosures
+## Ecosystem Comparison & Head-to-Head (`agent-claimcheck`)
 
-- **OWASP Top 10 for Agentic Applications (2026) coverage:**
-  - **`ASI02` (Tool Misuse & Phantom Execution):** `mcp-proxy`, `@recorder.tool`, and `ReceiptSupervisor` check assistant prose against signed `ToolReceipt` logs (`executed`, `ok`, `error_code`) so unexecuted or failed tool calls are flagged when reported as completed.
+### Direct Peer & Adjacent-Layer Landscape
+
+| Project | License | Layer / Integration | Signed Receipts & Tamper Log | Out-of-Band Local Effect Probes | Post-Turn Free-Prose Check | Three-State Verdict | Memory Write-Gate / RAG Dedup |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`epistemic-guard`** | **MIT** | **Out-of-process MCP stdio/HTTP proxy, Claude Code/Codex hooks, Python SDK** | **Ed25519 + RFC 6962 Merkle + AER-1** | **Yes (`--probe-fs`, `--probe-git`, `--probe-sqlite`)** | **Yes (CPU INT8 + Stage-2 NLI, ~8–11 ms)** | **Yes (`verified` / `contradicted` / `unverifiable`)** | **Yes (Ed25519 SQLite + RAG wire dedup)** |
+| **[`agent-claimcheck`](https://github.com/B0yko/agent-claimcheck)** | Apache-2.0 | Offline/trace verifier & `cascade-offline` classifier | No | Consumes trace `state_probe` steps | Yes (rule + trained cascade) | Yes (`allow` / `block` / `review`) | No |
+| **[`veridict`](https://github.com/veridict-dev/veridict)** | MIT | Alpha CI gate over declared artifacts | No | Checks declared CI artifacts | No (declared claims only) | Yes | No |
+| **[`Cruxial`](https://github.com/cruxial-ai/cruxial)** | MIT | In-process Python regex wrapper | No | No | Regex-only | No | No |
+| **[`claimproof`](https://github.com/claimproof/claimproof)** | MIT | Claude Code `Stop` hook | No | No | Yes | No | No |
+| **`TruthGuard`** | Source-available | Claude Code / Gemini CLI file-checksum hooks | No | Local file checksums | Hook-based | No | No |
+| **[`Pipelock`](https://github.com/pipelab-org/pipelock)** | Apache-2.0 | Go egress & Streamable HTTP MCP firewall | Ed25519 action receipts + `tools/list` pinning | No | No (pre-execution / wire firewall) | No | No |
+| **[`hol-guard`](https://github.com/hashgraph-online/hol-guard)** | Apache-2.0 | Pre-execution agent/MCP policy firewall | Policy logs | No | No (pre-execution) | No | No |
+| **[`NabaOS`](https://github.com/nabaos/nabaos)** | Apache-2.0 | Rust agent runtime (`arXiv:2603.10060`) | HMAC receipts (symmetric) | No | Cooperative receipt-ID tags | No | No |
+
+### External Benchmark Cross-Check: `B0yko/agent-claimcheck` (`benchmark/v1/traces.test.jsonl`, `N=120`)
+
+To test generalization on an independently authored third-party benchmark we did not design, we evaluated `epistemic-guard` on `agent-claimcheck`'s public `v1` test split (`120` traces: `72` clean, `48` injected failures across `phantom_action`, `error_ignored`, `wrong_target`, `wrong_value`, `not_persisted`, `partial_completion`, `reviewer_injection`):
+
+- **Pre-fix zero-shot (`b420b5d`, default `verify_output_values=False`):** `90/120 (75.0%)` accuracy, `19/48 (39.6%)` failures caught (`phantom_action 6/7`, `error_ignored 4/7`, `reviewer_injection 4/6`), **`1/72 (1.4%)` false alarms** at `7.47 ms` p50 CPU. (Enabling `verify_output_values=True` on `b420b5d` caught `27/48` including `wrong_target 5/7` and `reviewer_injection 6/6`, but caused `17/72 (23.6%)` false alarms because experimental MNLI-over-JSON-leaves misfired on `key: value` fragments.)
+- **Post-fix (`v0.6.5-dev`, disabling experimental MNLI-over-JSON by default in `OutputValueGuard` + adding general read-back negative-persistence detection):** `92/120 (76.7%)` accuracy, `21/48 (43.8%)` failures caught (`phantom_action 6/7`, `reviewer_injection 5/6`, `error_ignored 4/7`, `wrong_target 3/7`, `partial_completion 2/7`, `not_persisted 1/7`), **`1/72 (1.4%)` false alarms** at `8.2 ms` p50 CPU for both default and `verify_output_values=True`.
+- **Honest comparison vs `agent-claimcheck` `cascade-offline`:** `agent-claimcheck`'s own `cascade-offline` (trained on its 180-trace `v1` train split) catches `41/48` (`0/72` FP, routing `11/120` traces to human `review`), achieving substantially higher recall on subtle `wrong_value`, `not_persisted`, and `partial_completion` domain traces where our untuned model abstains. `epistemic-guard` trades lower recall on unseen domain-specific value/state schemas for `1.4%` FPR at 100% coverage without domain training, plus the out-of-process Ed25519/Merkle MCP proxy, `--probe-fs`/`--probe-git`/`--probe-sqlite` disk/git/SQLite verification, and native hooks.
+
+### OWASP Coverage & Disclosures
+
+- **OWASP Top 10 for Agentic Applications (2026):**
+  - **`ASI02` (Tool Misuse & Phantom Execution):** `mcp-proxy`, `hook`, `@recorder.tool`, and `ReceiptSupervisor` check assistant prose against signed `ToolReceipt` logs (`executed`, `ok`, `error_code`, `evidence_tier`).
   - **`ASI06` (Memory & Context Poisoning):** `ProvenanceGate` and `SQLiteProvenanceStore` reject unsigned writes and `LLM_NARRATION` at the database trigger layer, and `corroborate_sources` collapses syndicated wire/Sybil echoes before synthesis.
   - **`ASI08` (Cascading Hallucinations Across Trust Boundaries):** Append-only RFC 6962 Merkle logs and optional `AER-1` receipt export preserve verifiable provenance across multi-agent and MCP boundaries.
-- **Scope vs adjacent projects & literature:**
-  - **[NabaOS](https://github.com/nabaos/nabaos) (`arXiv:2603.10060`):** Rust agent runtime using HMAC-signed tool receipts, cooperative receipt-ID claim tagging (reporting `94.2%` on synthetic fabricated receipt-ID injection), and URL/computation cross-checking. `epistemic-guard` differs by using asymmetric `Ed25519` + `RFC 6962` Merkle logs in a separate OS process (public-key-only verification), wrapping unmodified MCP servers as a standalone `pip` package, checking plain uncooperative prose without receipt-ID tags, and adding an Ed25519 SQLite memory write-gate.
-  - **[Pipelock](https://github.com/pipelab-org/pipelock):** Go egress/MCP proxy covering SSRF/exfiltration, content injection scanning, `tools/list` SHA-256 drift/rug-pull detection, and Ed25519 action receipts over Streamable HTTP. `epistemic-guard` overlaps on MCP proxy receipts and `tools/list` pinning, and adds post-turn prose-vs-receipt checking, Ed25519 SQLite memory write-gating, and syndicated RAG wire-copy deduplication in Python (`0 MiB` VRAM).
-  - **`Halluci-Action` (Mao et al., NeurIPS 2026 Workshop):** Offline evaluation framework measuring bidirectional claim-vs-action misalignment across `2,843` enterprise trajectories (Odoo / AppWorld; peak `45.9%` Halluci-Action Rate, `>50%` of goal-complete trajectories affected). `epistemic-guard` targets runtime detection of the phantom-claim direction (with unrequested-mutation checks scoped for `v0.7`).
-  - **Pre-execution firewalls (`NeMo Guardrails`, `LlamaFirewall`, `Guardrails AI`):** Gate inputs and tool calls *before* execution; `epistemic-guard` checks post-execution assistant prose against signed `ToolReceipt` records.
-  - **RAG faithfulness (`Vectara HHEM`, `Bespoke-MiniCheck`, `Patronus Lynx`):** Score summary-to-chunk entailment (`epistemic-guard` has not been benchmarked on RAG summarization leaderboards).
-  - **Receipt formats (`AER-1`):** Portable hash-committed tool-receipt envelope; `epistemic-guard` signs receipts locally with Ed25519 (`mcp-proxy`, `mcp-http-proxy`, or `@recorder.tool`), supports optional `AER-1` import/export (`--aer1`), and checks assistant prose against those receipts.
-- **Disclosures:** Neural models are English-only. Benchmarks ran on a single workstation; pre-registrations use git + OpenTimestamps SHA-256 locks ([dataset & `.ots` proofs](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)), $\kappa$ agreement figures come from blinded LLM raters rather than human crowdworkers, and positive cases in `Live-Frontier-180` use prompted roleplay faults. Next validation step for `v0.7`: natural unprompted multi-turn enterprise trajectories (`N >= 500`), receipt-conditioned cross-encoder NLI, and local filesystem `EffectProbe` verification.
+- **Literature & adjacent tools:** `Halluci-Action` (Mao et al., NeurIPS 2026 Workshop) measures bidirectional claim-vs-action misalignment offline across `2,843` enterprise trajectories (`epistemic-guard` implements runtime detection for both phantom completion claims and silent `--flag-undisclosed` mutations). Pre-execution firewalls (`NeMo Guardrails`, `LlamaFirewall`, `Guardrails AI`) gate inputs before execution; RAG faithfulness models (`Vectara HHEM`, `Bespoke-MiniCheck`, `Patronus Lynx`) score summary-to-chunk entailment.
+- **Disclosures:** Neural models are English-only. Benchmarks ran on a single workstation; v0.3.0 pre-registrations use git + OpenTimestamps SHA-256 locks ([dataset & `.ots` proofs](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks)), $\kappa$ agreement figures come from blinded LLM raters rather than human crowdworkers, and positive cases in `Live-Frontier-180` / `Live-Frontier-360` use synthetic prompted roleplay faults (not human-labeled production traces). Next validation step: natural unprompted multi-turn enterprise trajectories (`N >= 500`) with human-audited labels and a receipt-conditioned cross-encoder.
 
 ---
 
