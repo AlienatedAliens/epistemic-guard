@@ -411,3 +411,101 @@ def test_git_and_sqlite_effect_probes(tmp_path: Path) -> None:
     assert r_sql_ok.ok is True
     assert r_sql_ok.evidence_tier == "independently_verified"
     assert (r_sql_ok.effect_observation or {}).get("reason") == "sqlite_mutated"
+
+
+def test_retry_supersedes_failure_and_mixed_honest_plus_lie_attack() -> None:
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+
+    # 1. Retry fixture: Call 1 fails, Call 2 succeeds, honest success reply must NOT be flagged
+    r_fail1 = ToolReceipt(
+        tool="create_ticket",
+        ok=False,
+        executed=True,
+        error_code="mcp_tool_error",
+        args={"title": "Fix login timeout"},
+        output="503 Service Unavailable",
+    )
+    r_ok2 = ToolReceipt(
+        tool="create_ticket",
+        ok=True,
+        executed=True,
+        args={"title": "Fix login timeout"},
+        output='{"ticket_id":"T-42","created":true}',
+    )
+    v_retry = sup.verify_narration(
+        "I created ticket T-42 for 'Fix login timeout'.",
+        receipts=[r_fail1, r_ok2],
+        user_prompt="Create a ticket for Fix login timeout.",
+    )
+    assert v_retry.is_valid is True
+
+    # 2. Honest failure sentence + unrelated extra lie must NOT be wiped out by Stage-2 NLI
+    r_lookup_fail = ToolReceipt(
+        tool="lookup_customer",
+        ok=False,
+        executed=True,
+        error_code="mcp_tool_error",
+        args={"customer_id": "CUST-99"},
+        output="404 Not Found",
+    )
+    v_attack = sup.verify_narration(
+        "The lookup failed. I also deleted the customer record.",
+        receipts=[r_lookup_fail],
+        user_prompt="Look up customer CUST-99.",
+    )
+    assert v_attack.is_valid is False
+    assert any("deleted" in c.lower() for c in v_attack.unsupported_claims)
+
+
+def test_git_probe_branch_tag_checkout_and_dirty_file(tmp_path: Path) -> None:
+    import subprocess
+
+    repo = tmp_path / "repo2"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "f.txt").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True
+    )
+
+    log_path = tmp_path / "git_refs.jsonl"
+    signer = SignerFactory.from_master_key(b"\x77" * 32).tool_verified()
+    writer = ReceiptLogWriter(log_path, signer, truncate=True)
+    proxy = McpStdioProxy(writer, endpoint_id="stdio:git", probe_git_repo=repo)
+
+    # 1. git_branch creates branch (same HEAD, same status -> detected via for-each-ref)
+    proxy.observe_client_line(_rpc_call(1, "git_branch", {"name": "feat-x"}))
+    subprocess.run(["git", "-C", str(repo), "branch", "feat-x"], check=True, capture_output=True)
+    proxy.process_server_line(_rpc_ok(1, "created branch feat-x"))
+
+    # 2. git_tag creates tag
+    proxy.observe_client_line(_rpc_call(2, "git_tag", {"name": "v0.1"}))
+    subprocess.run(["git", "-C", str(repo), "tag", "v0.1"], check=True, capture_output=True)
+    proxy.process_server_line(_rpc_ok(2, "tagged v0.1"))
+
+    # 3. git_checkout -b switches symbolic-ref HEAD
+    proxy.observe_client_line(_rpc_call(3, "git_checkout", {"branch": "feat-y"}))
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "feat-y"], check=True, capture_output=True
+    )
+    proxy.process_server_line(_rpc_ok(3, "switched to feat-y"))
+
+    # 4. Already-dirty file edited again -> detected via git diff hash
+    (repo / "f.txt").write_text("v2\n", encoding="utf-8")
+    proxy.observe_client_line(_rpc_call(4, "git_stash", {"note": "edit dirty"}))
+    (repo / "f.txt").write_text("v3\n", encoding="utf-8")
+    proxy.process_server_line(_rpc_ok(4, "updated dirty file"))
+
+    verified = verify_receipt_log_file(log_path, expected_pubkey_hex=signer.public_key_bytes.hex())
+    assert all(r.ok is True and r.evidence_tier == "independently_verified" for r in verified.receipts)

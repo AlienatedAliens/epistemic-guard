@@ -297,42 +297,61 @@ _SQLITE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 _SQLITE_MUTATING_QUERY_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from|drop\s+(?:table|index|view)|"
-    r"create\s+(?:table|index|view)|alter\s+table|replace\s+into|upsert|truncate)\b",
+    r"\b(?:insert\s+(?:or\s+\w+\s+)?into|update\s+(?:or\s+\w+\s+)?\w+\s+set|delete\s+from|"
+    r"drop\s+(?:table|index|view)|create\s+(?:table|index|view)|alter\s+table|"
+    r"replace\s+into|upsert|truncate)\b",
     re.IGNORECASE,
 )
+_SQLITE_QUERY_ARG_KEYS: Final[tuple[str, ...]] = ("query", "sql", "statement", "command")
 
 
 def _snapshot_git_repo(repo_path: Path) -> dict[str, Any]:
-    """Read-only git HEAD + porcelain status snapshot outside the MCP server's trust domain."""
-    head = ""
-    status_sha = ""
-    ok = False
+    """Read-only git HEAD, refs, status, diff, and stash snapshot outside the server's trust."""
     git_bin = shutil.which("git")
     if git_bin is None:
-        return {"ok": False, "head": "", "status_sha256": ""}
+        return {"ok": False}
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    base_cmd = [git_bin, "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(repo_path)]
+
+    def _run_git(extra: list[str]) -> tuple[int, str]:
+        res = subprocess.run(
+            [*base_cmd, *extra],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+            env=env,
+        )
+        return (int(res.returncode), res.stdout)
+
     try:
-        r_head = subprocess.run(
-            [git_bin, "-C", str(repo_path), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
-        r_stat = subprocess.run(
-            [git_bin, "-C", str(repo_path), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
-        if r_stat.returncode == 0:
-            ok = True
-            head = r_head.stdout.strip() if r_head.returncode == 0 else ""
-            status_sha = hashlib.sha256(r_stat.stdout.encode("utf-8")).hexdigest()[:16]
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return {"ok": ok, "head": head, "status_sha256": status_sha}
+        rc_head, out_head = _run_git(["rev-parse", "HEAD"])
+        rc_sym, out_sym = _run_git(["symbolic-ref", "-q", "HEAD"])
+        rc_stat, out_stat = _run_git(["status", "--porcelain"])
+        rc_refs, out_refs = _run_git(["for-each-ref", "--format=%(refname) %(objectname)"])
+        rc_diff, out_diff = _run_git(["diff"])
+        rc_stash, out_stash = _run_git(["stash", "list"])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {"ok": False}
+
+    if rc_stat != 0 or rc_refs != 0:
+        return {"ok": False}
+
+    def _h(s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    return {
+        "ok": True,
+        "head": out_head.strip() if rc_head == 0 else "",
+        "symbolic_ref": out_sym.strip() if rc_sym == 0 else "",
+        "status_sha256": _h(out_stat),
+        "refs_sha256": _h(out_refs),
+        "diff_sha256": _h(out_diff) if rc_diff == 0 else "",
+        "stash_sha256": _h(out_stash) if rc_stash == 0 else "",
+    }
 
 
 def _arm_git_probe(repo_path: Path, tool_name: str) -> tuple[Path, dict[str, Any]] | None:
@@ -344,12 +363,24 @@ def _arm_git_probe(repo_path: Path, tool_name: str) -> tuple[Path, dict[str, Any
 
 def _evaluate_git_probe(
     repo_path: Path, before: Mapping[str, Any]
-) -> tuple[bool, dict[str, Any]]:
+) -> tuple[bool | None, dict[str, Any]]:
+    """Three-state git evaluation: True (verified), False (contradicted), None (unobservable)."""
     after = _snapshot_git_repo(repo_path)
-    changed = bool(after.get("ok")) and (
-        before.get("head") != after.get("head")
-        or before.get("status_sha256") != after.get("status_sha256")
-    )
+    if not after.get("ok"):
+        return (
+            None,
+            {
+                "observer": "epistemic_guard.mcp_proxy.git_probe",
+                "kind": "git",
+                "target_path": str(repo_path),
+                "before": dict(before),
+                "after": after,
+                "verified": None,
+                "reason": "git_probe_unobservable",
+            },
+        )
+    keys = ("head", "symbolic_ref", "status_sha256", "refs_sha256", "diff_sha256", "stash_sha256")
+    changed = any(before.get(k) != after.get(k) for k in keys)
     reason = "git_state_mutated" if changed else "git_state_unchanged_after_ok"
     return (
         changed,
@@ -366,16 +397,17 @@ def _evaluate_git_probe(
 
 
 def _snapshot_sqlite_db(db_path: Path) -> dict[str, Any]:
-    """Read-only SQLite snapshot (`PRAGMA data_version` + DB/WAL stat)."""
-    snap: dict[str, Any] = {"exists": db_path.exists()}
+    """Read-only SQLite snapshot (file/WAL stat + sha256 + schema_version)."""
     if not db_path.exists():
-        return snap
+        return {"ok": False, "exists": False}
+    snap: dict[str, Any] = {"ok": True, "exists": True}
     try:
         st = db_path.stat()
         snap["size"] = int(st.st_size)
         snap["mtime_ns"] = int(st.st_mtime_ns)
+        snap["sha256"] = _stat_and_hash_file(db_path).get("sha256", "")
     except OSError:
-        pass
+        return {"ok": False, "exists": True}
     wal_p = Path(f"{db_path}-wal")
     if wal_p.exists():
         with contextlib.suppress(OSError):
@@ -385,13 +417,9 @@ def _snapshot_sqlite_db(db_path: Path) -> dict[str, Any]:
     try:
         uri = f"{db_path.resolve().as_uri()}?mode=ro"
         with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as conn:
-            row = conn.execute("PRAGMA data_version").fetchone()
-            if row:
-                snap["data_version"] = int(row[0])
             chg = conn.execute("PRAGMA schema_version").fetchone()
             if chg:
                 snap["schema_version"] = int(chg[0])
-            snap["sha256"] = _stat_and_hash_file(db_path).get("sha256", "")
     except (sqlite3.Error, OSError, ValueError):
         pass
     return snap
@@ -404,21 +432,39 @@ def _arm_sqlite_probe(
 ) -> tuple[Path, dict[str, Any]] | None:
     if not _SQLITE_TOOL_RE.search(tool_name):
         return None
-    joined_args = " ".join(str(v) for v in args.values())
-    if not _SQLITE_MUTATING_QUERY_RE.search(joined_args):
+    query_texts = [
+        str(args[k]) for k in _SQLITE_QUERY_ARG_KEYS if k in args and isinstance(args[k], str)
+    ]
+    if not query_texts:
+        return None
+    if not any(_SQLITE_MUTATING_QUERY_RE.search(q) for q in query_texts):
         return None
     snap = _snapshot_sqlite_db(db_path)
-    return (db_path, snap) if snap.get("exists") else None
+    return (db_path, snap) if snap.get("ok") else None
 
 
 def _evaluate_sqlite_probe(
     db_path: Path, before: Mapping[str, Any]
-) -> tuple[bool, dict[str, Any]]:
+) -> tuple[bool | None, dict[str, Any]]:
+    """Three-state SQLite evaluation: True (verified), False (contradicted), None (unobservable)."""
     after = _snapshot_sqlite_db(db_path)
-    changed = any(
-        before.get(k) != after.get(k)
-        for k in ("size", "mtime_ns", "wal_size", "wal_mtime_ns", "schema_version", "sha256")
-    )
+    if not after.get("ok"):
+        return (
+            None,
+            {
+                "observer": "epistemic_guard.mcp_proxy.sqlite_probe",
+                "kind": "sqlite",
+                "target_path": str(db_path),
+                "before": dict(before),
+                "after": after,
+                "verified": None,
+                "reason": "sqlite_probe_unobservable",
+            },
+        )
+    compare_keys = ["size", "mtime_ns", "wal_size", "wal_mtime_ns", "sha256"]
+    if "schema_version" in before and "schema_version" in after:
+        compare_keys.append("schema_version")
+    changed = any(before.get(k) != after.get(k) for k in compare_keys)
     reason = "sqlite_mutated" if changed else "sqlite_unchanged_after_ok"
     return (
         changed,
@@ -1512,7 +1558,7 @@ class McpStdioProxy:
             or self._probe_sqlite_path is not None
         )
         if ok:
-            probe_result: tuple[bool, dict[str, Any]] | None = None
+            probe_result: tuple[bool | None, dict[str, Any]] | None = None
             if pending.fs_probe is not None:
                 exp_op, target_path, before_snap = pending.fs_probe
                 probe_result = _evaluate_fs_probe(exp_op, target_path, before_snap)
@@ -1525,7 +1571,7 @@ class McpStdioProxy:
 
             if probe_result is not None:
                 verified, obs = probe_result
-                if verified:
+                if verified is True:
                     return ToolReceipt(
                         call_id=pending.call_id,
                         tool=pending.tool,
@@ -1537,6 +1583,20 @@ class McpStdioProxy:
                         tool_definition_sha256=pending.tool_def_sha256,
                         endpoint_id=self._endpoint_id,
                         evidence_tier="independently_verified",
+                        effect_observation=obs,
+                    )
+                if verified is None:
+                    return ToolReceipt(
+                        call_id=pending.call_id,
+                        tool=pending.tool,
+                        ok=True,
+                        executed=True,
+                        error_code="",
+                        args=pending.args,
+                        output=output_text,
+                        tool_definition_sha256=pending.tool_def_sha256,
+                        endpoint_id=self._endpoint_id,
+                        evidence_tier="probe_unobservable",
                         effect_observation=obs,
                     )
                 return ToolReceipt(

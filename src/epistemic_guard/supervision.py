@@ -1296,7 +1296,13 @@ class ReceiptSupervisor:
             output_guard = self._output_guard
 
         ok_receipts = [r for r in receipts if r.ok and r.executed]
-        failed_receipts = [r for r in receipts if not (r.ok and r.executed)]
+        ok_tools_succeeded = {r.tool.lower() for r in ok_receipts}
+        # Exclude failed attempts that were superseded by a later successful retry of the same tool
+        failed_receipts = [
+            r
+            for r in receipts
+            if not (r.ok and r.executed) and r.tool.lower() not in ok_tools_succeeded
+        ]
         family_counts: dict[str, int] = {}
         raw_spans = split_into_clauses_with_spans(masked)
         prose_spans: list[tuple[str, int, int]] = []
@@ -1439,8 +1445,37 @@ class ReceiptSupervisor:
                             narration, "The requested operation succeeded."
                         )
                         if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
-                            unsupported_claims.clear()
-                            unsupported_spans.clear()
+                            # Only clear spans whose claimed action plausibly refers to a failed
+                            # receipt (never wipe out an unrelated unexecuted action claim like
+                            # "The lookup failed. I also deleted the customer record.").
+                            kept_claims: list[str] = []
+                            kept_spans: list[UnsupportedClaimSpan] = []
+                            for sp in unsupported_spans:
+                                fam_matches_failed = any(
+                                    _receipt_matches_family(
+                                        fr,
+                                        sp.claimed_family,
+                                        extra_stems=self._extra_tool_stems,
+                                        custom_tool_families=self._custom_tool_families,
+                                    )
+                                    or any(
+                                        len(str(v).strip()) >= 4
+                                        and str(v).strip().lower() in sp.text.lower()
+                                        for v in fr.args.values()
+                                    )
+                                    for fr in failed_receipts
+                                )
+                                sp_nli = self._discourse_nli.infer_pair(
+                                    sp.text, "The requested operation succeeded."
+                                )
+                                if fam_matches_failed or (
+                                    sp_nli.contradiction >= 0.50 and sp_nli.entailment < 0.10
+                                ):
+                                    continue
+                                kept_spans.append(sp)
+                                kept_claims.append(sp.text)
+                            unsupported_claims = kept_claims
+                            unsupported_spans = kept_spans
                     elif need_paraphrase_check:
                         nli_res = self._discourse_nli.infer_pair(
                             narration, "The action failed."
