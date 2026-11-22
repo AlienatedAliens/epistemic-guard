@@ -217,6 +217,7 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             prev_log_path=args.prev_log,
             prev_pubkey_file=args.prev_pubkey_file,
+            probe_fs_root=args.probe_fs,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
@@ -531,6 +532,14 @@ def main(argv: list[str] | None = None) -> int:
         "--prev-pubkey-file",
         default=None,
         help="Optional public key file pinning --prev-log during key rotation",
+    )
+    mp.add_argument(
+        "--probe-fs",
+        default=None,
+        help=(
+            "Workspace root directory for independent out-of-process read-only filesystem "
+            "effect probes (catches silent no-op write/delete servers returning isError: false)"
+        ),
     )
     mp.add_argument(
         "server_cmd",

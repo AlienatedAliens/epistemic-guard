@@ -156,6 +156,132 @@ class _PendingToolCall:
     tool: str
     args: dict[str, str | int | float | bool]
     tool_def_sha256: str = ""
+    fs_probe: tuple[str, Path, dict[str, Any]] | None = None
+
+
+_FS_WRITE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:write|save|create|edit|update|append|patch|put)(?:_|$)",
+    re.IGNORECASE,
+)
+_FS_DELETE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:delete|remove|unlink|rm|erase)(?:_|$)",
+    re.IGNORECASE,
+)
+_FS_PATH_ARG_KEYS: Final[tuple[str, ...]] = (
+    "path",
+    "file_path",
+    "filepath",
+    "filename",
+    "target_path",
+    "destination",
+)
+_FS_MAX_HASH_BYTES: Final[int] = 16 * 1024 * 1024
+
+
+def _stat_and_hash_file(
+    target: Path, *, max_hash_bytes: int = _FS_MAX_HASH_BYTES
+) -> dict[str, Any]:
+    """Read-only filesystem snapshot independent of any MCP server response."""
+    try:
+        st = target.stat()
+    except OSError:
+        return {"exists": False}
+    snap: dict[str, Any] = {
+        "exists": True,
+        "is_dir": target.is_dir(),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+    if target.is_file() and st.st_size <= max_hash_bytes:
+        h = hashlib.sha256()
+        try:
+            with target.open("rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            snap["sha256"] = h.hexdigest()
+        except OSError:
+            pass
+    return snap
+
+
+def _arm_fs_probe(
+    root: Path,
+    tool_name: str,
+    args: Mapping[str, str | int | float | bool],
+) -> tuple[str, Path, dict[str, Any]] | None:
+    """Arm an out-of-process filesystem effect probe if `tool_name` targets a path under `root`."""
+    expected_op: str | None = None
+    if _FS_DELETE_TOOL_RE.search(tool_name):
+        expected_op = "delete"
+    elif _FS_WRITE_TOOL_RE.search(tool_name):
+        expected_op = "write"
+    if expected_op is None:
+        return None
+
+    raw_path: str | None = None
+    for key in _FS_PATH_ARG_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            raw_path = val.strip()
+            break
+    if raw_path is None:
+        return None
+
+    try:
+        root_resolved = root.resolve()
+        candidate = Path(raw_path)
+        target_resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (root_resolved / candidate).resolve()
+        )
+        if not target_resolved.is_relative_to(root_resolved):
+            return None
+    except (OSError, ValueError):
+        return None
+
+    return (expected_op, target_resolved, _stat_and_hash_file(target_resolved))
+
+
+def _evaluate_fs_probe(
+    expected_op: str,
+    target_path: Path,
+    before: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Compare post-call disk state against pre-call snapshot independently of server output."""
+    after = _stat_and_hash_file(target_path)
+    if expected_op == "write":
+        if not after.get("exists"):
+            verified, reason = False, "file_missing_after_write"
+        elif (
+            before.get("exists")
+            and before.get("size") == after.get("size")
+            and before.get("sha256") == after.get("sha256")
+            and before.get("mtime_ns") == after.get("mtime_ns")
+        ):
+            verified, reason = False, "file_unchanged_after_ok"
+        else:
+            verified = True
+            reason = "file_created" if not before.get("exists") else "file_mutated"
+    elif after.get("exists"):
+        verified, reason = False, "file_still_exists_after_delete"
+    else:
+        verified, reason = True, "file_deleted"
+
+    observation: dict[str, Any] = {
+        "observer": "epistemic_guard.mcp_proxy.filesystem_probe",
+        "kind": "filesystem",
+        "target_path": str(target_path),
+        "expected_op": expected_op,
+        "before": dict(before),
+        "after": after,
+        "verified": verified,
+        "reason": reason,
+    }
+    return (verified, observation)
 
 
 def _coerce_scalar(val: object) -> str | int | float | bool:
@@ -870,12 +996,16 @@ class McpStdioProxy:
         raise_on_rugpull: bool = False,
         filter_web_results: bool = False,
         endpoint_id: str = "",
+        probe_fs_root: Path | str | None = None,
     ) -> None:
         self._writer = writer
         self._pin_tools = pin_tools
         self._raise_on_rugpull = raise_on_rugpull
         self._filter_web_results = filter_web_results
         self._endpoint_id = endpoint_id
+        self._probe_fs_root: Path | None = (
+            Path(probe_fs_root).resolve() if probe_fs_root is not None else None
+        )
         self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
         self._pending_tools_list: set[tuple[str, str]] = set()
         self._seen_rpc_counts: dict[tuple[str, str], int] = {}
@@ -960,12 +1090,18 @@ class McpStdioProxy:
                 pinned_sha = self._tool_pins.get(tool_name, "")
                 is_compromised = self._pin_tools and tool_name in self._compromised_tools
                 if not is_compromised:
+                    armed_probe = (
+                        _arm_fs_probe(self._probe_fs_root, tool_name, args_map)
+                        if self._probe_fs_root is not None
+                        else None
+                    )
                     self._pending.setdefault(id_key, []).append(
                         _PendingToolCall(
                             call_id=cid,
                             tool=tool_name,
                             args=args_map,
                             tool_def_sha256=pinned_sha,
+                            fs_probe=armed_probe,
                         )
                     )
 
@@ -1201,6 +1337,36 @@ class McpStdioProxy:
 
         ok, output_text, is_validation = _extract_mcp_result_text(response.get("result"))
         if ok:
+            if pending.fs_probe is not None:
+                exp_op, target_path, before_snap = pending.fs_probe
+                verified, obs = _evaluate_fs_probe(exp_op, target_path, before_snap)
+                if verified:
+                    return ToolReceipt(
+                        call_id=pending.call_id,
+                        tool=pending.tool,
+                        ok=True,
+                        executed=True,
+                        error_code="",
+                        args=pending.args,
+                        output=output_text,
+                        tool_definition_sha256=pending.tool_def_sha256,
+                        endpoint_id=self._endpoint_id,
+                        evidence_tier="independently_verified",
+                        effect_observation=obs,
+                    )
+                return ToolReceipt(
+                    call_id=pending.call_id,
+                    tool=pending.tool,
+                    ok=False,
+                    executed=True,
+                    error_code="effect_probe_contradicted",
+                    args=pending.args,
+                    output=output_text,
+                    tool_definition_sha256=pending.tool_def_sha256,
+                    endpoint_id=self._endpoint_id,
+                    evidence_tier="effect_contradicted",
+                    effect_observation=obs,
+                )
             return ToolReceipt(
                 call_id=pending.call_id,
                 tool=pending.tool,
@@ -1211,6 +1377,7 @@ class McpStdioProxy:
                 output=output_text,
                 tool_definition_sha256=pending.tool_def_sha256,
                 endpoint_id=self._endpoint_id,
+                evidence_tier="server_reported" if self._probe_fs_root is not None else "",
             )
         return ToolReceipt(
             call_id=pending.call_id,
@@ -1222,6 +1389,11 @@ class McpStdioProxy:
             output=output_text,
             tool_definition_sha256=pending.tool_def_sha256,
             endpoint_id=self._endpoint_id,
+            evidence_tier=(
+                ("attempted" if is_validation else "server_reported")
+                if self._probe_fs_root is not None
+                else ""
+            ),
         )
 
 
@@ -1238,6 +1410,7 @@ def run_mcp_stdio_proxy(
     session_id: str | None = None,
     prev_log_path: Path | str | None = None,
     prev_pubkey_file: Path | str | None = None,
+    probe_fs_root: Path | str | None = None,
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -1260,6 +1433,7 @@ def run_mcp_stdio_proxy(
         pin_tools=pin_tools,
         filter_web_results=filter_web_results,
         endpoint_id=f"stdio:{Path(server_cmd[0]).name}",
+        probe_fs_root=probe_fs_root,
     )
 
     child_env = _scrub_child_env(os.environ)

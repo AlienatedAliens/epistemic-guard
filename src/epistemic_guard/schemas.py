@@ -474,6 +474,8 @@ class ToolReceipt(BaseModel):
     output_sha256: str = ""
     tool_definition_sha256: str = ""
     endpoint_id: str = ""
+    evidence_tier: str = ""
+    effect_observation: dict[str, Any] | None = None
     timestamp_utc: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     session_id: str = ""
     signature: str = ""
