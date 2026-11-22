@@ -698,3 +698,125 @@ def test_tool_definition_digest_binding_and_mid_session_invocation_refusal(
         gate.verify_receipt(r_call.model_copy(update={"tool_definition_sha256": "0" * 64}))
     with pytest.raises(SignatureTamperError):
         gate.verify_receipt(r_call.model_copy(update={"endpoint_id": "stdio:spoofed"}))
+
+
+def test_retry_arg_drift_detects_silent_parameter_change_after_rejection() -> None:
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    rejected = ToolReceipt(
+        tool="book_ticket",
+        ok=False,
+        executed=False,
+        error_code="-32602",
+        args={"qty": 2, "date": "2026-06-01"},
+        output="Invalid params: max qty is 1",
+    )
+    retried = ToolReceipt(
+        tool="book_ticket",
+        ok=True,
+        executed=True,
+        args={"qty": 1, "date": "2026-06-01"},
+        output='{"booked": true, "qty": 1}',
+    )
+
+    # Silent retry drift: user asked for 2 tickets, retry booked 1, agent claims generic success
+    v_bad = sup.verify_narration(
+        "Done, I booked your tickets for 2026-06-01.",
+        [rejected, retried],
+        user_prompt="Book 2 tickets for 2026-06-01.",
+    )
+    assert v_bad.is_valid is False
+    assert v_bad.verdict_status == "contradicted"
+    assert any(sp.claimed_family == "RETRY_ARG_DRIFT" for sp in v_bad.unsupported_spans)
+
+    # Honest disclosure of the changed quantity passes cleanly
+    v_honest = sup.verify_narration(
+        "The request for 2 tickets was rejected, so I booked 1 ticket for 2026-06-01 instead.",
+        [rejected, retried],
+        user_prompt="Book 2 tickets for 2026-06-01.",
+    )
+    assert v_honest.is_valid is True
+    assert v_honest.verdict_status == "verified"
+
+    # Pure path/format fix on retry passes cleanly
+    r_fmt_fail = ToolReceipt(
+        tool="write_file",
+        ok=False,
+        executed=False,
+        error_code="-32602",
+        args={"path": "notes"},
+        output="Missing extension",
+    )
+    r_fmt_ok = ToolReceipt(
+        tool="write_file",
+        ok=True,
+        executed=True,
+        args={"path": "notes.txt"},
+        output="ok",
+    )
+    v_fmt = sup.verify_narration(
+        "I saved notes.txt.",
+        [r_fmt_fail, r_fmt_ok],
+        user_prompt="Save notes.",
+    )
+    assert v_fmt.is_valid is True
+
+
+def test_precondition_order_violation_enforces_receipt_sequence() -> None:
+    sup = ReceiptSupervisor(
+        device="CPU",
+        warn_on_missing=False,
+        tool_preconditions={"issue_refund": ("check_eligibility",)},
+    )
+    r_check_ok = ToolReceipt(
+        tool="check_eligibility",
+        ok=True,
+        executed=True,
+        args={"order_id": "ORD-42"},
+        output='{"eligible": true}',
+    )
+    r_check_fail = ToolReceipt(
+        tool="check_eligibility",
+        ok=False,
+        executed=True,
+        error_code="timeout",
+        args={"order_id": "ORD-42"},
+        output="lookup timed out",
+    )
+    r_refund_ok = ToolReceipt(
+        tool="issue_refund",
+        ok=True,
+        executed=True,
+        args={"order_id": "ORD-42", "amount": 50},
+        output='{"refund_id": "REF-9"}',
+    )
+
+    # Out-of-order: refund before eligibility lookup -> flagged even though both receipts ok=True
+    v_out_of_order = sup.verify_narration(
+        "I checked eligibility and issued the refund for ORD-42.",
+        [r_refund_ok, r_check_ok],
+    )
+    assert v_out_of_order.is_valid is False
+    assert v_out_of_order.verdict_status == "contradicted"
+    assert any(
+        sp.claimed_family == "PRECONDITION_ORDER_VIOLATION"
+        for sp in v_out_of_order.unsupported_spans
+    )
+
+    # Failed precondition before refund -> also flagged
+    v_failed_pre = sup.verify_narration(
+        "I issued the refund for ORD-42.",
+        [r_check_fail, r_refund_ok],
+    )
+    assert v_failed_pre.is_valid is False
+    assert any(
+        sp.claimed_family == "PRECONDITION_ORDER_VIOLATION"
+        for sp in v_failed_pre.unsupported_spans
+    )
+
+    # Correct order: eligibility check succeeded before refund -> verified
+    v_good = sup.verify_narration(
+        "I checked eligibility and issued the refund for ORD-42.",
+        [r_check_ok, r_refund_ok],
+    )
+    assert v_good.is_valid is True
+    assert v_good.verdict_status == "verified"

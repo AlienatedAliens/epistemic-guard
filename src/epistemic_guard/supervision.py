@@ -1150,6 +1150,109 @@ def _find_unexecuted_secondary_action(
     return None
 
 
+def _scalar_in_text(val: str, text_lower: str) -> bool:
+    """Boundary-aware scalar lookup so short values like `'1'` do not match `'10'`."""
+    clean = val.strip().lower()
+    if not clean:
+        return False
+    if len(clean) <= 3 or clean.replace(".", "", 1).isdigit():
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(clean)}(?![a-z0-9])", text_lower))
+    return clean in text_lower
+
+
+def _find_retry_arg_drift(
+    narration: str,
+    receipts: Sequence[ToolReceipt],
+    *,
+    user_prompt: str = "",
+) -> str | None:
+    """Detect when a failed/rejected mutating tool call is retried with changed arguments
+    and the assistant reports success on the original request without disclosing the change.
+    """
+    if not receipts or _has_failure_disclosure(narration):
+        return None
+    narr_low = narration.lower()
+    prompt_low = user_prompt.lower()
+    prior_failed: dict[str, list[ToolReceipt]] = {}
+    for rcpt in receipts:
+        t_low = rcpt.tool.lower()
+        if _is_read_only_tool(rcpt.tool):
+            continue
+        if not (rcpt.ok and rcpt.executed):
+            is_pre_exec_reject = (not rcpt.executed) or (
+                rcpt.error_code.strip().lower()
+                in {"-32602", "-32600", "invalid_params", "validation_error"}
+            )
+            if is_pre_exec_reject:
+                prior_failed.setdefault(t_low, []).append(rcpt)
+            continue
+        failed_attempts = prior_failed.get(t_low)
+        if not failed_attempts or not rcpt.args:
+            continue
+        for fr in failed_attempts:
+            if not fr.args:
+                continue
+            for key, old_val in fr.args.items():
+                if key not in rcpt.args:
+                    continue
+                new_val = rcpt.args[key]
+                old_s = str(old_val).strip()
+                new_s = str(new_val).strip()
+                if not old_s or not new_s or old_s.lower() == new_s.lower():
+                    continue
+                if isinstance(old_val, bool) and isinstance(new_val, bool):
+                    continue
+                # Ignore pure path/format normalization where one is a clear substring of the other
+                if len(old_s) >= 4 and len(new_s) >= 4 and (
+                    old_s.lower() in new_s.lower() or new_s.lower() in old_s.lower()
+                ):
+                    continue
+                requested_or_claimed = (
+                    (bool(prompt_low) and _scalar_in_text(old_s, prompt_low))
+                    or _scalar_in_text(old_s, narr_low)
+                )
+                if requested_or_claimed and not _scalar_in_text(new_s, narr_low):
+                    return (
+                        f"Tool '{rcpt.tool}' failed/rejected with {key}={old_s!r} and "
+                        f"succeeded on retry with {key}={new_s!r} without disclosing "
+                        "the argument change."
+                    )
+    return None
+
+
+def _find_precondition_order_violation(
+    receipts: Sequence[ToolReceipt],
+    tool_preconditions: Mapping[str, Sequence[str]] | None,
+) -> str | None:
+    """Verify caller-supplied temporal precondition rules over the ordered receipt log.
+
+    Example: `tool_preconditions={"issue_refund": ("check_eligibility",)}` rejects any
+    trace where `issue_refund` executes before `check_eligibility` has completed with `ok=True`.
+    """
+    if not receipts or not tool_preconditions:
+        return None
+    norm_rules: dict[str, tuple[str, ...]] = {
+        k.strip().lower(): tuple(p.strip().lower() for p in reqs if p.strip())
+        for k, reqs in tool_preconditions.items()
+        if k.strip()
+    }
+    seen_ok: set[str] = set()
+    for idx, rcpt in enumerate(receipts):
+        if not (rcpt.ok and rcpt.executed):
+            continue
+        t_low = rcpt.tool.lower()
+        reqs = norm_rules.get(t_low)
+        if reqs:
+            missing = [pre for pre in reqs if pre not in seen_ok]
+            if missing:
+                return (
+                    f"Tool '{rcpt.tool}' executed at receipt #{idx} before required "
+                    f"precondition(s) {missing} completed."
+                )
+        seen_ok.add(t_low)
+    return None
+
+
 @dataclass(frozen=True)
 class OutputValueMismatch:
     """Detected scalar or NLI contradiction against an `ok=True` `ToolReceipt.output` payload."""
@@ -1287,6 +1390,7 @@ class ReceiptSupervisor:
         verify_discourse_nli: bool = True,
         extra_tool_stems: Mapping[str, Sequence[str]] | None = None,
         mcp_tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_preconditions: Mapping[str, Sequence[str]] | None = None,
         verify_hashes: bool = True,
         require_neural: bool = False,
         warn_on_missing: bool = True,
@@ -1317,6 +1421,11 @@ class ReceiptSupervisor:
         self._mcp_tool_tokens: dict[str, frozenset[str]] = (
             _extract_mcp_tool_tokens(mcp_tools) if mcp_tools else {}
         )
+        self._tool_preconditions: dict[str, tuple[str, ...]] = {
+            k.strip().lower(): tuple(p.strip().lower() for p in reqs if p.strip())
+            for k, reqs in (tool_preconditions or {}).items()
+            if k.strip()
+        }
         self._output_guard: OutputValueGuard | None = (
             OutputValueGuard(device=device, warn_on_missing=False)
             if verify_output_values
@@ -1504,9 +1613,21 @@ class ReceiptSupervisor:
                 if len(str(v).strip()) >= 4
             }
             for fr in failed_receipts:
-                for v in fr.args.values():
+                fr_tool = fr.tool.lower()
+                for k, v in fr.args.items():
                     v_low = str(v).strip().lower()
-                    if len(v_low) >= 4 and v_low not in ok_arg_vals and v_low in cl_lower:
+                    same_key_refined = any(
+                        r.tool.lower() == fr_tool
+                        and k in r.args
+                        and v_low in str(r.args[k]).strip().lower()
+                        for r in ok_receipts
+                    )
+                    if (
+                        len(v_low) >= 4
+                        and v_low not in ok_arg_vals
+                        and not same_key_refined
+                        and v_low in cl_lower
+                    ):
                         return False
 
         matching_rcpts = [
@@ -1664,6 +1785,7 @@ class ReceiptSupervisor:
         allow_creative_context: bool | None = None,
         verify_output_values: bool | None = None,
         flag_undisclosed_mutations: bool | None = None,
+        tool_preconditions: Mapping[str, Sequence[str]] | None = None,
         gate: ProvenanceGate | None = None,
         expected_session_id: str | None = None,
         max_receipt_age_seconds: float | None = None,
@@ -2074,6 +2196,38 @@ class ReceiptSupervisor:
                         f"Failed mutating receipt '{undisc_fail.tool}' "
                         f"({undisc_fail.error_code or 'error'}) was not disclosed in reply."
                     ),
+                )
+            )
+
+        # Check silent argument drift when a rejected/failed mutating call is retried
+        retry_drift = _find_retry_arg_drift(narration, receipts, user_prompt=user_prompt)
+        if retry_drift is not None and not unsupported_claims and narration.strip():
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="RETRY_ARG_DRIFT",
+                    reason=retry_drift,
+                )
+            )
+
+        # Check caller-supplied temporal precondition ordering over the verified receipt sequence
+        active_preconds = (
+            self._tool_preconditions if tool_preconditions is None else tool_preconditions
+        )
+        order_violation = _find_precondition_order_violation(receipts, active_preconds)
+        if order_violation is not None and not unsupported_claims:
+            snippet = narration.strip()[:160] if narration.strip() else order_violation
+            unsupported_claims.append(snippet)
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=snippet,
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + len(snippet),
+                    claimed_family="PRECONDITION_ORDER_VIOLATION",
+                    reason=order_violation,
                 )
             )
 
