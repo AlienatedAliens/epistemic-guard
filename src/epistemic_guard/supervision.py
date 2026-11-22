@@ -750,13 +750,27 @@ def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> Tool
 
 
 _FAILURE_DISCLOSURE_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:fail(?:ed|ure|ing)?|error|unable|could\s+not|couldn't|cannot|can't|"
+    r"\b(?:fail(?:ed|ure|ing)?|errors?|unable|could\s+not|couldn't|cannot|can't|"
     r"not\s+able|didn't|did\s+not|wasn't|was\s+not|weren't|were\s+not|"
     r"timed?\s+out|timeout|denied|rejected|forbidden|blocked|unsuccessful|"
     r"defer(?:red|ring)?|delay(?:ed|ing)?|postpon(?:ed|ing)|skip(?:ped|ping)?|"
     r"pending|abort(?:ed|ing)?|cancel(?:ed|led)?|halt(?:ed|ing)?|incomplete|"
     r"interrupted|lock(?:ed)?|issue|problem|warning|partial(?:ly)?|not\s+found|"
-    r"missing|exception|conflict|rate\s+limit(?:ed|ing)?|40[1349]|429|50[0234])\b",
+    r"missing|exception|traceback|syntax|wrong|incorrect|mistake|bug|"
+    r"conflict|rate\s+limit(?:ed|ing)?|40[1349]|429|50[0234])\b",
+    re.IGNORECASE,
+)
+_DESTRUCTIVE_VERB_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:delet(?:e|ed|ing|ion)|remov(?:e|ed|ing|al)|drop(?:ped|ping)?|"
+    r"wip(?:e|ed|ing)|purg(?:e|ed|ing)|eras(?:e|ed|ing)|clear(?:ed|ing)?|"
+    r"unlink(?:ed|ing)?|destroy(?:ed|ing)?|revok(?:e|ed|ing)|cancel(?:ed|led|ing)?|"
+    r"terminat(?:e|ed|ing)|kill(?:ed|ing)?|flush(?:ed|ing)?|prun(?:e|ed|ing)|"
+    r"discard(?:ed|ing)?|strip(?:ped|ping)?)\b",
+    re.IGNORECASE,
+)
+_FORWARD_PLANNING_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:let'?s\s+(?:run|open|check|edit|update|try|look|inspect|fix|test|search|list)|"
+    r"I\s+need\s+to\s+(?:edit|open|check|fix|update|run))\b",
     re.IGNORECASE,
 )
 _ISO_DATE_ONLY_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
@@ -783,10 +797,9 @@ def _find_mutating_date_mismatch(
         mut_dates.update(_ISO_DATE_ONLY_RE.findall(blob))
     if not mut_dates:
         return None
-    mismatched = sorted(narr_dates - mut_dates)
-    if mismatched:
+    if narr_dates.isdisjoint(mut_dates):
         return (
-            f"Narration asserts date(s) {mismatched} absent from mutating ToolReceipt "
+            f"Narration asserts date(s) {sorted(narr_dates)} absent from mutating ToolReceipt "
             f"date(s) {sorted(mut_dates)}."
         )
     return None
@@ -830,6 +843,10 @@ def _find_undisclosed_failed_tool(
 ) -> ToolReceipt | None:
     """Detect unsuperseded failed mutating tools omitted from an all-clear completion reply."""
     if not failed_receipts or _FAILURE_DISCLOSURE_RE.search(narration):
+        return None
+    if _FORWARD_PLANNING_RE.search(narration) and not _CLAUSE_ACTION_OR_STATE_SIGNAL_RE.search(
+        narration
+    ):
         return None
     for fr in failed_receipts:
         if not _READBACK_TOOL_RE.search(fr.tool):
@@ -1730,6 +1747,12 @@ class ReceiptSupervisor:
             fam, _conf = self._classify_speech_act(
                 cl_text, user_prompt=user_prompt, has_receipts=bool(ok_receipts)
             )
+            if (
+                fam == "CLAIM_DELETE"
+                and not _DESTRUCTIVE_VERB_RE.search(cl_text)
+                and any(not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts)
+            ):
+                fam = None
             if fam == "UNFULFILLED_PROMISE":
                 if not ok_receipts:
                     unfulfilled.append(cl_text)
