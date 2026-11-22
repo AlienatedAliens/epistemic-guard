@@ -836,6 +836,114 @@ def _find_undisclosed_failed_tool(
     return None
 
 
+def _find_read_after_write_contradiction(ok_receipts: Sequence[ToolReceipt]) -> str | None:
+    """Detect read-after-write contradictions where a later read returns stale/empty state."""
+    written_file_content: dict[str, str] = {}
+    written_record_fields: dict[str, bool] = {}
+
+    for rcpt in ok_receipts:
+        if not (rcpt.ok and rcpt.executed):
+            continue
+        is_read = bool(_READBACK_TOOL_RE.search(rcpt.tool))
+        path_val = str(rcpt.args.get("path") or rcpt.args.get("file_path") or "").strip().lower()
+        rec_val = str(rcpt.args.get("record_id") or rcpt.args.get("id") or "").strip().lower()
+
+        if not is_read:
+            if path_val and "content" in rcpt.args and isinstance(rcpt.args["content"], str):
+                written_file_content[path_val] = rcpt.args["content"]
+            if rec_val and "fields" in rcpt.args:
+                raw_fields = str(rcpt.args["fields"]).strip()
+                if raw_fields and raw_fields not in {"{}", "[]", "null", "None"}:
+                    written_record_fields[rec_val] = True
+            continue
+
+        # Read-back receipt: verify against prior writes
+        raw_out = rcpt.output.strip()
+        if raw_out[:1] != "{":
+            continue
+        with contextlib.suppress(Exception):
+            parsed = json.loads(raw_out)
+            if not isinstance(parsed, Mapping):
+                continue
+            out_path = str(parsed.get("path") or path_val).strip().lower()
+            if (
+                out_path
+                and out_path in written_file_content
+                and isinstance(parsed.get("content"), str)
+                and parsed["content"] != written_file_content[out_path]
+            ):
+                return (
+                    f"Read-back receipt '{rcpt.tool}' for '{out_path}' returned content "
+                    "contradicting the prior write receipt."
+                )
+            out_rec = str(parsed.get("record_id") or rec_val).strip().lower()
+            if (
+                out_rec
+                and out_rec in written_record_fields
+                and isinstance(parsed.get("fields"), Mapping)
+                and len(parsed["fields"]) == 0
+            ):
+                return (
+                    f"Read-back receipt '{rcpt.tool}' for '{out_rec}' returned empty fields "
+                    "after a non-empty update receipt."
+                )
+    return None
+
+
+_SECONDARY_ACTION_CHECKS: Final[tuple[tuple[str, re.Pattern[str], re.Pattern[str]], ...]] = (
+    (
+        "CLAIM_COMM_EXTERNAL",
+        re.compile(
+            r"\b(?:sent\s+(?:the\s+|an?\s+)?(?:invite|email|message)|"
+            r"invite\s+(?:sent|went|has\s+been\s+sent)|has\s+the\s+invite|"
+            r"should\s+have\s+the\s+invite|invited\s+\S+@\S+)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:send|email|mail|invite|notify|message)(?:_|$)", re.IGNORECASE),
+    ),
+    (
+        "CLAIM_LAUNCH_EXEC",
+        re.compile(
+            r"\b(?:(?:it'?s|is|was|been|and)\s+committed|committed\s+(?:the|to))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:commit|git)(?:_|$)", re.IGNORECASE),
+    ),
+    (
+        "CLAIM_LAUNCH_EXEC",
+        re.compile(
+            r"\b(?:(?:full\s+|test\s+)?suite\s+pass(?:es|ed)|(?:all\s+)?tests?\s+pass(?:es|ed))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:test|tests|pytest|shell|run|exec|ci)(?:_|$)", re.IGNORECASE),
+    ),
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            r"\b(?:added\s+(?:the|a)\s+note|note\s+(?:is\s+|was\s+)?added)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:note|notes|comment)(?:_|$)", re.IGNORECASE),
+    ),
+)
+
+
+def _find_unexecuted_secondary_action(
+    narration: str, ok_receipts: Sequence[ToolReceipt]
+) -> tuple[str, str] | None:
+    """Detect explicit secondary completion claims lacking any matching executed receipt."""
+    if not ok_receipts or _FAILURE_DISCLOSURE_RE.search(narration):
+        return None
+    tool_names = [r.tool for r in ok_receipts]
+    for family, claim_re, tool_re in _SECONDARY_ACTION_CHECKS:
+        if claim_re.search(narration) and not any(tool_re.search(t) for t in tool_names):
+            return (
+                family,
+                f"Narration claims secondary '{family}' completion with no matching ToolReceipt.",
+            )
+    return None
+
+
 @dataclass(frozen=True)
 class OutputValueMismatch:
     """Detected scalar or NLI contradiction against an `ok=True` `ToolReceipt.output` payload."""
@@ -1771,6 +1879,33 @@ class ReceiptSupervisor:
                             reason=target_mismatch,
                         )
                     )
+                else:
+                    raw_contradiction = _find_read_after_write_contradiction(ok_receipts)
+                    if raw_contradiction is not None and narration.strip():
+                        unsupported_claims.append(narration.strip()[:160])
+                        unsupported_spans.append(
+                            UnsupportedClaimSpan(
+                                text=narration.strip()[:160],
+                                start_char=base_char_offset,
+                                end_char=base_char_offset + min(len(narration.strip()), 160),
+                                claimed_family="READ_AFTER_WRITE_CONTRADICTION",
+                                reason=raw_contradiction,
+                            )
+                        )
+                    else:
+                        sec_missing = _find_unexecuted_secondary_action(narration, ok_receipts)
+                        if sec_missing is not None:
+                            sec_fam, sec_reason = sec_missing
+                            unsupported_claims.append(narration.strip()[:160])
+                            unsupported_spans.append(
+                                UnsupportedClaimSpan(
+                                    text=narration.strip()[:160],
+                                    start_char=base_char_offset,
+                                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                                    claimed_family=sec_fam,
+                                    reason=sec_reason,
+                                )
+                            )
 
         is_ok = (
             len(unsupported_claims) == 0

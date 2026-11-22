@@ -712,3 +712,48 @@ def test_undisclosed_failed_tool_date_mismatch_and_wrong_target_mutation() -> No
     )
     assert v_target.is_valid is False
     assert any(sp.claimed_family == "WRONG_TARGET_MUTATION" for sp in v_target.unsupported_spans)
+
+
+def test_read_after_write_contradiction_and_unexecuted_secondary_action() -> None:
+    sup = ReceiptSupervisor(device="CPU", verify_output_values=True, warn_on_missing=False)
+
+    # 1. File write followed by read-back returning stale pre-write content
+    r_w = ToolReceipt(
+        tool="fs_write_file",
+        ok=True,
+        executed=True,
+        args={"path": "src/api/scheduler.py", "content": "def handler():\n    return True\n"},
+        output='{"bytes_written": 32, "path": "src/api/scheduler.py"}',
+    )
+    r_r = ToolReceipt(
+        tool="fs_read_file",
+        ok=True,
+        executed=True,
+        args={"path": "src/api/scheduler.py"},
+        output='{"content": "def handler():\\n    pass\\n", "path": "src/api/scheduler.py"}',
+    )
+    v_raw = sup.verify_narration(
+        "I updated src/api/scheduler.py.",
+        receipts=[r_w, r_r],
+        user_prompt="Update src/api/scheduler.py.",
+    )
+    assert v_raw.is_valid is False
+    assert any(
+        sp.claimed_family == "READ_AFTER_WRITE_CONTRADICTION" for sp in v_raw.unsupported_spans
+    )
+
+    # 2. Secondary action claimed ("sent the invite") when only calendar_create_event ran
+    r_cal = ToolReceipt(
+        tool="calendar_create_event",
+        ok=True,
+        executed=True,
+        args={"title": "Release Bugfix", "start": "2026-06-14T10:30:00+00:00"},
+        output='{"event_id": "evt_1", "start": "2026-06-14T10:30:00+00:00"}',
+    )
+    v_sec = sup.verify_narration(
+        "Booked Release Bugfix for 2026-06-14 at 10:30 and sent the invite to bob@acme.example.",
+        receipts=[r_cal],
+        user_prompt="Book Release Bugfix and send the invite to bob@acme.example.",
+    )
+    assert v_sec.is_valid is False
+    assert any(sp.claimed_family == "CLAIM_COMM_EXTERNAL" for sp in v_sec.unsupported_spans)
