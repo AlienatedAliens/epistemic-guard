@@ -768,6 +768,33 @@ _DESTRUCTIVE_VERB_RE: Final[re.Pattern[str]] = re.compile(
     r"discard(?:ed|ing)?|strip(?:ped|ping)?)\b",
     re.IGNORECASE,
 )
+_COMM_EXTERNAL_VERB_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:send|sent|sending|email(?:ed|ing)?|mail(?:ed|ing)?|messag(?:e|ed|ing)|"
+    r"post(?:ed|ing)?|slack(?:ed|ing)?|notif(?:y|ied|ying|ication)|invit(?:e|ed|ing)|"
+    r"pay|paid|payment|transfer(?:red|ring)?|refund(?:ed|ing)?|webhook|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|book(?:ed|ing)?|schedul(?:e|ed|ing)|order(?:ed|ing)?|"
+    r"dispatch(?:ed|ing)?|tweet(?:ed|ing)?|broadcast(?:ed|ing)?|call(?:ed|ing)?)\b",
+    re.IGNORECASE,
+)
+_DISCLOSURE_SYNONYMS: Final[dict[str, frozenset[str]]] = {
+    "money": frozenset(
+        {"paid", "payment", "pay", "transfer", "transferred", "sent", "bill", "refund"}
+    ),
+    "transfer": frozenset({"paid", "payment", "transferred", "sent", "wired"}),
+    "transaction": frozenset(
+        {"payment", "rent", "standing", "order", "recurring", "adjusted", "paid"}
+    ),
+    "scheduled": frozenset({"standing", "order", "recurring", "scheduled", "adjusted"}),
+    "update": frozenset({"updated", "adjusted", "changed", "modified", "edited", "account"}),
+    "edit": frozenset({"edited", "updated", "changed", "modified", "fixed"}),
+    "delete": frozenset({"deleted", "removed", "canceled", "cancelled", "erased", "dropped"}),
+    "remove": frozenset({"removed", "deleted", "canceled", "cancelled"}),
+    "send": frozenset({"sent", "emailed", "mailed", "messaged", "notified", "invited", "paid"}),
+    "create": frozenset({"created", "added", "booked", "scheduled", "opened"}),
+}
+_EXTERNAL_RECIPIENT_ARG_KEYS: Final[frozenset[str]] = frozenset(
+    {"recipient", "to", "email", "iban", "url", "channel", "webhook"}
+)
 _FORWARD_PLANNING_RE: Final[re.Pattern[str]] = re.compile(
     r"\b(?:let'?s\s+(?:run|open|check|edit|update|try|look|inspect|fix|test|search|list)|"
     r"I\s+need\s+to\s+(?:edit|open|check|fix|update|run))\b",
@@ -1753,6 +1780,12 @@ class ReceiptSupervisor:
                 and any(not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts)
             ):
                 fam = None
+            elif (
+                fam == "CLAIM_COMM_EXTERNAL"
+                and not _COMM_EXTERNAL_VERB_RE.search(cl_text)
+                and any(not _READBACK_TOOL_RE.search(r.tool) for r in ok_receipts)
+            ):
+                fam = None
             if fam == "UNFULFILLED_PROMISE":
                 if not ok_receipts:
                     unfulfilled.append(cl_text)
@@ -1925,18 +1958,25 @@ class ReceiptSupervisor:
                 continue
 
             disclosed = False
-            for aval in rcpt.args.values():
+            has_unmentioned_recipient = False
+            for akey, aval in rcpt.args.items():
                 v_str = str(aval).strip().lower()
                 if len(v_str) >= 4:
                     base = Path(v_str).name if ("/" in v_str or "\\" in v_str) else v_str
                     if v_str in narr_low or (len(base) >= 4 and base in narr_low):
                         disclosed = True
                         break
-            if not disclosed:
+                    if akey.lower() in _EXTERNAL_RECIPIENT_ARG_KEYS:
+                        has_unmentioned_recipient = True
+            if not disclosed and not has_unmentioned_recipient:
                 tool_toks = _extract_content_tokens(t_low) | self._mcp_tool_tokens.get(
                     t_low, frozenset()
                 )
-                if narr_tokens & tool_toks:
+                expanded_toks = set(tool_toks)
+                for tok in tool_toks:
+                    if tok in _DISCLOSURE_SYNONYMS:
+                        expanded_toks.update(_DISCLOSURE_SYNONYMS[tok])
+                if narr_tokens & expanded_toks:
                     disclosed = True
             if not disclosed:
                 args_preview = ", ".join(f"{k}={v!r}" for k, v in list(rcpt.args.items())[:3])
