@@ -664,6 +664,22 @@ class ReceiptLogWriter:
         self._id_index: dict[str, ReceiptLogEntry] = {}
         self._synced_lines = 0
 
+        # Seed durable operation_key and receipt lookup indexes from verified predecessor log
+        # so log/key rotation (`--prev-log`) preserves A5 recovery and idempotent retry protection.
+        if prev_log_path is not None:
+            prev_raw = Path(prev_log_path).read_text(encoding="utf-8").splitlines()
+            for line in prev_raw:
+                if not line.strip():
+                    continue
+                prev_entry = ReceiptLogEntry.model_validate_json(line)
+                self._id_index[prev_entry.receipt.call_id] = prev_entry
+                if isinstance(prev_entry.aer1, Mapping) and isinstance(
+                    prev_entry.aer1.get("id"), str
+                ):
+                    self._id_index[str(prev_entry.aer1["id"])] = prev_entry
+                if prev_entry.operation_key and prev_entry.operation_key not in self._op_index:
+                    self._op_index[prev_entry.operation_key] = prev_entry
+
         with _exclusive_log_lock(self.log_path):
             if truncate and self.log_path.exists():
                 self.log_path.unlink()

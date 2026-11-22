@@ -820,3 +820,47 @@ def test_precondition_order_violation_enforces_receipt_sequence() -> None:
     )
     assert v_good.is_valid is True
     assert v_good.verdict_status == "verified"
+
+
+def test_prev_log_rotation_preserves_operation_and_receipt_lookup(tmp_path: Path) -> None:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from epistemic_guard.mcp_proxy import ReceiptLogWriter
+    from epistemic_guard.provenance import DomainSigner
+    from epistemic_guard.schemas import Provenance
+
+    log1 = tmp_path / "run1.jsonl"
+    log2 = tmp_path / "run2.jsonl"
+    w1 = ReceiptLogWriter(
+        log1,
+        signer=DomainSigner(Provenance.TOOL_VERIFIED, Ed25519PrivateKey.generate()),
+        truncate=True,
+        include_aer1=True,
+    )
+    e1 = w1.append(
+        ToolReceipt(
+            call_id="call-rot-1",
+            tool="create_ticket",
+            args={"title": "K-rot-1: migrate", "priority": "normal"},
+            output='{"id":"T-1"}',
+            ok=True,
+            executed=True,
+        ),
+        operation_key="K-rot-1",
+        operation_input_sha256="abc123",
+        cached_rpc_result={"content": [{"type": "text", "text": '{"id":"T-1"}'}]},
+    )
+
+    # Rotate to a brand-new log file with a fresh Ed25519 key linked via prev_log_path
+    w2 = ReceiptLogWriter(
+        log2,
+        signer=DomainSigner(Provenance.TOOL_VERIFIED, Ed25519PrivateKey.generate()),
+        prev_log_path=log1,
+        truncate=True,
+        include_aer1=True,
+    )
+    hit_op = w2.lookup_operation("K-rot-1")
+    hit_id = w2.lookup_receipt_or_operation("call-rot-1")
+    assert hit_op is not None and hit_op.receipt.call_id == e1.receipt.call_id
+    assert hit_op.operation_input_sha256 == "abc123"
+    assert hit_id is not None and hit_id.operation_key == "K-rot-1"
