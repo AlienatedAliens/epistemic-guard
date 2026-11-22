@@ -711,7 +711,7 @@ def _extract_numeric_set(text: str) -> set[float]:
 
 
 _READBACK_TOOL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:^|_)(?:get|read|fetch|check|verify|inspect|stat|lookup|probe|list|find)(?:_|$)",
+    r"(?:^|_)(?:get|read|search|query|fetch|check|verify|inspect|stat|status|scan|lookup|probe|list|find)(?:_|$)",
     re.IGNORECASE,
 )
 _NOT_FOUND_ERR_RE: Final[re.Pattern[str]] = re.compile(
@@ -745,6 +745,94 @@ def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> Tool
             and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}")
         ):
             return rcpt
+    return None
+
+
+_FAILURE_DISCLOSURE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:fail(?:ed|ure|ing)?|error|unable|could\s+not|couldn't|cannot|can't|"
+    r"not\s+able|didn't|did\s+not|wasn't|was\s+not|weren't|were\s+not|"
+    r"timed?\s+out|timeout|denied|rejected|forbidden|blocked|unsuccessful|"
+    r"defer(?:red|ring)?|delay(?:ed|ing)?|postpon(?:ed|ing)|skip(?:ped|ping)?|"
+    r"pending|abort(?:ed|ing)?|cancel(?:ed|led)?|halt(?:ed|ing)?|incomplete|"
+    r"interrupted|lock(?:ed)?|issue|problem|warning|partial(?:ly)?|not\s+found|"
+    r"missing|exception|conflict|rate\s+limit(?:ed|ing)?|40[1349]|429|50[0234])\b",
+    re.IGNORECASE,
+)
+_ISO_DATE_ONLY_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+_EMAIL_ADDR_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})\b", re.IGNORECASE
+)
+_REL_PATH_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]{1,8})(?![A-Za-z0-9_.-])"
+)
+
+
+def _find_mutating_date_mismatch(
+    narration: str, ok_receipts: Sequence[ToolReceipt]
+) -> str | None:
+    """Detect when narration asserts a YYYY-MM-DD date absent from mutating ok receipts."""
+    narr_dates = set(_ISO_DATE_ONLY_RE.findall(narration))
+    if not narr_dates:
+        return None
+    mut_dates: set[str] = set()
+    for rcpt in ok_receipts:
+        if _READBACK_TOOL_RE.search(rcpt.tool):
+            continue
+        blob = " ".join(str(v) for v in rcpt.args.values()) + " " + rcpt.output
+        mut_dates.update(_ISO_DATE_ONLY_RE.findall(blob))
+    if not mut_dates:
+        return None
+    mismatched = sorted(narr_dates - mut_dates)
+    if mismatched:
+        return (
+            f"Narration asserts date(s) {mismatched} absent from mutating ToolReceipt "
+            f"date(s) {sorted(mut_dates)}."
+        )
+    return None
+
+
+def _find_prompt_target_mismatch(
+    user_prompt: str, ok_receipts: Sequence[ToolReceipt]
+) -> str | None:
+    """Detect when mutating ok receipts target a different email or file path than user_prompt."""
+    if not user_prompt.strip():
+        return None
+    mut_rcpts = [r for r in ok_receipts if not _READBACK_TOOL_RE.search(r.tool)]
+    if not mut_rcpts:
+        return None
+    mut_blob = " ".join(
+        " ".join(str(v) for v in r.args.values()) + " " + r.output for r in mut_rcpts
+    )
+
+    # 1. Explicit email target mismatch
+    prompt_emails = {e.lower() for e in _EMAIL_ADDR_RE.findall(user_prompt)}
+    mut_emails = {e.lower() for e in _EMAIL_ADDR_RE.findall(mut_blob)}
+    if prompt_emails and mut_emails and prompt_emails.isdisjoint(mut_emails):
+        return (
+            f"Mutating ToolReceipt targeted email(s) {sorted(mut_emails)} instead of "
+            f"user-requested {sorted(prompt_emails)}."
+        )
+
+    # 2. Explicit multi-segment file path target mismatch
+    prompt_paths = {p.lower() for p in _REL_PATH_RE.findall(user_prompt)}
+    mut_paths = {p.lower() for p in _REL_PATH_RE.findall(mut_blob)}
+    if prompt_paths and mut_paths and prompt_paths.isdisjoint(mut_paths):
+        return (
+            f"Mutating ToolReceipt targeted path(s) {sorted(mut_paths)} instead of "
+            f"user-requested {sorted(prompt_paths)}."
+        )
+    return None
+
+
+def _find_undisclosed_failed_tool(
+    narration: str, failed_receipts: Sequence[ToolReceipt]
+) -> ToolReceipt | None:
+    """Detect unsuperseded failed mutating tools omitted from an all-clear completion reply."""
+    if not failed_receipts or _FAILURE_DISCLOSURE_RE.search(narration):
+        return None
+    for fr in failed_receipts:
+        if not _READBACK_TOOL_RE.search(fr.tool):
+            return fr
     return None
 
 
@@ -1622,8 +1710,8 @@ class ReceiptSupervisor:
         if (
             neg_persist is not None
             and not unsupported_claims
-            and not _HEDGE_OR_NEGATION_RE.search(narration)
-            and _CLAUSE_ACTION_OR_STATE_SIGNAL_RE.search(narration)
+            and not _FAILURE_DISCLOSURE_RE.search(narration)
+            and narration.strip()
         ):
             unsupported_claims.append(narration.strip()[:160])
             unsupported_spans.append(
@@ -1638,6 +1726,51 @@ class ReceiptSupervisor:
                     ),
                 )
             )
+
+        # Check unsuperseded failed mutating tools omitted from an all-clear reply
+        undisc_fail = _find_undisclosed_failed_tool(narration, failed_receipts)
+        if undisc_fail is not None and not unsupported_claims and narration.strip():
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="FAILED_TOOL_UNDISCLOSED",
+                    reason=(
+                        f"Failed mutating receipt '{undisc_fail.tool}' "
+                        f"({undisc_fail.error_code or 'error'}) was not disclosed in reply."
+                    ),
+                )
+            )
+
+        # Check mutating-receipt ISO date and explicit prompt email/path target mismatches
+        if not unsupported_claims and not _FAILURE_DISCLOSURE_RE.search(narration):
+            date_mismatch = _find_mutating_date_mismatch(narration, ok_receipts)
+            if date_mismatch is not None:
+                unsupported_claims.append(narration.strip()[:160])
+                unsupported_spans.append(
+                    UnsupportedClaimSpan(
+                        text=narration.strip()[:160],
+                        start_char=base_char_offset,
+                        end_char=base_char_offset + min(len(narration.strip()), 160),
+                        claimed_family="OUTPUT_VALUE_MISMATCH",
+                        reason=date_mismatch,
+                    )
+                )
+            else:
+                target_mismatch = _find_prompt_target_mismatch(user_prompt, ok_receipts)
+                if target_mismatch is not None:
+                    unsupported_claims.append(narration.strip()[:160])
+                    unsupported_spans.append(
+                        UnsupportedClaimSpan(
+                            text=narration.strip()[:160],
+                            start_char=base_char_offset,
+                            end_char=base_char_offset + min(len(narration.strip()), 160),
+                            claimed_family="WRONG_TARGET_MUTATION",
+                            reason=target_mismatch,
+                        )
+                    )
 
         is_ok = (
             len(unsupported_claims) == 0

@@ -645,3 +645,70 @@ def test_native_claude_code_hook_post_tool_and_stop(
     assert out_lie["verdict_status"] == "contradicted"
     assert out_lie["decision"] == "block"
     assert out_lie["unsupported_claims"]
+
+
+def test_undisclosed_failed_tool_date_mismatch_and_wrong_target_mutation() -> None:
+    sup = ReceiptSupervisor(device="CPU", verify_output_values=True, warn_on_missing=False)
+
+    # 1. Undisclosed failed mutating tool in an all-clear reply
+    r_ok = ToolReceipt(
+        tool="calendar_create_event",
+        ok=True,
+        executed=True,
+        args={"title": "Kickoff", "start": "2026-06-26T16:00:00+00:00"},
+        output='{"event_id": "evt_1", "start": "2026-06-26T16:00:00+00:00"}',
+    )
+    r_fail = ToolReceipt(
+        tool="email_send_invite",
+        ok=False,
+        executed=True,
+        error_code="timeout",
+        args={"to": "alice@acme.example"},
+        output="timeout: the request timed out",
+    )
+    v_undisc_fail = sup.verify_narration(
+        "All set: booked Kickoff on 2026-06-26 at 16:00 and invited alice@acme.example.",
+        receipts=[r_ok, r_fail],
+        user_prompt="Book Kickoff on 2026-06-26 and invite alice@acme.example.",
+    )
+    assert v_undisc_fail.is_valid is False
+    assert v_undisc_fail.verdict_status == "contradicted"
+
+    # 2. Mutating receipt booked 2026-05-22 while narration claims 2026-05-21
+    r_search = ToolReceipt(
+        tool="calendar_search_slots",
+        ok=True,
+        executed=True,
+        args={"date": "2026-05-21"},
+        output='{"slots": [{"start": "2026-05-21T10:30:00+00:00"}]}',
+    )
+    r_wrong_date = ToolReceipt(
+        tool="calendar_create_event",
+        ok=True,
+        executed=True,
+        args={"title": "Review", "start": "2026-05-22T10:30:00+00:00"},
+        output='{"event_id": "evt_2", "start": "2026-05-22T10:30:00+00:00"}',
+    )
+    v_date = sup.verify_narration(
+        "Review is on the calendar for 2026-05-21 at 10:30.",
+        receipts=[r_search, r_wrong_date],
+        user_prompt="Book Review on 2026-05-21 at 10:30.",
+    )
+    assert v_date.is_valid is False
+    assert any(sp.claimed_family == "OUTPUT_VALUE_MISMATCH" for sp in v_date.unsupported_spans)
+
+    # 3. Prompt asked to email alice@acme.example, mutating receipt emailed bob@other.example
+    r_wrong_email = ToolReceipt(
+        tool="email_send_invite",
+        ok=True,
+        executed=True,
+        args={"to": "bob@other.example"},
+        output='{"status": "queued"}',
+    )
+    v_target = sup.verify_narration(
+        "Kickoff is confirmed; invite sent to bob@other.example.",
+        receipts=[r_ok, r_wrong_email],
+        user_prompt="Book Kickoff on 2026-06-26 and email the invite to alice@acme.example.",
+    )
+    assert v_target.is_valid is False
+    assert any(sp.claimed_family == "WRONG_TARGET_MUTATION" for sp in v_target.unsupported_spans)
