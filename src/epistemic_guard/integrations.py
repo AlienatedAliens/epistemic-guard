@@ -539,6 +539,30 @@ def _parse_raw_args_map(raw_args: object) -> dict[str, str | int | float | bool]
     return {}
 
 
+def _content_indicates_tool_failure(content_str: str) -> bool:
+    """Return True if a tool message payload explicitly signals failure via text prefix or JSON."""
+    stripped = content_str.strip()
+    if stripped.lower().startswith(("error:", "traceback")):
+        return True
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            obj = json.loads(stripped)
+        except (TypeError, ValueError):
+            return False
+        if isinstance(obj, Mapping):
+            if obj.get("ok") is False or obj.get("success") is False:
+                return True
+            if obj.get("isError") is True or obj.get("is_error") is True:
+                return True
+            err_val = obj.get("error")
+            if err_val not in (None, False, "", [], {}):
+                return True
+            status_val = str(obj.get("status", "")).strip().lower()
+            if status_val in {"error", "failed", "failure", "denied", "rejected"}:
+                return True
+    return False
+
+
 def extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> list[ToolReceipt]:
     """Extract `ToolReceipt` items across OpenAI (`tool_calls`/`tool`), Anthropic
     (`tool_use`/`tool_result`), and Google Gemini (`functionCall`/`functionResponse`) transcripts.
@@ -661,8 +685,8 @@ def extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> lis
                 if isinstance(content_val, str)
                 else json.dumps(content_val, sort_keys=True, separators=(",", ":"))
             )
-            is_err = bool(msg.get("is_error", False)) or content_str.lower().startswith(
-                ("error:", "traceback")
+            is_err = bool(msg.get("is_error", False)) or _content_indicates_tool_failure(
+                content_str
             )
             tname, parsed_args = call_meta.get(cid, (str(msg.get("name", "tool")), {}))
             extracted.append(

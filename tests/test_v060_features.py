@@ -1043,3 +1043,44 @@ def test_probe_verified_mutation_overrides_read_only_stem_gate() -> None:
     v_hidden_strict = sup_strict.verify_narration("All set, nothing changed.", [probed_rcpt])
     assert v_hidden_strict.is_valid is False
     assert any("get_cache_entry" in m for m in v_hidden_strict.undisclosed_mutations)
+
+
+
+def test_extract_receipts_parses_structured_json_tool_failures() -> None:
+    """OpenAI `role == 'tool'` messages returning structured JSON failures
+    (`ok: false`, `error: ...`, `status: 'failed'`) must become `ok=False` receipts.
+    """
+    from epistemic_guard import extract_receipts_from_messages, verify_chat_turn
+
+    messages = [
+        {"role": "user", "content": "Delete report.txt."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_json_err",
+                    "type": "function",
+                    "function": {
+                        "name": "delete_file",
+                        "arguments": '{"path": "report.txt"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_json_err",
+            "name": "delete_file",
+            "content": '{"ok": false, "error": "PermissionError: access denied"}',
+        },
+    ]
+    receipts = extract_receipts_from_messages(messages)
+    assert len(receipts) == 1
+    assert receipts[0].ok is False
+    verdict = verify_chat_turn(
+        messages,
+        response="I deleted report.txt.",
+        supervisor=ReceiptSupervisor(warn_on_missing=False),
+    )
+    assert verdict.is_valid is False
