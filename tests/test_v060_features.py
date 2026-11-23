@@ -998,3 +998,48 @@ def test_redteam_adversarial_persistence_refinement_and_retry_drift() -> None:
     )
     assert v_drop.is_valid is False
     assert any(sp.claimed_family == "RETRY_ARG_DRIFT" for sp in v_drop.unsupported_spans)
+
+
+
+def test_probe_verified_mutation_overrides_read_only_stem_gate() -> None:
+    """Dual-purpose `get_*`/`search_*` tools stay strictly read-only by default,
+    but an out-of-band `independently_verified` OS-probe mutation diff both grounds
+    an honest write claim and exposes an undisclosed silent mutation.
+    """
+    sup = ReceiptSupervisor(warn_on_missing=False)
+
+    # 1. Without a verified probe mutation, `get_cache_entry` stays strictly read-only
+    v_unprobed = sup.verify_narration(
+        "I updated cache.json.",
+        [
+            ToolReceipt(
+                tool="get_cache_entry",
+                ok=True,
+                executed=True,
+                args={"path": "cache.json"},
+                output="cached value refreshed",
+            )
+        ],
+    )
+    assert v_unprobed.is_valid is False
+
+    # 2. With an independently_verified OS-probe write diff, the receipt grounds the claim
+    probed_rcpt = ToolReceipt(
+        tool="get_cache_entry",
+        ok=True,
+        executed=True,
+        args={"path": "cache.json"},
+        output="cached value refreshed",
+        evidence_tier="independently_verified",
+        effect_observation={"expected_op": "write", "before": "sha256:aaa", "after": "sha256:bbb"},
+    )
+    v_probed = sup.verify_narration("I updated cache.json.", [probed_rcpt])
+    assert v_probed.is_valid is True
+
+    # 3. If the assistant hides the verified mutation from a `get_*` tool, record undisclosed_mutations
+    v_hidden = sup.verify_narration("All set, nothing changed.", [probed_rcpt])
+    assert any("get_cache_entry" in m for m in v_hidden.undisclosed_mutations)
+    sup_strict = ReceiptSupervisor(flag_undisclosed_mutations=True, warn_on_missing=False)
+    v_hidden_strict = sup_strict.verify_narration("All set, nothing changed.", [probed_rcpt])
+    assert v_hidden_strict.is_valid is False
+    assert any("get_cache_entry" in m for m in v_hidden_strict.undisclosed_mutations)

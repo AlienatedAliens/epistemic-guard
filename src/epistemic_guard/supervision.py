@@ -741,6 +741,23 @@ def _is_read_only_tool(tool_name: str) -> bool:
     )
 
 
+def _receipt_has_verified_mutation(rcpt: ToolReceipt) -> bool:
+    """Return True iff an out-of-band OS probe independently observed a state mutation."""
+    if rcpt.evidence_tier != "independently_verified":
+        return False
+    obs = rcpt.effect_observation
+    if not isinstance(obs, Mapping):
+        return False
+    op = str(obs.get("expected_op") or obs.get("op") or obs.get("mutation") or "").lower()
+    if op and op not in {"read", "none", "noop"}:
+        return True
+    if bool(obs.get("mutated")) or bool(obs.get("changed")):
+        return True
+    before = obs.get("before")
+    after = obs.get("after")
+    return before is not None and after is not None and before != after
+
+
 def _extract_receipt_target_key(rcpt: ToolReceipt) -> str:
     """Extract a normalized value-only target key from `args` (or JSON `output` for `create_*`
     tools that return a newly minted `id`/`event_id`/`record_id`).
@@ -1760,12 +1777,15 @@ class ReceiptSupervisor:
             )
             for rcpt in ok_receipts:
                 t_low = rcpt.tool.lower()
-                if _SQL_OR_EXEC_TOOL_RE.search(t_low) or strict_file_re.search(t_low):
-                    continue
-                if any(
-                    re.search(rf"(?:^|_){re.escape(s)}(?:_|$)", t_low) for s in strict_read_stems
-                ):
-                    continue
+                verified_mut = _receipt_has_verified_mutation(rcpt)
+                if not verified_mut:
+                    if _SQL_OR_EXEC_TOOL_RE.search(t_low) or strict_file_re.search(t_low):
+                        continue
+                    if any(
+                        re.search(rf"(?:^|_){re.escape(s)}(?:_|$)", t_low)
+                        for s in strict_read_stems
+                    ):
+                        continue
                 arg_hit = any(
                     len(str(v).strip()) >= 4 and str(v).strip().lower() in cl_lower
                     for v in rcpt.args.values()
@@ -2218,7 +2238,7 @@ class ReceiptSupervisor:
                     and not _SQL_WRITE_ARG_RE.search(joined_sql)
                 ):
                     is_read_only = True
-            if is_read_only:
+            if is_read_only and not _receipt_has_verified_mutation(rcpt):
                 continue
 
             disclosed = False
@@ -2290,7 +2310,10 @@ class ReceiptSupervisor:
         # When another mutating tool succeeded in the same turn, only require disclosure for
         # failed calls that actually executed (or whose target/tool was requested in user_prompt),
         # so an unrelated pre-execution schema rejection does not poison a grounded reply.
-        has_ok_mutation = any(not _is_read_only_tool(r.tool) for r in ok_receipts)
+        has_ok_mutation = any(
+            (not _is_read_only_tool(r.tool)) or _receipt_has_verified_mutation(r)
+            for r in ok_receipts
+        )
         prompt_l = user_prompt.lower()
         undisc_candidates = [
             fr
