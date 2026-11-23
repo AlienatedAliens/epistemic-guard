@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
+import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,16 +18,23 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Final
+from typing import Any, BinaryIO, Final
 from uuid import uuid4
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import BaseModel, Field
 
-from epistemic_guard.exceptions import MerkleTamperError, ProvenanceError, SignatureTamperError
+from epistemic_guard.aer1 import export_receipts_to_aer1_chain_v07
+from epistemic_guard.exceptions import (
+    MerkleTamperError,
+    ProvenanceError,
+    SignatureTamperError,
+    ToolPinMismatchError,
+)
 from epistemic_guard.provenance import DomainSigner, ProvenanceGate
 from epistemic_guard.schemas import Provenance, ToolReceipt
 from epistemic_guard.store import MerkleReceiptLog
+from epistemic_guard.web_filters import clean_scraped_passage, cluster_near_duplicate_sources
 
 _PRE_EXEC_JSONRPC_CODES: Final[frozenset[int]] = frozenset({-32700, -32600, -32601, -32602})
 _MCP_VALIDATION_MARKERS: Final[tuple[str, ...]] = (
@@ -122,6 +133,9 @@ class ReceiptLogEntry(BaseModel):
     entry_signature: str = ""
     prev_chain_sha256: str | None = None
     aer1: dict[str, object] | None = None
+    operation_key: str | None = None
+    operation_input_sha256: str | None = None
+    cached_rpc_result: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,327 @@ class _PendingToolCall:
     call_id: str
     tool: str
     args: dict[str, str | int | float | bool]
+    tool_def_sha256: str = ""
+    fs_probe: tuple[str, Path, dict[str, Any]] | None = None
+    git_probe: tuple[Path, dict[str, Any]] | None = None
+    sqlite_probe: tuple[Path, dict[str, Any]] | None = None
+
+
+_FS_WRITE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:write|save|create|edit|update|append|patch|put)(?:_|$)",
+    re.IGNORECASE,
+)
+_FS_DELETE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:delete|remove|unlink|rm|erase)(?:_|$)",
+    re.IGNORECASE,
+)
+_FS_PATH_ARG_KEYS: Final[tuple[str, ...]] = (
+    "path",
+    "file_path",
+    "filepath",
+    "filename",
+    "target_path",
+    "destination",
+)
+_FS_MAX_HASH_BYTES: Final[int] = 16 * 1024 * 1024
+
+
+def _stat_and_hash_file(
+    target: Path, *, max_hash_bytes: int = _FS_MAX_HASH_BYTES
+) -> dict[str, Any]:
+    """Read-only filesystem snapshot independent of any MCP server response."""
+    try:
+        st = target.stat()
+    except OSError:
+        return {"exists": False}
+    snap: dict[str, Any] = {
+        "exists": True,
+        "is_dir": target.is_dir(),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+    if target.is_file() and st.st_size <= max_hash_bytes:
+        h = hashlib.sha256()
+        try:
+            with target.open("rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            snap["sha256"] = h.hexdigest()
+        except OSError:
+            pass
+    return snap
+
+
+def _arm_fs_probe(
+    root: Path,
+    tool_name: str,
+    args: Mapping[str, str | int | float | bool],
+) -> tuple[str, Path, dict[str, Any]] | None:
+    """Arm an out-of-process filesystem effect probe if `tool_name` targets a path under `root`."""
+    expected_op: str | None = None
+    if _FS_DELETE_TOOL_RE.search(tool_name):
+        expected_op = "delete"
+    elif _FS_WRITE_TOOL_RE.search(tool_name):
+        expected_op = "write"
+    if expected_op is None:
+        return None
+
+    raw_path: str | None = None
+    for key in _FS_PATH_ARG_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            raw_path = val.strip()
+            break
+    if raw_path is None:
+        return None
+
+    try:
+        root_resolved = root.resolve()
+        candidate = Path(raw_path)
+        target_resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (root_resolved / candidate).resolve()
+        )
+        if not target_resolved.is_relative_to(root_resolved):
+            return None
+    except (OSError, ValueError):
+        return None
+
+    return (expected_op, target_resolved, _stat_and_hash_file(target_resolved))
+
+
+def _evaluate_fs_probe(
+    expected_op: str,
+    target_path: Path,
+    before: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Compare post-call disk state against pre-call snapshot independently of server output."""
+    after = _stat_and_hash_file(target_path)
+    if expected_op == "write":
+        if not after.get("exists"):
+            verified, reason = False, "file_missing_after_write"
+        elif (
+            before.get("exists")
+            and before.get("size") == after.get("size")
+            and before.get("sha256") == after.get("sha256")
+            and before.get("mtime_ns") == after.get("mtime_ns")
+        ):
+            verified, reason = False, "file_unchanged_after_ok"
+        else:
+            verified = True
+            reason = "file_created" if not before.get("exists") else "file_mutated"
+    elif after.get("exists"):
+        verified, reason = False, "file_still_exists_after_delete"
+    else:
+        verified, reason = True, "file_deleted"
+
+    observation: dict[str, Any] = {
+        "observer": "epistemic_guard.mcp_proxy.filesystem_probe",
+        "kind": "filesystem",
+        "target_path": str(target_path),
+        "expected_op": expected_op,
+        "before": dict(before),
+        "after": after,
+        "verified": verified,
+        "reason": reason,
+    }
+    return (verified, observation)
+
+
+_GIT_MUTATING_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)git_(?:commit|checkout|reset|branch|merge|revert|tag|stash|add|cherry_pick)(?:_|$)",
+    re.IGNORECASE,
+)
+_SQLITE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:sql|sqlite|db|database|query)(?:_|$)",
+    re.IGNORECASE,
+)
+_SQLITE_MUTATING_QUERY_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:insert\s+(?:or\s+\w+\s+)?into|update\s+(?:or\s+\w+\s+)?\w+\s+set|delete\s+from|"
+    r"drop\s+(?:table|index|view)|create\s+(?:table|index|view)|alter\s+table|"
+    r"replace\s+into|upsert|truncate)\b",
+    re.IGNORECASE,
+)
+_SQLITE_QUERY_ARG_KEYS: Final[tuple[str, ...]] = ("query", "sql", "statement", "command")
+
+
+def _snapshot_git_repo(repo_path: Path) -> dict[str, Any]:
+    """Read-only git HEAD, refs, status, diff, and stash snapshot outside the server's trust."""
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        return {"ok": False}
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    base_cmd = [git_bin, "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(repo_path)]
+
+    def _run_git(extra: list[str]) -> tuple[int, str]:
+        res = subprocess.run(
+            [*base_cmd, *extra],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+            env=env,
+        )
+        return (int(res.returncode), res.stdout)
+
+    try:
+        rc_head, out_head = _run_git(["rev-parse", "HEAD"])
+        rc_sym, out_sym = _run_git(["symbolic-ref", "-q", "HEAD"])
+        rc_stat, out_stat = _run_git(["status", "--porcelain"])
+        rc_refs, out_refs = _run_git(["for-each-ref", "--format=%(refname) %(objectname)"])
+        rc_diff, out_diff = _run_git(["diff"])
+        rc_stash, out_stash = _run_git(["stash", "list"])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {"ok": False}
+
+    if rc_stat != 0 or rc_refs != 0:
+        return {"ok": False}
+
+    def _h(s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    return {
+        "ok": True,
+        "head": out_head.strip() if rc_head == 0 else "",
+        "symbolic_ref": out_sym.strip() if rc_sym == 0 else "",
+        "status_sha256": _h(out_stat),
+        "refs_sha256": _h(out_refs),
+        "diff_sha256": _h(out_diff) if rc_diff == 0 else "",
+        "stash_sha256": _h(out_stash) if rc_stash == 0 else "",
+    }
+
+
+def _arm_git_probe(repo_path: Path, tool_name: str) -> tuple[Path, dict[str, Any]] | None:
+    if not _GIT_MUTATING_TOOL_RE.search(tool_name):
+        return None
+    snap = _snapshot_git_repo(repo_path)
+    return (repo_path, snap) if snap.get("ok") else None
+
+
+def _evaluate_git_probe(
+    repo_path: Path, before: Mapping[str, Any]
+) -> tuple[bool | None, dict[str, Any]]:
+    """Three-state git evaluation: True (verified), False (contradicted), None (unobservable)."""
+    after = _snapshot_git_repo(repo_path)
+    if not after.get("ok"):
+        return (
+            None,
+            {
+                "observer": "epistemic_guard.mcp_proxy.git_probe",
+                "kind": "git",
+                "target_path": str(repo_path),
+                "before": dict(before),
+                "after": after,
+                "verified": None,
+                "reason": "git_probe_unobservable",
+            },
+        )
+    keys = ("head", "symbolic_ref", "status_sha256", "refs_sha256", "diff_sha256", "stash_sha256")
+    changed = any(before.get(k) != after.get(k) for k in keys)
+    reason = "git_state_mutated" if changed else "git_state_unchanged_after_ok"
+    return (
+        changed,
+        {
+            "observer": "epistemic_guard.mcp_proxy.git_probe",
+            "kind": "git",
+            "target_path": str(repo_path),
+            "before": dict(before),
+            "after": after,
+            "verified": changed,
+            "reason": reason,
+        },
+    )
+
+
+def _snapshot_sqlite_db(db_path: Path) -> dict[str, Any]:
+    """Read-only SQLite snapshot (file/WAL stat + sha256 + schema_version)."""
+    if not db_path.exists():
+        return {"ok": False, "exists": False}
+    snap: dict[str, Any] = {"ok": True, "exists": True}
+    try:
+        st = db_path.stat()
+        snap["size"] = int(st.st_size)
+        snap["mtime_ns"] = int(st.st_mtime_ns)
+        snap["sha256"] = _stat_and_hash_file(db_path).get("sha256", "")
+    except OSError:
+        return {"ok": False, "exists": True}
+    wal_p = Path(f"{db_path}-wal")
+    if wal_p.exists():
+        with contextlib.suppress(OSError):
+            wst = wal_p.stat()
+            snap["wal_size"] = int(wst.st_size)
+            snap["wal_mtime_ns"] = int(wst.st_mtime_ns)
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2.0)) as conn:
+            chg = conn.execute("PRAGMA schema_version").fetchone()
+            if chg:
+                snap["schema_version"] = int(chg[0])
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    return snap
+
+
+def _arm_sqlite_probe(
+    db_path: Path,
+    tool_name: str,
+    args: Mapping[str, str | int | float | bool],
+) -> tuple[Path, dict[str, Any]] | None:
+    if not _SQLITE_TOOL_RE.search(tool_name):
+        return None
+    query_texts = [
+        str(args[k]) for k in _SQLITE_QUERY_ARG_KEYS if k in args and isinstance(args[k], str)
+    ]
+    if not query_texts:
+        return None
+    if not any(_SQLITE_MUTATING_QUERY_RE.search(q) for q in query_texts):
+        return None
+    snap = _snapshot_sqlite_db(db_path)
+    return (db_path, snap) if snap.get("ok") else None
+
+
+def _evaluate_sqlite_probe(
+    db_path: Path, before: Mapping[str, Any]
+) -> tuple[bool | None, dict[str, Any]]:
+    """Three-state SQLite evaluation: True (verified), False (contradicted), None (unobservable)."""
+    after = _snapshot_sqlite_db(db_path)
+    if not after.get("ok"):
+        return (
+            None,
+            {
+                "observer": "epistemic_guard.mcp_proxy.sqlite_probe",
+                "kind": "sqlite",
+                "target_path": str(db_path),
+                "before": dict(before),
+                "after": after,
+                "verified": None,
+                "reason": "sqlite_probe_unobservable",
+            },
+        )
+    compare_keys = ["size", "mtime_ns", "wal_size", "wal_mtime_ns", "sha256"]
+    if "schema_version" in before and "schema_version" in after:
+        compare_keys.append("schema_version")
+    changed = any(before.get(k) != after.get(k) for k in compare_keys)
+    reason = "sqlite_mutated" if changed else "sqlite_unchanged_after_ok"
+    return (
+        changed,
+        {
+            "observer": "epistemic_guard.mcp_proxy.sqlite_probe",
+            "kind": "sqlite",
+            "target_path": str(db_path),
+            "before": dict(before),
+            "after": after,
+            "verified": changed,
+            "reason": reason,
+        },
+    )
 
 
 def _coerce_scalar(val: object) -> str | int | float | bool:
@@ -325,7 +660,25 @@ class ReceiptLogWriter:
             initial_chain_hash=self._initial_chain_hash,
         )
         self._seen_call_ids: set[str] = set()
+        self._op_index: dict[str, ReceiptLogEntry] = {}
+        self._id_index: dict[str, ReceiptLogEntry] = {}
         self._synced_lines = 0
+
+        # Seed durable operation_key and receipt lookup indexes from verified predecessor log
+        # so log/key rotation (`--prev-log`) preserves A5 recovery and idempotent retry protection.
+        if prev_log_path is not None:
+            prev_raw = Path(prev_log_path).read_text(encoding="utf-8").splitlines()
+            for line in prev_raw:
+                if not line.strip():
+                    continue
+                prev_entry = ReceiptLogEntry.model_validate_json(line)
+                self._id_index[prev_entry.receipt.call_id] = prev_entry
+                if isinstance(prev_entry.aer1, Mapping) and isinstance(
+                    prev_entry.aer1.get("id"), str
+                ):
+                    self._id_index[str(prev_entry.aer1["id"])] = prev_entry
+                if prev_entry.operation_key and prev_entry.operation_key not in self._op_index:
+                    self._op_index[prev_entry.operation_key] = prev_entry
 
         with _exclusive_log_lock(self.log_path):
             if truncate and self.log_path.exists():
@@ -423,9 +776,54 @@ class ReceiptLogWriter:
             ):
                 raise MerkleTamperError(f"Existing receipt log failed Merkle check at seq={idx}.")
             self._seen_call_ids.add(entry.receipt.call_id)
+            self._id_index[entry.receipt.call_id] = entry
+            if isinstance(entry.aer1, Mapping) and isinstance(entry.aer1.get("id"), str):
+                self._id_index[str(entry.aer1["id"])] = entry
+            if entry.operation_key and entry.operation_key not in self._op_index:
+                self._op_index[entry.operation_key] = entry
         self._synced_lines = len(raw_lines)
 
-    def append(self, receipt: ToolReceipt) -> ReceiptLogEntry:
+    def lookup_operation(self, operation_key: str) -> ReceiptLogEntry | None:
+        """Look up a committed operation entry by durable `operation_key` (syncing disk first)."""
+        key = operation_key.strip()
+        if not key:
+            return None
+        with self._lock, _exclusive_log_lock(self.log_path):
+            if self.log_path.exists() and self.log_path.stat().st_size > 0:
+                self._sync_from_disk_locked()
+            return self._op_index.get(key)
+
+    def lookup_receipt_or_operation(self, identifier: str) -> ReceiptLogEntry | None:
+        """Resolve a log entry by `operation_key`, `receipt.call_id`, or `aer1.id`."""
+        ident = identifier.strip()
+        if not ident:
+            return None
+        with self._lock, _exclusive_log_lock(self.log_path):
+            if self.log_path.exists() and self.log_path.stat().st_size > 0:
+                self._sync_from_disk_locked()
+            return self._op_index.get(ident) or self._id_index.get(ident)
+
+    def export_aer1_chain_v07(
+        self, *, close: bool = True, published_at: str | None = None
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Export this writer's verified `ToolReceipt` sequence as an AER-1 `-07` chain."""
+        with self._lock:
+            rcpts = list(self._merkle.receipts)
+        return export_receipts_to_aer1_chain_v07(
+            rcpts,
+            job_id=self._session_id,
+            close=close,
+            published_at=published_at,
+        )
+
+    def append(
+        self,
+        receipt: ToolReceipt,
+        *,
+        operation_key: str | None = None,
+        operation_input_sha256: str | None = None,
+        cached_rpc_result: dict[str, object] | None = None,
+    ) -> ReceiptLogEntry:
         """Sign `receipt`, update the Merkle log, and atomically flush one JSONL line to disk."""
         with self._lock, _exclusive_log_lock(self.log_path):
             self._sync_from_disk_locked()
@@ -464,6 +862,7 @@ class ReceiptLogWriter:
                 chain_sha256=chain_sha,
                 merkle_root=proof.root_sha256,
             )
+            clean_op = operation_key.strip() if operation_key and operation_key.strip() else None
             entry = ReceiptLogEntry(
                 seq=seq,
                 receipt=signed,
@@ -474,7 +873,15 @@ class ReceiptLogWriter:
                 entry_signature=entry_sig,
                 prev_chain_sha256=prev_anchor,
                 aer1=signed.to_aer1() if self._include_aer1 else None,
+                operation_key=clean_op,
+                operation_input_sha256=operation_input_sha256 if clean_op else None,
+                cached_rpc_result=cached_rpc_result if clean_op else None,
             )
+            if clean_op and clean_op not in self._op_index:
+                self._op_index[clean_op] = entry
+            self._id_index[signed.call_id] = entry
+            if isinstance(entry.aer1, Mapping) and isinstance(entry.aer1.get("id"), str):
+                self._id_index[str(entry.aer1["id"])] = entry
             serialized = json.dumps(
                 entry.model_dump(exclude_none=True),
                 sort_keys=True,
@@ -660,30 +1067,222 @@ def _extract_mcp_result_text(result: object) -> tuple[bool, str, bool]:
     return (False, output_text, is_validation)
 
 
+_PROMPT_INJECTION_BANNER_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?im)^.*(?:"
+    r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?|"
+    r"system\s+override\s*:|"
+    r"<\s*(?:system|developer|important_instruction)\s*>.*<\s*/\s*(?:system|developer|important_instruction)\s*>|"
+    r"you\s+are\s+now\s+in\s+developer\s+mode"
+    r").*$"
+)
+_WEB_SEARCH_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:search|fetch|scrape|browse|crawl|web|firecrawl|tavily|brave|exa|serp)",
+    re.IGNORECASE,
+)
+
+
+def compute_mcp_tool_sha256(tool_def: Mapping[str, Any]) -> str:
+    """Compute canonical SHA-256 over `(name, description, inputSchema[, annotations])`."""
+    canonical: dict[str, Any] = {
+        "name": str(tool_def.get("name") or ""),
+        "description": str(tool_def.get("description") or ""),
+        "inputSchema": tool_def.get("inputSchema") or {},
+    }
+    if "annotations" in tool_def and tool_def["annotations"] is not None:
+        canonical["annotations"] = tool_def["annotations"]
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(blob).hexdigest()
+
+
+def sanitize_untrusted_web_text(raw_text: str) -> tuple[str, int]:
+    """Strip indirect prompt-injection directives, anti-bot stubs, and syndicated wire copies.
+
+    Returns `(sanitized_text, collapsed_or_stripped_count)`.
+    """
+    removed = 0
+
+    def _strip_inj(match: re.Match[str]) -> str:
+        nonlocal removed
+        removed += 1
+        return "[STRIPPED_UNTRUSTED_DIRECTIVE]"
+
+    scrubbed = _PROMPT_INJECTION_BANNER_RE.sub(_strip_inj, raw_text)
+    stripped = scrubbed.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        with contextlib.suppress(Exception):
+            parsed = json.loads(stripped)
+            items = (
+                parsed
+                if isinstance(parsed, list)
+                else (parsed.get("results") if isinstance(parsed, Mapping) else None)
+            )
+            if isinstance(items, list) and items and all(isinstance(x, Mapping) for x in items):
+                raw_tuples: list[tuple[str, str, str, str]] = []
+                for idx, entry in enumerate(items):
+                    url = str(entry.get("url") or entry.get("link") or f"source-{idx}.example")
+                    snippet = str(
+                        entry.get("snippet") or entry.get("content") or entry.get("text") or ""
+                    )
+                    title = str(entry.get("title") or "")
+                    cleaned, is_stub = clean_scraped_passage(snippet, title=title)
+                    if is_stub and not cleaned:
+                        removed += 1
+                        continue
+                    dom = (
+                        url.rsplit("//", maxsplit=1)[-1].split("/", maxsplit=1)[0].lower()
+                        or f"src-{idx}"
+                    )
+                    raw_tuples.append((dom, url, f"{title} {cleaned}".strip(), cleaned))
+                if raw_tuples:
+                    clusters, collapsed = cluster_near_duplicate_sources(raw_tuples, "")
+                    removed += collapsed
+                    deduped_docs = [
+                        {
+                            "domain": cl.primary_domain,
+                            "url": cl.primary_url,
+                            "snippet": cl.primary_body_text,
+                            "collapsed_syndicated_copies": cl.collapsed_duplicates,
+                        }
+                        for cl in clusters
+                    ]
+                    if isinstance(parsed, Mapping):
+                        out_doc = dict(parsed)
+                        out_doc["results"] = deduped_docs
+                        out_doc["deduplicated_copies_collapsed"] = collapsed
+                        return (
+                            json.dumps(out_doc, sort_keys=True, separators=(",", ":")),
+                            removed,
+                        )
+                    return (
+                        json.dumps(deduped_docs, sort_keys=True, separators=(",", ":")),
+                        removed,
+                    )
+    return (scrubbed, removed)
+
+
+def filter_mcp_result_object(
+    tool_name: str, response_obj: Mapping[str, object]
+) -> tuple[dict[str, object], int]:
+    """Filter `result.content` text blocks on web-search/fetch MCP tools."""
+    if not _WEB_SEARCH_TOOL_RE.search(tool_name):
+        return (dict(response_obj), 0)
+    res = response_obj.get("result")
+    if not isinstance(res, Mapping) or bool(res.get("isError", False)):
+        return (dict(response_obj), 0)
+    content = res.get("content")
+    if not isinstance(content, list):
+        return (dict(response_obj), 0)
+
+    total_changes = 0
+    new_content: list[object] = []
+    for block in content:
+        if isinstance(block, Mapping) and block.get("type") == "text" and isinstance(
+            block.get("text"), str
+        ):
+            clean_txt, delta = sanitize_untrusted_web_text(block["text"])
+            total_changes += delta
+            new_blk = dict(block)
+            new_blk["text"] = clean_txt
+            new_content.append(new_blk)
+        else:
+            new_content.append(block)
+    if total_changes == 0:
+        return (dict(response_obj), 0)
+    new_res = dict(res)
+    new_res["content"] = new_content
+    updated = dict(response_obj)
+    updated["result"] = new_res
+    return (updated, total_changes)
+
+
 class McpStdioProxy:
     """Out-of-process stdio JSON-RPC 2.0 proxy recording signed `ToolReceipt`s."""
 
-    def __init__(self, writer: ReceiptLogWriter) -> None:
+    def __init__(
+        self,
+        writer: ReceiptLogWriter,
+        *,
+        pin_tools: bool = False,
+        raise_on_rugpull: bool = False,
+        filter_web_results: bool = False,
+        endpoint_id: str = "",
+        probe_fs_root: Path | str | None = None,
+        probe_git_repo: Path | str | None = None,
+        probe_sqlite_path: Path | str | None = None,
+    ) -> None:
         self._writer = writer
+        self._pin_tools = pin_tools
+        self._raise_on_rugpull = raise_on_rugpull
+        self._filter_web_results = filter_web_results
+        self._endpoint_id = endpoint_id
+        self._probe_fs_root: Path | None = (
+            Path(probe_fs_root).resolve() if probe_fs_root is not None else None
+        )
+        self._probe_git_repo: Path | None = (
+            Path(probe_git_repo).resolve() if probe_git_repo is not None else None
+        )
+        self._probe_sqlite_path: Path | None = (
+            Path(probe_sqlite_path).resolve() if probe_sqlite_path is not None else None
+        )
         self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
+        self._pending_tools_list: set[tuple[str, str]] = set()
         self._seen_rpc_counts: dict[tuple[str, str], int] = {}
+        self._tool_pins: dict[str, str] = {}
+        self._compromised_tools: set[str] = set()
+        self._observed_tools: dict[str, dict[str, Any]] = {}
+        self._rugpull_count = 0
         self._lock = threading.Lock()
 
-    def observe_client_line(self, raw_line: bytes) -> None:
-        """Inspect a client->server JSON-RPC line and register `tools/call` requests."""
+    @property
+    def observed_tools(self) -> list[dict[str, Any]]:
+        """Snapshot of MCP `tools/list` definitions observed by this proxy."""
+        with self._lock:
+            return [dict(v) for v in self._observed_tools.values()]
+
+    @property
+    def tool_pins(self) -> dict[str, str]:
+        """Map of `tool_name -> canonical SHA-256` pinned from initial `tools/list`."""
+        with self._lock:
+            return dict(self._tool_pins)
+
+    def process_client_line(self, raw_line: bytes) -> tuple[bytes, list[bytes]]:
+        """Inspect a client->server JSON-RPC line.
+
+        Returns `(bytes_to_forward_to_server, immediate_client_error_lines)`.
+        When `pin_tools=True` and a tool's definition previously mutated mid-session,
+        `tools/call` for that tool is refused pre-execution without forwarding upstream.
+        """
         stripped = raw_line.strip()
         if not stripped or stripped[:1] not in (b"{", b"["):
-            return
+            return (raw_line, [])
         try:
             payload = json.loads(stripped.decode("utf-8"))
         except Exception:
-            return
-        items = payload if isinstance(payload, list) else [payload]
+            return (raw_line, [])
+        is_batch = isinstance(payload, list)
+        items = payload if is_batch else [payload]
+        fwd_items: list[object] = []
+        refusal_lines: list[bytes] = []
+        intercepted = False
+
         for item in items:
-            if not isinstance(item, Mapping) or item.get("method") != "tools/call":
+            if not isinstance(item, Mapping):
+                fwd_items.append(item)
                 continue
+            method = item.get("method")
             id_key = _rpc_id_key(item.get("id"))
             if id_key is None:
+                fwd_items.append(item)
+                continue
+            if method == "tools/list":
+                with self._lock:
+                    self._pending_tools_list.add(id_key)
+                fwd_items.append(item)
+                continue
+            if method != "tools/call":
+                fwd_items.append(item)
                 continue
             params = item.get("params")
             if isinstance(params, Mapping):
@@ -708,39 +1307,214 @@ class McpStdioProxy:
                 occ = self._seen_rpc_counts.get(id_key, 0) + 1
                 self._seen_rpc_counts[id_key] = occ
                 cid = f"mcp-{id_key[1]}" if occ == 1 else f"mcp-{id_key[1]}#{occ}"
-                self._pending.setdefault(id_key, []).append(
-                    _PendingToolCall(
+                pinned_sha = self._tool_pins.get(tool_name, "")
+                is_compromised = self._pin_tools and tool_name in self._compromised_tools
+                if not is_compromised:
+                    armed_probe = (
+                        _arm_fs_probe(self._probe_fs_root, tool_name, args_map)
+                        if self._probe_fs_root is not None
+                        else None
+                    )
+                    armed_git = (
+                        _arm_git_probe(self._probe_git_repo, tool_name)
+                        if self._probe_git_repo is not None
+                        else None
+                    )
+                    armed_sqlite = (
+                        _arm_sqlite_probe(self._probe_sqlite_path, tool_name, args_map)
+                        if self._probe_sqlite_path is not None
+                        else None
+                    )
+                    self._pending.setdefault(id_key, []).append(
+                        _PendingToolCall(
+                            call_id=cid,
+                            tool=tool_name,
+                            args=args_map,
+                            tool_def_sha256=pinned_sha,
+                            fs_probe=armed_probe,
+                            git_probe=armed_git,
+                            sqlite_probe=armed_sqlite,
+                        )
+                    )
+
+            if is_compromised:
+                intercepted = True
+                self._writer.append(
+                    ToolReceipt(
                         call_id=cid,
                         tool=tool_name,
+                        ok=False,
+                        executed=False,
+                        error_code="mcp_tool_pin_refused",
                         args=args_map,
+                        output=(
+                            f"Refused tools/call for '{tool_name}': tool definition changed "
+                            "mid-session from approved pin."
+                        ),
+                        tool_definition_sha256=pinned_sha,
+                        endpoint_id=self._endpoint_id,
                     )
                 )
+                err_resp = {
+                    "jsonrpc": "2.0",
+                    "id": item.get("id"),
+                    "error": {
+                        "code": -32603,
+                        "message": (
+                            f"MCP tool '{tool_name}' invocation refused: definition digest "
+                            "differs from approved session pin."
+                        ),
+                    },
+                }
+                refusal_lines.append(
+                    (json.dumps(err_resp, separators=(",", ":")) + "\n").encode("utf-8")
+                )
+            else:
+                fwd_items.append(item)
 
-    def observe_server_line(self, raw_line: bytes) -> None:
-        """Inspect a server->client JSON-RPC line and commit receipts for completed calls."""
+        if not intercepted:
+            return (raw_line, [])
+        if not fwd_items:
+            return (b"", refusal_lines)
+        out_fwd = fwd_items if is_batch else fwd_items[0]
+        return ((json.dumps(out_fwd, separators=(",", ":")) + "\n").encode("utf-8"), refusal_lines)
+
+    def observe_client_line(self, raw_line: bytes) -> None:
+        """Inspect a client->server JSON-RPC line and register `tools/call` or `tools/list`."""
+        self.process_client_line(raw_line)
+
+    def _inspect_tools_list_response(
+        self, item: Mapping[str, object]
+    ) -> list[tuple[str, str, str]]:
+        """Record `tools/list` definitions and return `(name, old_sha, new_sha)` mutations."""
+        res = item.get("result")
+        if not isinstance(res, Mapping):
+            return []
+        tools = res.get("tools")
+        if not isinstance(tools, list):
+            return []
+        mutations: list[tuple[str, str, str]] = []
+        with self._lock:
+            for tdef in tools:
+                if not isinstance(tdef, Mapping):
+                    continue
+                raw_name = tdef.get("name")
+                if not isinstance(raw_name, str) or not raw_name:
+                    continue
+                digest = compute_mcp_tool_sha256(tdef)
+                prev_digest = self._tool_pins.get(raw_name)
+                if prev_digest is None:
+                    self._tool_pins[raw_name] = digest
+                    self._observed_tools[raw_name] = dict(tdef)
+                elif prev_digest != digest:
+                    mutations.append((raw_name, prev_digest, digest))
+                    if self._pin_tools:
+                        self._compromised_tools.add(raw_name)
+                    else:
+                        self._tool_pins[raw_name] = digest
+                        self._observed_tools[raw_name] = dict(tdef)
+        for tname, old_h, new_h in mutations:
+            with self._lock:
+                self._rugpull_count += 1
+                rp_seq = self._rugpull_count
+            self._writer.append(
+                ToolReceipt(
+                    call_id=f"mcp-rugpull-{tname}-{rp_seq}-{uuid4().hex[:8]}",
+                    tool=tname,
+                    ok=False,
+                    executed=False,
+                    error_code="mcp_tool_rugpull",
+                    args={"pinned_sha256": old_h, "observed_sha256": new_h},
+                    output=(
+                        f"MCP tools/list schema mutation detected for '{tname}': "
+                        f"pinned={old_h[:16]}... != observed={new_h[:16]}..."
+                    ),
+                    tool_definition_sha256=old_h,
+                    endpoint_id=self._endpoint_id,
+                )
+            )
+            if self._raise_on_rugpull:
+                raise ToolPinMismatchError(
+                    f"MCP tool '{tname}' mutated mid-session: {old_h} -> {new_h}"
+                )
+        return mutations
+
+    def process_server_line(self, raw_line: bytes) -> bytes:
+        """Inspect and optionally filter/block a server->client JSON-RPC line."""
         stripped = raw_line.strip()
         if not stripped or stripped[:1] not in (b"{", b"["):
-            return
+            return raw_line
         try:
             payload = json.loads(stripped.decode("utf-8"))
         except Exception:
-            return
-        items = payload if isinstance(payload, list) else [payload]
+            return raw_line
+        is_batch = isinstance(payload, list)
+        items = payload if is_batch else [payload]
+        rewritten = False
+        out_items: list[object] = []
+
         for item in items:
             if not isinstance(item, Mapping) or "method" in item:
+                out_items.append(item)
                 continue
             id_key = _rpc_id_key(item.get("id"))
             if id_key is None:
+                out_items.append(item)
                 continue
+
+            is_tools_list = False
+            with self._lock:
+                if id_key in self._pending_tools_list:
+                    self._pending_tools_list.discard(id_key)
+                    is_tools_list = True
+            if is_tools_list:
+                mutations = self._inspect_tools_list_response(item)
+                if mutations and self._pin_tools:
+                    mut_names = ", ".join(m[0] for m in mutations)
+                    err_item = {
+                        "jsonrpc": "2.0",
+                        "id": item.get("id"),
+                        "error": {
+                            "code": -32603,
+                            "message": (
+                                f"MCP tools/list pin mismatch (rug-pull blocked): {mut_names}"
+                            ),
+                        },
+                    }
+                    out_items.append(err_item)
+                    rewritten = True
+                else:
+                    out_items.append(item)
+                continue
+
             with self._lock:
                 queue = self._pending.get(id_key)
                 pending = queue.pop(0) if queue else None
                 if queue is not None and not queue:
                     self._pending.pop(id_key, None)
             if pending is None:
+                out_items.append(item)
                 continue
-            receipt = self._build_receipt_from_response(pending, item)
+
+            active_item: Mapping[str, object] = item
+            if self._filter_web_results:
+                filtered_item, changes = filter_mcp_result_object(pending.tool, item)
+                if changes > 0:
+                    active_item = filtered_item
+                    rewritten = True
+
+            receipt = self._build_receipt_from_response(pending, active_item)
             self._writer.append(receipt)
+            out_items.append(active_item)
+
+        if not rewritten:
+            return raw_line
+        out_payload = out_items if is_batch else out_items[0]
+        return (json.dumps(out_payload, separators=(",", ":")) + "\n").encode("utf-8")
+
+    def observe_server_line(self, raw_line: bytes) -> None:
+        """Inspect a server->client JSON-RPC line and commit receipts for completed calls."""
+        self.process_server_line(raw_line)
 
     def flush_abandoned_calls(self, exit_code: int) -> None:
         """Record `ok=False` receipts for in-flight calls if the MCP server exits early."""
@@ -757,11 +1531,13 @@ class McpStdioProxy:
                     error_code="mcp_server_eof",
                     args=pending.args,
                     output=f"MCP server exited (code {exit_code}) before responding.",
+                    tool_definition_sha256=pending.tool_def_sha256,
+                    endpoint_id=self._endpoint_id,
                 )
             )
 
-    @staticmethod
     def _build_receipt_from_response(
+        self,
         pending: _PendingToolCall,
         response: Mapping[str, object],
     ) -> ToolReceipt:
@@ -787,10 +1563,71 @@ class McpStdioProxy:
                 error_code=f"jsonrpc_{code}",
                 args=pending.args,
                 output=f"JSON-RPC {code}: {msg}",
+                tool_definition_sha256=pending.tool_def_sha256,
+                endpoint_id=self._endpoint_id,
             )
 
         ok, output_text, is_validation = _extract_mcp_result_text(response.get("result"))
+        any_probe_enabled = (
+            self._probe_fs_root is not None
+            or self._probe_git_repo is not None
+            or self._probe_sqlite_path is not None
+        )
         if ok:
+            probe_result: tuple[bool | None, dict[str, Any]] | None = None
+            if pending.fs_probe is not None:
+                exp_op, target_path, before_snap = pending.fs_probe
+                probe_result = _evaluate_fs_probe(exp_op, target_path, before_snap)
+            elif pending.git_probe is not None:
+                repo_path, before_git = pending.git_probe
+                probe_result = _evaluate_git_probe(repo_path, before_git)
+            elif pending.sqlite_probe is not None:
+                db_path, before_db = pending.sqlite_probe
+                probe_result = _evaluate_sqlite_probe(db_path, before_db)
+
+            if probe_result is not None:
+                verified, obs = probe_result
+                if verified is True:
+                    return ToolReceipt(
+                        call_id=pending.call_id,
+                        tool=pending.tool,
+                        ok=True,
+                        executed=True,
+                        error_code="",
+                        args=pending.args,
+                        output=output_text,
+                        tool_definition_sha256=pending.tool_def_sha256,
+                        endpoint_id=self._endpoint_id,
+                        evidence_tier="independently_verified",
+                        effect_observation=obs,
+                    )
+                if verified is None:
+                    return ToolReceipt(
+                        call_id=pending.call_id,
+                        tool=pending.tool,
+                        ok=True,
+                        executed=True,
+                        error_code="",
+                        args=pending.args,
+                        output=output_text,
+                        tool_definition_sha256=pending.tool_def_sha256,
+                        endpoint_id=self._endpoint_id,
+                        evidence_tier="probe_unobservable",
+                        effect_observation=obs,
+                    )
+                return ToolReceipt(
+                    call_id=pending.call_id,
+                    tool=pending.tool,
+                    ok=False,
+                    executed=True,
+                    error_code="effect_probe_contradicted",
+                    args=pending.args,
+                    output=output_text,
+                    tool_definition_sha256=pending.tool_def_sha256,
+                    endpoint_id=self._endpoint_id,
+                    evidence_tier="effect_contradicted",
+                    effect_observation=obs,
+                )
             return ToolReceipt(
                 call_id=pending.call_id,
                 tool=pending.tool,
@@ -799,6 +1636,9 @@ class McpStdioProxy:
                 error_code="",
                 args=pending.args,
                 output=output_text,
+                tool_definition_sha256=pending.tool_def_sha256,
+                endpoint_id=self._endpoint_id,
+                evidence_tier="server_reported" if any_probe_enabled else "",
             )
         return ToolReceipt(
             call_id=pending.call_id,
@@ -808,6 +1648,11 @@ class McpStdioProxy:
             error_code="invalid_tool_arguments" if is_validation else "mcp_tool_error",
             args=pending.args,
             output=output_text,
+            tool_definition_sha256=pending.tool_def_sha256,
+            endpoint_id=self._endpoint_id,
+            evidence_tier=(
+                ("attempted" if is_validation else "server_reported") if any_probe_enabled else ""
+            ),
         )
 
 
@@ -819,9 +1664,14 @@ def run_mcp_stdio_proxy(
     pubkey_out: Path | str | None = None,
     truncate_log: bool = False,
     include_aer1: bool = False,
+    pin_tools: bool = False,
+    filter_web_results: bool = False,
     session_id: str | None = None,
     prev_log_path: Path | str | None = None,
     prev_pubkey_file: Path | str | None = None,
+    probe_fs_root: Path | str | None = None,
+    probe_git_repo: Path | str | None = None,
+    probe_sqlite_path: Path | str | None = None,
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -839,12 +1689,21 @@ def run_mcp_stdio_proxy(
         prev_log_path=prev_log_path,
         prev_pubkey_file=prev_pubkey_file,
     )
-    proxy = McpStdioProxy(writer)
+    proxy = McpStdioProxy(
+        writer,
+        pin_tools=pin_tools,
+        filter_web_results=filter_web_results,
+        endpoint_id=f"stdio:{Path(server_cmd[0]).name}",
+        probe_fs_root=probe_fs_root,
+        probe_git_repo=probe_git_repo,
+        probe_sqlite_path=probe_sqlite_path,
+    )
 
     child_env = _scrub_child_env(os.environ)
 
     in_stream = client_in if client_in is not None else sys.stdin.buffer
     out_stream = client_out if client_out is not None else sys.stdout.buffer
+    out_lock = threading.Lock()
 
     proc = subprocess.Popen(
         list(server_cmd),
@@ -864,9 +1723,15 @@ def run_mcp_stdio_proxy(
                 line = in_stream.readline()
                 if not line:
                     break
-                proxy.observe_client_line(line)
-                child_stdin.write(line)
-                child_stdin.flush()
+                fwd_line, immediate_replies = proxy.process_client_line(line)
+                if immediate_replies:
+                    with out_lock:
+                        for rep in immediate_replies:
+                            out_stream.write(rep)
+                        out_stream.flush()
+                if fwd_line:
+                    child_stdin.write(fwd_line)
+                    child_stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
         finally:
@@ -881,9 +1746,10 @@ def run_mcp_stdio_proxy(
             line = child_stdout.readline()
             if not line:
                 break
-            proxy.observe_server_line(line)
-            out_stream.write(line)
-            out_stream.flush()
+            out_line = proxy.process_server_line(line)
+            with out_lock:
+                out_stream.write(out_line)
+                out_stream.flush()
     except (BrokenPipeError, OSError):
         pass
     finally:

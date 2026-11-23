@@ -6,14 +6,18 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import openvino as ov
 
 from epistemic_guard.corroboration import corroborate_sources
 from epistemic_guard.exceptions import EpistemicGuardError, ProvenanceError
+from epistemic_guard.http_proxy import run_mcp_http_proxy
 from epistemic_guard.integrations import ReceiptRecorder
 from epistemic_guard.mcp_proxy import run_mcp_stdio_proxy, verify_receipt_log_file
 from epistemic_guard.mcp_server import run_mcp_stdio_server
@@ -61,7 +65,7 @@ def _cmd_doctor() -> int:
 
 
 def _cmd_demo() -> int:
-    print("epistemic-guard v0.5.2 — Live Verification Demo")
+    print("epistemic-guard v0.6.5 — Live Verification Demo")
     print("=" * 68)
 
     master_key = os.urandom(32)
@@ -164,6 +168,60 @@ def _cmd_demo() -> int:
         f"    Hazard: {burden.hazard.value} | Required: '{req_std}' | "
         f"Meets burden: {burden.meets_casual_burden}"
     )
+
+    # 5. Out-of-process Filesystem Effect Probe (--probe-fs) catching a silent no-op MCP server
+    import tempfile  # noqa: PLC0415
+
+    from epistemic_guard.mcp_proxy import McpStdioProxy, ReceiptLogWriter  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory(prefix="eg-demo-") as tmp_dir:
+        tmp_p = Path(tmp_dir)
+        ws = tmp_p / "ws"
+        ws.mkdir()
+        (ws / "secrets.txt").write_text("sensitive", encoding="utf-8")
+        demo_writer = ReceiptLogWriter(tmp_p / "demo.jsonl", factory.tool_verified(), truncate=True)
+        demo_proxy = McpStdioProxy(demo_writer, endpoint_id="stdio:demo", probe_fs_root=ws)
+        demo_proxy.observe_client_line(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "delete_file", "arguments": {"path": "secrets.txt"}},
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        # Lying server returns isError: false while leaving secrets.txt on disk!
+        demo_proxy.process_server_line(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{"type": "text", "text": "deleted secrets.txt"}],
+                            "isError": False,
+                        },
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        probe_rcpt = verify_receipt_log_file(tmp_p / "demo.jsonl").receipts[0]
+        probe_verdict = sup.verify_narration(
+            "I deleted secrets.txt.",
+            receipts=[probe_rcpt],
+            user_prompt="Delete secrets.txt.",
+        )
+        print("\n[5] Out-of-Process Disk Effect Probe (`--probe-fs`)")
+        print(
+            f"    Server returned isError=false, disk probe: {probe_rcpt.evidence_tier} "
+            f"({(probe_rcpt.effect_observation or {}).get('reason')})"
+        )
+        print(f"    LLM claim 'I deleted secrets.txt.' valid : {probe_verdict.is_valid}")
     print("=" * 68)
     return 0
 
@@ -208,13 +266,164 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             pubkey_out=args.pubkey_out,
             truncate_log=args.truncate,
             include_aer1=args.aer1,
+            pin_tools=args.pin_tools,
+            filter_web_results=args.filter_web_results,
             session_id=args.session_id,
             prev_log_path=args.prev_log,
             prev_pubkey_file=args.prev_pubkey_file,
+            probe_fs_root=args.probe_fs,
+            probe_git_repo=args.probe_git,
+            probe_sqlite_path=args.probe_sqlite,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
         return 2
+
+
+def _cmd_mcp_http_proxy(args: argparse.Namespace) -> int:
+    try:
+        return run_mcp_http_proxy(
+            args.upstream,
+            log_path=args.log,
+            host=args.host,
+            port=int(args.port),
+            key_file=args.key_file,
+            pubkey_out=args.pubkey_out,
+            truncate_log=args.truncate,
+            include_aer1=args.aer1,
+            pin_tools=args.pin_tools,
+            filter_web_results=args.filter_web_results,
+            session_id=args.session_id,
+            prev_log_path=args.prev_log,
+            prev_pubkey_file=args.prev_pubkey_file,
+            timeout_s=float(args.timeout),
+        )
+    except (EpistemicGuardError, OSError, ValueError) as exc:
+        print(f"epistemic-guard mcp-http-proxy error: {exc}", file=sys.stderr)
+        return 2
+
+
+def wrap_mcp_config_dict(
+    config_doc: Mapping[str, Any],
+    *,
+    log_dir: Path,
+    pin_tools: bool = False,
+    filter_web_results: bool = False,
+    probe_fs: str | None = None,
+    unwrap: bool = False,
+) -> tuple[dict[str, Any], int]:
+    """Wrap or unwrap `mcpServers` entries in Cursor / Claude Desktop / Claude Code JSON configs."""
+    out = dict(config_doc)
+    servers_raw = out.get("mcpServers")
+    if not isinstance(servers_raw, Mapping):
+        return (out, 0)
+
+    updated_servers: dict[str, Any] = {}
+    changed = 0
+    for name, entry in servers_raw.items():
+        if not isinstance(entry, Mapping):
+            updated_servers[str(name)] = entry
+            continue
+        ent = dict(entry)
+        cmd = ent.get("command")
+        raw_args = ent.get("args")
+        arg_list = [str(x) for x in raw_args] if isinstance(raw_args, list) else []
+
+        is_wrapped = cmd == "epistemic-guard" and len(arg_list) >= 2 and arg_list[0] == "mcp-proxy"
+        if unwrap:
+            if is_wrapped and "--" in arg_list:
+                sep_idx = arg_list.index("--")
+                orig = arg_list[sep_idx + 1 :]
+                if orig:
+                    ent["command"] = orig[0]
+                    ent["args"] = orig[1:]
+                    changed += 1
+            updated_servers[str(name)] = ent
+            continue
+
+        if is_wrapped or str(name) == "epistemic-guard" or not isinstance(cmd, str) or not cmd:
+            updated_servers[str(name)] = ent
+            continue
+
+        log_path = (log_dir / f"{name}.receipts.jsonl").as_posix()
+        proxy_args: list[str] = ["mcp-proxy", "--log", log_path]
+        if pin_tools:
+            proxy_args.append("--pin-tools")
+        if filter_web_results:
+            proxy_args.append("--filter-web-results")
+        if probe_fs:
+            proxy_args.extend(["--probe-fs", probe_fs])
+        proxy_args.extend(["--", cmd, *arg_list])
+        ent["command"] = "epistemic-guard"
+        ent["args"] = proxy_args
+        updated_servers[str(name)] = ent
+        changed += 1
+
+    out["mcpServers"] = updated_servers
+    return (out, changed)
+
+
+def _resolve_client_config_path(target: str) -> Path:
+    low = target.strip().lower()
+    home = Path.home()
+    if low == "cursor":
+        return home / ".cursor" / "mcp.json"
+    if low in {"claude-code", "claudecode"}:
+        return home / ".claude.json"
+    if low in {"claude", "claude-desktop"}:
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA") or str(home / "AppData" / "Roaming")
+            return Path(appdata) / "Claude" / "claude_desktop_config.json"
+        if sys.platform == "darwin":
+            return (
+                home
+                / "Library"
+                / "Application Support"
+                / "Claude"
+                / "claude_desktop_config.json"
+            )
+        return home / ".config" / "Claude" / "claude_desktop_config.json"
+    return Path(target)
+
+
+def _cmd_wrap_config(args: argparse.Namespace) -> int:
+    cfg_path = _resolve_client_config_path(args.target)
+    if not cfg_path.exists():
+        print(f"epistemic-guard wrap-config: file not found: {cfg_path}", file=sys.stderr)
+        return 2
+    try:
+        loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"epistemic-guard wrap-config: invalid JSON in {cfg_path}: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(loaded, Mapping):
+        print(
+            f"epistemic-guard wrap-config: root of {cfg_path} must be an object.",
+            file=sys.stderr,
+        )
+        return 2
+
+    log_dir = Path(args.log_dir) if args.log_dir else (Path.home() / ".epistemic_guard" / "logs")
+    updated, count = wrap_mcp_config_dict(
+        loaded,
+        log_dir=log_dir,
+        pin_tools=args.pin_tools,
+        filter_web_results=args.filter_web_results,
+        probe_fs=args.probe_fs,
+        unwrap=args.unwrap,
+    )
+    rendered = json.dumps(updated, indent=2) + "\n"
+    if args.dry_run:
+        print(rendered, end="")
+        return 0
+    if count > 0:
+        backup = cfg_path.with_suffix(cfg_path.suffix + ".bak")
+        shutil.copy2(cfg_path, backup)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(rendered, encoding="utf-8")
+    verb = "unwrapped" if args.unwrap else "wrapped"
+    print(f"OK: {verb} {count} MCP server(s) in {cfg_path}")
+    return 0
 
 
 def _cmd_verify_log(args: argparse.Namespace) -> int:
@@ -242,6 +451,12 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             print(f"TAMPER OR KEY ERROR: {exc}", file=sys.stderr)
         return 2
 
+    tier_counts: dict[str, int] = {}
+    for r in verified.receipts:
+        if r.evidence_tier:
+            tier_counts[r.evidence_tier] = tier_counts.get(r.evidence_tier, 0) + 1
+    contradicted_effects = tier_counts.get("effect_contradicted", 0)
+
     if narration_text is None:
         if args.json:
             print(
@@ -255,20 +470,29 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                         "session_id": verified.session_id,
                         "public_key_hex": verified.public_key_hex,
                         "key_pinned": verified.key_pinned,
+                        "evidence_tiers": tier_counts,
+                        "effect_contradictions": contradicted_effects,
                     },
                     sort_keys=True,
                 )
             )
         else:
             pin_note = "pinned" if verified.key_pinned else "unpinned (self-declared)"
+            tier_note = (
+                f" | probes={tier_counts}" if tier_counts else ""
+            )
             print(
                 f"OK: verified {verified.entry_count} receipt(s) | "
-                f"merkle_root={verified.merkle_root[:24]}... | key={pin_note}"
+                f"merkle_root={verified.merkle_root[:24]}... | key={pin_note}{tier_note}"
             )
         return 0
 
     active_receipts = verified.receipts[since_seq:]
-    sup = ReceiptSupervisor(device=args.device, warn_on_missing=False)
+    sup = ReceiptSupervisor(
+        device=args.device,
+        flag_undisclosed_mutations=args.flag_undisclosed,
+        warn_on_missing=False,
+    )
     verdict = sup.verify_narration(
         narration_text,
         receipts=active_receipts,
@@ -282,9 +506,13 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                     "entry_count": verified.entry_count,
                     "merkle_root": verified.merkle_root,
                     "key_pinned": verified.key_pinned,
+                    "evidence_tiers": tier_counts,
+                    "effect_contradictions": contradicted_effects,
                     "narration_valid": verdict.is_valid,
+                    "verdict_status": verdict.verdict_status,
                     "device": verdict.device,
                     "unsupported_claims": list(verdict.unsupported_claims),
+                    "undisclosed_mutations": list(verdict.undisclosed_mutations),
                     "retry_prompt": (
                         "" if verdict.is_valid else verdict.to_retry_prompt(active_receipts)
                     ),
@@ -302,8 +530,179 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
             f"NARRATION UNGROUNDED ({len(verdict.unsupported_spans)} span(s) flagged):",
             file=sys.stderr,
         )
+        if verdict.undisclosed_mutations:
+            print(
+                f"  Undisclosed mutating tools: {verdict.undisclosed_mutations}",
+                file=sys.stderr,
+            )
         print(verdict.to_retry_prompt(active_receipts), file=sys.stderr)
     return 0 if verdict.is_valid else 1
+
+
+def _cmd_hook(args: argparse.Namespace) -> int:
+    """Claude Code / Codex / Gemini CLI `PostToolUse` & `Stop` JSON hook handler (fail-open)."""
+    from epistemic_guard.mcp_proxy import (  # noqa: PLC0415
+        ReceiptLogWriter,
+        load_or_create_mcp_signer,
+    )
+    from epistemic_guard.schemas import ToolReceipt  # noqa: PLC0415
+
+    try:
+        raw_stdin = sys.stdin.read().strip()
+        payload: Mapping[str, Any] = json.loads(raw_stdin) if raw_stdin else {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "decision": "allow",
+                    "verdict_status": "unverifiable",
+                    "error": f"hook_parse_error: {exc}",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    try:
+        log_path = Path(args.log)
+        if args.hook_event == "post-tool":
+            signer = load_or_create_mcp_signer(key_file=args.key_file)
+            writer = ReceiptLogWriter(log_path, signer, truncate=False)
+            tool_name = str(payload.get("tool_name") or payload.get("name") or "unknown_tool")
+            raw_inp = payload.get("tool_input") or payload.get("input") or {}
+            flat_args: dict[str, str | int | float | bool] = {}
+            if isinstance(raw_inp, Mapping):
+                for k, v in raw_inp.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        flat_args[str(k)] = v
+                    else:
+                        flat_args[str(k)] = json.dumps(v, sort_keys=True)[:240]
+            raw_resp = payload.get("tool_response") or payload.get("output") or ""
+            out_str = (
+                json.dumps(raw_resp, sort_keys=True)
+                if isinstance(raw_resp, (Mapping, list))
+                else str(raw_resp)
+            )
+            is_err = bool(payload.get("is_error")) or (
+                isinstance(raw_resp, Mapping) and bool(raw_resp.get("isError"))
+            )
+            rcpt = ToolReceipt(
+                tool=tool_name,
+                ok=not is_err,
+                executed=True,
+                error_code="hook_tool_error" if is_err else "",
+                args=flat_args,
+                output=out_str[:1000],
+                endpoint_id="hook:post-tool",
+                evidence_tier="server_reported",
+            )
+            writer.append(rcpt)
+            print(json.dumps({"recorded": True, "call_id": rcpt.call_id, "tool": tool_name}))
+            return 0
+
+        # Stop hook: respect stop_hook_active to prevent infinite retry loops in Claude Code
+        if payload.get("stop_hook_active") is True:
+            print(
+                json.dumps(
+                    {
+                        "decision": "allow",
+                        "verdict_status": "verified",
+                        "skipped": "stop_hook_active",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        last_msg = str(
+            payload.get("last_assistant_message")
+            or payload.get("assistant_message")
+            or payload.get("message")
+            or ""
+        ).strip()
+        if not last_msg or not log_path.exists():
+            print(json.dumps({"verdict_status": "unverifiable", "decision": "allow"}))
+            return 0
+        verified = verify_receipt_log_file(log_path)
+        sup = ReceiptSupervisor(
+            device=args.device,
+            flag_undisclosed_mutations=args.flag_undisclosed,
+            warn_on_missing=False,
+        )
+        verdict = sup.verify_narration(last_msg, receipts=verified.receipts)
+        decision = "block" if (args.enforce and not verdict.is_valid) else "allow"
+        out_doc: dict[str, Any] = {
+            "decision": decision,
+            "verdict_status": verdict.verdict_status,
+            "is_valid": verdict.is_valid,
+            "unsupported_claims": list(verdict.unsupported_claims),
+            "undisclosed_mutations": list(verdict.undisclosed_mutations),
+        }
+        if decision == "block":
+            out_doc["reason"] = verdict.to_retry_prompt(verified.receipts)
+        print(json.dumps(out_doc, sort_keys=True))
+        return 0
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "decision": "allow",
+                    "verdict_status": "unverifiable",
+                    "error": f"hook_runtime_error: {exc}",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+
+def _cmd_install_hooks(args: argparse.Namespace) -> int:
+    """Safely install or uninstall `epistemic-guard hook` entries in `.claude/settings.json`."""
+    settings_path = Path(args.settings)
+    if settings_path.exists():
+        doc: dict[str, Any] = json.loads(settings_path.read_text(encoding="utf-8"))
+    else:
+        doc = {}
+    hooks = doc.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        hooks = {}
+        doc["hooks"] = hooks
+
+    def _is_eg_entry(entry: object) -> bool:
+        if not isinstance(entry, Mapping):
+            return False
+        sub = entry.get("hooks")
+        if not isinstance(sub, list):
+            return False
+        return any(
+            isinstance(h, Mapping) and "epistemic-guard hook" in str(h.get("command") or "")
+            for h in sub
+        )
+
+    for ev in ("PostToolUse", "Stop"):
+        existing = hooks.get(ev)
+        cleaned = [e for e in existing if not _is_eg_entry(e)] if isinstance(existing, list) else []
+        if not args.uninstall:
+            if ev == "PostToolUse":
+                cmd = f"epistemic-guard hook post-tool --log {args.log}"
+            else:
+                flags = []
+                if args.flag_undisclosed:
+                    flags.append("--flag-undisclosed")
+                if args.enforce:
+                    flags.append("--enforce")
+                suffix = (" " + " ".join(flags)) if flags else ""
+                cmd = f"epistemic-guard hook stop --log {args.log}{suffix}"
+            cleaned.append({"hooks": [{"type": "command", "command": cmd}]})
+        hooks[ev] = cleaned
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    action = "Uninstalled" if args.uninstall else "Installed"
+    print(f"{action} epistemic-guard Claude Code hooks in {settings_path}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -360,6 +759,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Include an exported AER-1 envelope alongside each native ToolReceipt",
     )
     mp.add_argument(
+        "--pin-tools",
+        action="store_true",
+        help="Pin SHA-256 of initial tools/list schemas and block mid-session rug-pulls",
+    )
+    mp.add_argument(
+        "--filter-web-results",
+        action="store_true",
+        help="Sanitize untrusted web-search MCP outputs (dedup wire copies & strip directives)",
+    )
+    mp.add_argument(
         "--session-id",
         default=None,
         help="Optional session identifier bound into each signed ToolReceipt",
@@ -373,6 +782,30 @@ def main(argv: list[str] | None = None) -> int:
         "--prev-pubkey-file",
         default=None,
         help="Optional public key file pinning --prev-log during key rotation",
+    )
+    mp.add_argument(
+        "--probe-fs",
+        default=None,
+        help=(
+            "Workspace root directory for independent out-of-process read-only filesystem "
+            "effect probes (catches silent no-op write/delete servers returning isError: false)"
+        ),
+    )
+    mp.add_argument(
+        "--probe-git",
+        default=None,
+        help=(
+            "Git repository path for out-of-process read-only HEAD/status effect probes "
+            "(catches silent no-op git_commit/git_reset servers)"
+        ),
+    )
+    mp.add_argument(
+        "--probe-sqlite",
+        default=None,
+        help=(
+            "Local SQLite DB path for out-of-process read-only PRAGMA/stat effect probes "
+            "(catches silent no-op execute_sql mutations)"
+        ),
     )
     mp.add_argument(
         "server_cmd",
@@ -420,6 +853,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     vl.add_argument("--prompt", default=None, help="Optional user prompt context for supervision")
     vl.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
+    vl.add_argument(
+        "--flag-undisclosed",
+        action="store_true",
+        help="Fail verification if executed mutating tools were omitted from --narration",
+    )
     vl.add_argument("--json", action="store_true", help="Emit JSON output")
 
     ms = sub.add_parser(
@@ -428,6 +866,109 @@ def main(argv: list[str] | None = None) -> int:
     )
     ms.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
 
+    mhp = sub.add_parser(
+        "mcp-http-proxy",
+        help="Run a Streamable HTTP / SSE MCP receipt proxy with Lost-Response recovery",
+    )
+    mhp.add_argument("--upstream", required=True, help="Target http:// or https:// MCP endpoint")
+    mhp.add_argument("--log", required=True, help="Append-only JSONL receipt log path")
+    mhp.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    mhp.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    mhp.add_argument("--key-file", default=None, help="Path to 32-byte Ed25519 seed file")
+    mhp.add_argument("--pubkey-out", default=None, help="Write Ed25519 public key JSON here")
+    mhp.add_argument("--truncate", action="store_true", help="Truncate existing --log on startup")
+    mhp.add_argument("--aer1", action="store_true", help="Include AER-1 export on each log entry")
+    mhp.add_argument(
+        "--pin-tools", action="store_true", help="Pin tools/list SHA-256 against rug-pulls"
+    )
+    mhp.add_argument(
+        "--filter-web-results",
+        action="store_true",
+        help="Deduplicate wire copies and strip directives from web MCP outputs",
+    )
+    mhp.add_argument("--session-id", default=None, help="Session ID bound into signed receipts")
+    mhp.add_argument("--prev-log", default=None, help="Predecessor JSONL log path for rotation")
+    mhp.add_argument("--prev-pubkey-file", default=None, help="Public key file pinning --prev-log")
+    mhp.add_argument("--timeout", type=float, default=30.0, help="Upstream HTTP timeout in seconds")
+
+    wc = sub.add_parser(
+        "wrap-config",
+        help="Auto-wrap mcpServers in Cursor, Claude Desktop, Claude Code, or a JSON file",
+    )
+    wc.add_argument(
+        "target",
+        help="Client alias ('cursor', 'claude', 'claude-code') or path to mcp.json",
+    )
+    wc.add_argument("--log-dir", default=None, help="Directory for per-server .receipts.jsonl logs")
+    wc.add_argument(
+        "--pin-tools", action="store_true", help="Enable --pin-tools on wrapped servers"
+    )
+    wc.add_argument(
+        "--filter-web-results",
+        action="store_true",
+        help="Enable --filter-web-results on wrapped servers",
+    )
+    wc.add_argument(
+        "--probe-fs",
+        default=None,
+        help="Enable --probe-fs <dir> out-of-process disk verification on wrapped servers",
+    )
+    wc.add_argument("--unwrap", action="store_true", help="Restore unwrapped server commands")
+    wc.add_argument("--dry-run", action="store_true", help="Print updated JSON without writing")
+
+    hk = sub.add_parser(
+        "hook",
+        help="Native Claude Code / Codex PostToolUse & Stop hook handler",
+    )
+    hk.add_argument("hook_event", choices=("post-tool", "stop"), help="Hook lifecycle event")
+    hk.add_argument(
+        "--log",
+        default=".epistemic_guard/hook_receipts.jsonl",
+        help="Signed Ed25519/Merkle receipt log path",
+    )
+    hk.add_argument("--key-file", default=None, help="Path to 32-byte Ed25519 seed file")
+    hk.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU)")
+    hk.add_argument(
+        "--flag-undisclosed",
+        action="store_true",
+        help="Flag executed mutating tools omitted from the final reply",
+    )
+    hk.add_argument(
+        "--enforce",
+        action="store_true",
+        help="Emit decision='block' on Stop hook when narration is contradicted",
+    )
+
+    ih = sub.add_parser(
+        "install-hooks",
+        help="Install or uninstall epistemic-guard hooks in .claude/settings.json",
+    )
+    ih.add_argument(
+        "--settings",
+        default=".claude/settings.json",
+        help="Path to Claude Code settings.json (default: .claude/settings.json)",
+    )
+    ih.add_argument(
+        "--log",
+        default=".epistemic_guard/hook_receipts.jsonl",
+        help="Signed Ed25519/Merkle receipt log path",
+    )
+    ih.add_argument(
+        "--flag-undisclosed",
+        action="store_true",
+        help="Enable --flag-undisclosed on the Stop hook",
+    )
+    ih.add_argument(
+        "--enforce",
+        action="store_true",
+        help="Enable --enforce blocking mode on the Stop hook",
+    )
+    ih.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove epistemic-guard hook entries without touching other hooks",
+    )
+
     parsed = parser.parse_args(argv)
     if parsed.command == "doctor":
         return _cmd_doctor()
@@ -435,6 +976,14 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_download(parsed)
     if parsed.command == "mcp-proxy":
         return _cmd_mcp_proxy(parsed)
+    if parsed.command == "mcp-http-proxy":
+        return _cmd_mcp_http_proxy(parsed)
+    if parsed.command == "wrap-config":
+        return _cmd_wrap_config(parsed)
+    if parsed.command == "hook":
+        return _cmd_hook(parsed)
+    if parsed.command == "install-hooks":
+        return _cmd_install_hooks(parsed)
     if parsed.command == "mcp-server":
         return run_mcp_stdio_server(device=parsed.device)
     if parsed.command == "verify-log":

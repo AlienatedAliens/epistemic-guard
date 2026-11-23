@@ -33,6 +33,7 @@ HAZARD_RANK: Final[dict[Hazard, int]] = {
 _CLAUSE_SPLIT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<=[.!?])\s+|\n+|;\s+|,\s+(?=(?:how|what|why|when|where|which|who|does|do|did|"
     r"can|could|should|will|would|while|although|whereas)\b)|"
+    r",\s+(?:but|however|though|yet)\s+|"
     r"(?:,\s*|\s+)(?:and|but|then|plus)\s+(?=(?:I|we)\s+|\[(?:ACTION|ACTION_CLAIM)\b)",
     re.IGNORECASE,
 )

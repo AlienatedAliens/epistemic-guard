@@ -4,13 +4,18 @@ classification, exact character-offset spans, and `[ACTION: verb target]` (`SOAC
 
 from __future__ import annotations
 
+import contextlib
+import json
+import posixpath
 import re
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import openvino as ov
@@ -19,6 +24,7 @@ from tokenizers import Tokenizer
 from epistemic_guard.exceptions import ProvenanceError
 from epistemic_guard.hazard import split_into_clauses_with_spans
 from epistemic_guard.models import resolve_managed_model_dir
+from epistemic_guard.nli import OpenVINONLIVerifier
 from epistemic_guard.provenance import ProvenanceGate
 from epistemic_guard.schemas import (
     StructuredActionTag,
@@ -43,7 +49,21 @@ SPEECH_ACT_CLASSES: Final[tuple[str, ...]] = (
 )
 
 _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
-    "CLAIM_FILE_WRITE": ("write", "save", "create", "edit", "update", "append", "patch", "note"),
+    "CLAIM_FILE_WRITE": (
+        "write",
+        "save",
+        "create",
+        "edit",
+        "update",
+        "append",
+        "patch",
+        "note",
+        "put",
+        "upsert",
+        "insert",
+        "ticket",
+        "issue",
+    ),
     "CLAIM_DELETE": (
         "delete",
         "remove",
@@ -64,6 +84,7 @@ _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
         "shell",
         "cmd",
         "git",
+        "commit",
         "install",
         "kill",
         "stop",
@@ -88,6 +109,7 @@ _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
         "find",
         "lookup",
         "verify",
+        "get",
     ),
     "CLAIM_MEMORY": ("memory", "commit", "remember", "store", "save", "note"),
     "CLAIM_COMM_EXTERNAL": (
@@ -96,6 +118,9 @@ _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
         "mail",
         "message",
         "post",
+        "http",
+        "webhook",
+        "slack",
         "upload",
         "schedule",
         "book",
@@ -157,12 +182,95 @@ _DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] =
 )
 
 _HEDGE_OR_NEGATION_RE: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:if\s+I|would\s+have|could\s+have|should\s+have|cannot|can't|did\s+not|didn't|"
-    r"haven't|have\s+not|has\s+not|hasn't|not\s+yet|unable\s+to|"
+    r"(?:^\s*(?:#{1,6}\s*|\*{1,2})?[^\n.!]{1,70}\b"
+    r"(?:failed|error|rejected|denied|aborted|unsuccessful|timed\s+out)\b[\s*!:]*$|"
+    r"\b(?:if\s+I|would\s+have|could\s+have|should\s+have|cannot|can't|could\s+not|couldn't|"
+    r"did\s+not|didn't|haven't|have\s+not|has\s+not|hasn't|not\s+yet|unable\s+to|"
+    r"failed\s+(?:to|due\s+to|because|with)|(?:has|have)\s+failed\b|"
+    r"(?:attempted|tried)\s+to\b(?![^.!?\n]*\b(?:succeeded|worked)\b)|"
+    r"(?:was|were|is|are)\s+not\s+(?:be\s+)?\w+(?:ed|en)\b|"
+    r"no\s+[\w-]+\s+(?:was|were|has\s+been|have\s+been)\s+\w+(?:ed|en)\b|"
+    r"(?:rejected|denied|refused)\s+(?:the\s+)?(?:request|call|operation|action|attempt|command)\b|"
+    r"(?:reported|returned|encountered)\s+an?\s+[^\n.!?]{0,35}\b(?:error|failure|exit|crash|timeout)\b|"
+    r"(?:received|with)\s+invalid\s+parameters?\b|"
+    r"(?:server|process|tool)\s+(?:crashed|terminated\s+unexpectedly|exited\s+prematurely)\b|"
+    r"^\s*\*{0,2}#{0,6}\s*failure\s+report\*{0,2}\s*$|"
+    r"(?:is|was|remains?)\s+(?:currently\s+)?(?:deferred|aborted|skipped|unchanged|untouched)\b|"
+    r"(?:operation|execution|tool|email|query|sql\s+execution|file\s+operation|request|call|"
+    r"attempt|command|action|process)\s+"
+    r"(?:failed|errored|aborted|timed\s+out|was\s+(?:rejected|denied|refused|aborted))\b|"
     r"suppose\s+I|imagine\s+I|pretend\s+I|for\s+example|for\s+instance|e\.g\.|"
     r"in\s+\*{0,2}(?:active|passive)\s+voice\*{0,2}|the\s+corrected\s+sentence\s+is|"
     r"it\s+translates\s+to|"
-    r"let\s+me\s+know\s+if\s+you\s+want\s+me\s+to|would\s+you\s+like\s+me\s+to)\b",
+    r"let\s+me\s+know\s+if\s+you\s+want\s+me\s+to|would\s+you\s+like\s+me\s+to)\b)",
+    re.IGNORECASE,
+)
+
+_GROUNDING_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "that",
+        "this",
+        "with",
+        "from",
+        "into",
+        "have",
+        "been",
+        "will",
+        "were",
+        "your",
+        "their",
+        "there",
+        "about",
+        "after",
+        "before",
+        "would",
+        "could",
+        "should",
+        "using",
+        "used",
+        "tool",
+        "call",
+        "action",
+        "successfully",
+        "completed",
+        "done",
+        "status",
+        "result",
+        "true",
+        "false",
+        "none",
+        "null",
+    }
+)
+
+
+def _extract_content_tokens(text: str) -> frozenset[str]:
+    """Extract lowercase alphanumeric stems (`len >= 4`) for general tool/clause grounding."""
+    raw = re.findall(r"[a-z0-9]{4,}", text.lower().replace("_", " ").replace("-", " "))
+    return frozenset(tok for tok in raw if tok not in _GROUNDING_STOPWORDS)
+
+
+def _extract_mcp_tool_tokens(
+    mcp_tools: Sequence[Mapping[str, Any]],
+) -> dict[str, frozenset[str]]:
+    """Build `{lowercased_tool_name: content_tokens}` from MCP `tools/list` metadata."""
+    out: dict[str, frozenset[str]] = {}
+    for item in mcp_tools:
+        raw_name = item.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        t_low = raw_name.strip().lower()
+        desc = str(item.get("description") or "")
+        schema = item.get("inputSchema")
+        prop_names: list[str] = []
+        if isinstance(schema, Mapping) and isinstance(schema.get("properties"), Mapping):
+            prop_names = [str(k) for k in schema["properties"]]
+        blob = f"{t_low} {desc} {' '.join(prop_names)}"
+        out[t_low] = _extract_content_tokens(blob)
+    return out
+
+_FIRST_PERSON_PROMISE_SUBJECT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:I|I'll|I'm|I'd|I\s+will|I\s+am|we|we'll|we're|we\s+will|let\s+me|allow\s+me)\b",
     re.IGNORECASE,
 )
 
@@ -234,7 +342,7 @@ _FENCED_CODE_RE: Final[re.Pattern[str]] = re.compile(
     r"```[\s\S]*?```|~~~[\s\S]*?~~~|```[^\n]*\n[\s\S]*$"
 )
 _BLOCKQUOTE_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^[ \t]*>[^\n]*")
-_INLINE_CODE_MULTIWORD_RE: Final[re.Pattern[str]] = re.compile(r"`[^`\n]*\s+[^`\n]*`")
+_INLINE_CODE_SPAN_RE: Final[re.Pattern[str]] = re.compile(r"`[^`\n]+`")
 _PRE_ATTRIBUTED_QUOTE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:\b(?:said|says|stated|states|wrote|writes|claimed|claims|replied|replies|asked|asks|"
     r"whispered|muttered|shouted|reads?|message|email|log|output|error|prints?|example|"
@@ -308,24 +416,27 @@ def resolve_clause_claim_family(clause_text: str, neural_claim_cls: str) -> str:
     ):
         return "CLAIM_DELETE"
     if re.search(
-        r"\b(?:sent|emailed|dispatched|refunded|transferred|booked)\b.*"
-        r"\b(?:email|message|notification|confirmation|report|proposal|invoice|thread|order|payment|flight)\b|"
+        r"\b(?:sent|emailed|dispatched|posted|notified|refunded|transferred|booked)\b.*"
+        r"\b(?:email|message|notification|confirmation|report|proposal|invoice|thread|order|"
+        r"payment|flight|webhook|endpoint|slack|channel)\b|"
         r"\b(?:refunded|transferred)\b|"
-        r"\b(?:email|message)\s+(?:has\s+been\s+|is\s+)?(?:sent|dispatched)\b",
+        r"\b(?:email|message|notification)\s+(?:has\s+been\s+|is\s+)?"
+        r"(?:sent|dispatched|posted)\b",
         c_low,
     ):
         return "CLAIM_COMM_EXTERNAL"
     if re.search(
         r"\b(?:wrote|written|overwritten|created|saved|appended)\b.*"
         r"\b(?:file|note|reminder|config|configuration|schedule|report|markdown|directory|"
-        r"workspace|entry|keys?|checklist|\.[a-z0-9]{2,8})\b|"
+        r"workspace|entry|keys?|checklist|ticket|issue|\.[a-z0-9]{2,8})\b|"
+        r"\b(?:ticket|issue|entry)\b.*\bopened\s+in\s+[a-z0-9_.-]+\.[a-z0-9]{2,8}\b|"
         r"\b(?:file|note)\s+is\s+(?:now\s+)?saved\b|"
         r"\bupdated\s+[a-z0-9_.-]+\.(?:json|yaml|yml|toml|md|txt|conf|ini|env|gitignore|nvmrc)\b",
         c_low,
     ):
         return "CLAIM_FILE_WRITE"
     if re.search(
-        r"\b(?:executed|ran|launched|opened|started|killed|terminated|installed|deployed)\b",
+        r"\b(?:executed|ran|launched|opened|started|killed|terminated|installed|deployed|committed)\b",
         c_low,
     ):
         return "CLAIM_LAUNCH_EXEC"
@@ -365,8 +476,12 @@ def mask_non_assertive_spans(text: str) -> str:
     quotations/dialogue with equal-length spaces so assertive prose offsets stay exact.
     """
     masked = text
-    for block_re in (_FENCED_CODE_RE, _BLOCKQUOTE_RE, _INLINE_CODE_MULTIWORD_RE):
+    for block_re in (_FENCED_CODE_RE, _BLOCKQUOTE_RE):
         masked = block_re.sub(lambda m: " " * (m.end() - m.start()), masked)
+    masked = _INLINE_CODE_SPAN_RE.sub(
+        lambda m: " " * (m.end() - m.start()) if re.search(r"\s", m.group(0)) else m.group(0),
+        masked,
+    )
     for m in list(_PRE_ATTRIBUTED_QUOTE_RE.finditer(masked)):
         masked = _mask_span_preserving_offsets(masked, m.start(1), m.end(1))
     for m in list(_POST_ATTRIBUTED_QUOTE_RE.finditer(masked)):
@@ -466,6 +581,888 @@ def _validate_receipt_authenticity(
                 )
 
 
+_SQL_OR_EXEC_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:sql|db|database|query|sqlite|postgres|mysql|exec|bash|shell|cmd)",
+    re.IGNORECASE,
+)
+_SQL_DELETE_ARG_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:delete\s+from|drop\s+(?:table|database|schema|index|view)|truncate\s+table|"
+    r"rm\s+(?:-[a-z]+\s+)*\S+)\b",
+    re.IGNORECASE,
+)
+_SQL_WRITE_ARG_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:insert\s+into|update\s+\w+\s+set|create\s+(?:table|index|view)|alter\s+table|"
+    r"upsert|replace\s+into)\b",
+    re.IGNORECASE,
+)
+_SQL_READ_ARG_RE: Final[re.Pattern[str]] = re.compile(r"\bselect\b", re.IGNORECASE)
+_SCALAR_NUMBER_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![a-z0-9_.-])\$?\d{1,3}(?:,\d{3})+(?:\.\d+)?%?|"
+    r"(?<![a-z0-9_.-])\$?\d+(?:\.\d+)?%?(?![a-z0-9_.-])",
+    re.IGNORECASE,
+)
+
+
+def infer_tool_families(
+    mcp_tools: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[str, ...]]:
+    """Infer compatible `CLAIM_*` families from MCP `tools/list` definitions (`name`,
+    `description`, `inputSchema`). Returns `{lowercased_tool_name: (family, ...)}`.
+    """
+    inferred: dict[str, tuple[str, ...]] = {}
+    for item in mcp_tools:
+        raw_name = item.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        t_low = raw_name.strip().lower()
+        desc = str(item.get("description") or "").lower()
+        schema = item.get("inputSchema")
+        prop_names: list[str] = []
+        if isinstance(schema, Mapping) and isinstance(schema.get("properties"), Mapping):
+            prop_names = [str(k).lower() for k in schema["properties"]]
+        blob = f"{t_low.replace('_', ' ').replace('-', ' ')} {desc} {' '.join(prop_names)}"
+
+        fams: list[str] = []
+        for fam, stems in _FAMILY_TOOL_STEMS.items():
+            if not stems:
+                continue
+            if any(
+                s in t_low or re.search(rf"\b{re.escape(s)}\w*\b", blob) is not None
+                for s in stems
+            ):
+                fams.append(fam)
+        if fams:
+            inferred[t_low] = tuple(dict.fromkeys(fams))
+    return inferred
+
+
+def _receipt_matches_family(
+    rcpt: ToolReceipt,
+    family: str,
+    *,
+    extra_stems: Mapping[str, Sequence[str]] | None = None,
+    custom_tool_families: Mapping[str, Sequence[str]] | None = None,
+) -> bool:
+    if family == "DEONTIC_CAPITULATION":
+        return False
+    stems = _FAMILY_TOOL_STEMS.get(family, ())
+    tool_l = rcpt.tool.lower()
+    if not stems or any(kw in tool_l for kw in stems):
+        return True
+    if extra_stems:
+        ext = extra_stems.get(family, ())
+        if any(kw.lower() in tool_l for kw in ext):
+            return True
+    if custom_tool_families and family in custom_tool_families.get(tool_l, ()):
+        return True
+    if _SQL_OR_EXEC_TOOL_RE.search(tool_l) and rcpt.args:
+        joined_args = " ".join(str(v) for v in rcpt.args.values())
+        if family == "CLAIM_DELETE" and _SQL_DELETE_ARG_RE.search(joined_args):
+            return True
+        if family == "CLAIM_FILE_WRITE" and _SQL_WRITE_ARG_RE.search(joined_args):
+            return True
+        if family == "CLAIM_SEARCH_READ" and _SQL_READ_ARG_RE.search(joined_args):
+            return True
+    return False
+
+
+def _normalize_numeric_token(raw: str) -> float | None:
+    cleaned = raw.strip().lstrip("$").rstrip("%").replace(",", "")
+    if not cleaned:
+        return None
+    try:
+        val = float(cleaned)
+    except ValueError:
+        return None
+    return val if np.isfinite(val) else None
+
+
+def _flatten_json_leaves(
+    obj: object, prefix: str = "", out: list[tuple[str, str]] | None = None
+) -> list[tuple[str, str]]:
+    acc = [] if out is None else out
+    if len(acc) >= 2048:
+        return acc
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            next_p = f"{prefix}.{k}" if prefix else str(k)
+            _flatten_json_leaves(v, next_p, acc)
+    elif isinstance(obj, list):
+        for idx, v in enumerate(obj[:256]):
+            next_p = f"{prefix}[{idx}]"
+            _flatten_json_leaves(v, next_p, acc)
+    elif obj is not None:
+        acc.append((prefix, str(obj)))
+    return acc
+
+
+_ISO_DATETIME_OR_TIME_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b|"
+    r"\b\d{1,2}:\d{2}(?::\d{2})?\b"
+)
+
+
+def _extract_numeric_set(text: str) -> set[float]:
+    cleaned = _ISO_DATETIME_OR_TIME_RE.sub(" ", text)
+    nums: set[float] = set()
+    for m in _SCALAR_NUMBER_RE.finditer(cleaned):
+        val = _normalize_numeric_token(m.group(0))
+        if val is not None:
+            nums.add(round(val, 6))
+    return nums
+
+
+_READBACK_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:get|read|search|query|fetch|check|verify|inspect|stat|status|scan|lookup|probe|list|find|show)(?:_|$)",
+    re.IGNORECASE,
+)
+_MUTATING_TOOL_VERB_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:create|write|edit|update|set|put|post|patch|delete|remove|drop|insert|add|"
+    r"append|send|email|mail|invite|pay|transfer|refund|book|schedule|commit|push|merge|"
+    r"deploy|exec|execute|run|bash|shell|kill|stop|start|restart|enable|disable|toggle|"
+    r"revoke|cancel|archive|wipe|purge|move|rename|copy|upload|publish|assign|protect)(?:_|$)",
+    re.IGNORECASE,
+)
+_DELETE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|_)(?:delete|remove|unlink|drop|purge|wipe|erase|cancel|revoke|rm)(?:_|$)",
+    re.IGNORECASE,
+)
+_NOT_FOUND_ERR_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:not_found|not\s+found|enoent|no\s+such\s+file|does\s+not\s+exist|"
+    r"no\s+\w+\s+with\s+that\s+id|unpersisted|404)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_read_only_tool(tool_name: str) -> bool:
+    """Return True iff `tool_name` is a read/query/probe tool with no mutating verb."""
+    return bool(_READBACK_TOOL_RE.search(tool_name)) and not bool(
+        _MUTATING_TOOL_VERB_RE.search(tool_name)
+    )
+
+
+def _extract_receipt_target_key(rcpt: ToolReceipt) -> str:
+    """Extract a normalized value-only target key so `path` and `file_path` align."""
+    for key in ("path", "file_path", "filepath", "record_id", "deal_id", "event_id", "id"):
+        val = str(rcpt.args.get(key) or "").strip().lower()
+        if val:
+            norm = val.replace("\\", "/")
+            if "/" in norm:
+                norm = posixpath.normpath(norm)
+            elif norm.startswith("./"):
+                norm = norm[2:]
+            return norm
+    return ""
+
+
+def _readback_polarity(rcpt: ToolReceipt) -> bool | None:
+    """Return True if read-back confirms presence, False if missing/unpersisted, else None."""
+    if rcpt.ok and rcpt.output.strip()[:1] == "{":
+        with contextlib.suppress(Exception):
+            parsed = json.loads(rcpt.output)
+            if isinstance(parsed, Mapping):
+                for key in ("exists", "found", "persisted", "present"):
+                    if parsed.get(key) is False:
+                        return False
+                    if parsed.get(key) is True:
+                        return True
+                status_val = str(parsed.get("status") or "").strip().lower()
+                if status_val in {"not_found", "missing", "absent", "unpersisted"}:
+                    return False
+                if status_val in {"ok", "found", "present", "exists", "confirmed", "active"}:
+                    return True
+    if not rcpt.ok and _NOT_FOUND_ERR_RE.search(f"{rcpt.error_code} {rcpt.output}"):
+        return False
+    return None
+
+
+def _find_negative_persistence_readback(receipts: Sequence[ToolReceipt]) -> ToolReceipt | None:
+    """Detect post-write read-back receipts reporting missing or unpersisted state.
+
+    Tracks per-target state by normalized target value:
+    - Write -> delete -> read(not_found) passes cleanly (even when it is the only target).
+    - Targetless writes (e.g. `send_email`) never cause unrelated `search` not-found FPs.
+    - Retried reads after index lag pass when a later read confirms presence.
+    """
+    state: dict[str, tuple[str, ToolReceipt | None]] = {}
+    for rcpt in receipts:
+        if not rcpt.executed:
+            continue
+        tgt = _extract_receipt_target_key(rcpt)
+        if rcpt.ok and not _is_read_only_tool(rcpt.tool):
+            if tgt:
+                status = "deleted" if _DELETE_TOOL_RE.search(rcpt.tool) else "written"
+                state[tgt] = (status, None)
+            continue
+        if not _is_read_only_tool(rcpt.tool) or tgt not in state:
+            continue
+        cur_status, _cur_neg = state[tgt]
+        if cur_status != "written":
+            continue
+        polarity = _readback_polarity(rcpt)
+        if polarity is True:
+            state[tgt] = (cur_status, None)
+        elif polarity is False:
+            state[tgt] = (cur_status, rcpt)
+    for status, neg_rcpt in state.values():
+        if status == "written" and neg_rcpt is not None:
+            return neg_rcpt
+    return None
+
+
+_FAILURE_DISCLOSURE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:fail(?:ed|ure|ing)?|errors?|unable|could\s+not|couldn't|cannot|can't|"
+    r"not\s+able|didn't|did\s+not|wasn't|was\s+not|weren't|were\s+not|"
+    r"timed?\s+out|timeout|denied|rejected|forbidden|blocked|unsuccessful|"
+    r"defer(?:red|ring)?|delay(?:ed|ing)?|postpon(?:ed|ing)|skip(?:ped|ping)?|"
+    r"pending|abort(?:ed|ing)?|cancel(?:ed|led)?|halt(?:ed|ing)?|incomplete|"
+    r"interrupted|lock(?:ed)?|issue|problem|warning|partial(?:ly)?|not\s+found|"
+    r"missing|exception|traceback|syntax|wrong|incorrect|mistake|bug|"
+    r"conflict|rate\s+limit(?:ed|ing)?|40[1349]|429|50[0234])\b",
+    re.IGNORECASE,
+)
+_DESTRUCTIVE_VERB_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:delet(?:e|ed|ing|ion)|remov(?:e|ed|ing|al)|drop(?:ped|ping)?|"
+    r"wip(?:e|ed|ing)|purg(?:e|ed|ing)|eras(?:e|ed|ing)|clear(?:ed|ing)?|"
+    r"unlink(?:ed|ing)?|destroy(?:ed|ing)?|revok(?:e|ed|ing)|cancel(?:ed|led|ing)?|"
+    r"terminat(?:e|ed|ing)|kill(?:ed|ing)?|flush(?:ed|ing)?|prun(?:e|ed|ing)|"
+    r"discard(?:ed|ing)?|strip(?:ped|ping)?)\b",
+    re.IGNORECASE,
+)
+_COMM_EXTERNAL_VERB_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:send|sent|sending|email(?:ed|ing)?|mail(?:ed|ing)?|messag(?:e|ed|ing)|"
+    r"post(?:ed|ing)?|slack(?:ed|ing)?|notif(?:y|ied|ying|ication)|invit(?:e|ed|ing)|"
+    r"pay|paid|payment|transfer(?:red|ring)?|refund(?:ed|ing)?|webhook|upload(?:ed|ing)?|"
+    r"publish(?:ed|ing)?|book(?:ed|ing)?|schedul(?:e|ed|ing)|order(?:ed|ing)?|"
+    r"dispatch(?:ed|ing)?|tweet(?:ed|ing)?|broadcast(?:ed|ing)?|call(?:ed|ing)?)\b",
+    re.IGNORECASE,
+)
+_DISCLOSURE_SYNONYMS: Final[dict[str, frozenset[str]]] = {
+    "money": frozenset(
+        {"paid", "payment", "pay", "transfer", "transferred", "sent", "bill", "refund"}
+    ),
+    "transfer": frozenset({"paid", "payment", "transferred", "sent", "wired"}),
+    "transaction": frozenset(
+        {"payment", "rent", "standing", "order", "recurring", "adjusted", "paid"}
+    ),
+    "scheduled": frozenset({"standing", "order", "recurring", "scheduled", "adjusted"}),
+    "update": frozenset({"updated", "adjusted", "changed", "modified", "edited", "account"}),
+    "edit": frozenset({"edited", "updated", "changed", "modified", "fixed"}),
+    "delete": frozenset({"deleted", "removed", "canceled", "cancelled", "erased", "dropped"}),
+    "remove": frozenset({"removed", "deleted", "canceled", "cancelled"}),
+    "send": frozenset({"sent", "emailed", "mailed", "messaged", "notified", "invited", "paid"}),
+    "create": frozenset({"created", "added", "booked", "scheduled", "opened"}),
+}
+_EXTERNAL_RECIPIENT_ARG_KEYS: Final[frozenset[str]] = frozenset(
+    {"recipient", "to", "email", "iban", "url", "channel", "webhook"}
+)
+_FORWARD_PLANNING_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:let'?s\s+(?:run|open|check|edit|update|try|look|inspect|fix|test|search|list)|"
+    r"I\s+need\s+to\s+(?:edit|open|check|fix|update|run))\b",
+    re.IGNORECASE,
+)
+_ISO_DATE_ONLY_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+_EMAIL_ADDR_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})\b", re.IGNORECASE
+)
+
+
+_NO_ERROR_PHRASE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:no|zero|without(?:\s+any)?)\s+(?:errors?|issues?|problems?|warnings?|failures?|bugs?)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_failure_disclosure(narration: str) -> bool:
+    """Return True if narration genuinely discloses an error/failure/caveat."""
+    cleaned = _NO_ERROR_PHRASE_RE.sub(" ", narration)
+    return bool(_FAILURE_DISCLOSURE_RE.search(cleaned))
+
+
+def _find_mutating_date_mismatch(
+    narration: str, ok_receipts: Sequence[ToolReceipt]
+) -> str | None:
+    """Detect when narration asserts a YYYY-MM-DD date absent from mutating ok receipts."""
+    narr_dates = set(_ISO_DATE_ONLY_RE.findall(narration))
+    if not narr_dates:
+        return None
+    mut_dates: set[str] = set()
+    for rcpt in ok_receipts:
+        if _is_read_only_tool(rcpt.tool):
+            continue
+        blob = " ".join(str(v) for v in rcpt.args.values()) + " " + rcpt.output
+        mut_dates.update(_ISO_DATE_ONLY_RE.findall(blob))
+    if not mut_dates:
+        return None
+    if narr_dates.isdisjoint(mut_dates):
+        return (
+            f"Narration asserts date(s) {sorted(narr_dates)} absent from mutating ToolReceipt "
+            f"date(s) {sorted(mut_dates)}."
+        )
+    return None
+
+
+def _find_prompt_target_mismatch(
+    user_prompt: str, ok_receipts: Sequence[ToolReceipt]
+) -> str | None:
+    """Detect when mutating ok receipts target a different email than user_prompt."""
+    if not user_prompt.strip():
+        return None
+    mut_rcpts = [r for r in ok_receipts if not _is_read_only_tool(r.tool)]
+    if not mut_rcpts:
+        return None
+    mut_blob = " ".join(
+        " ".join(str(v) for v in r.args.values()) + " " + r.output for r in mut_rcpts
+    )
+    prompt_emails = {e.lower() for e in _EMAIL_ADDR_RE.findall(user_prompt)}
+    mut_emails = {e.lower() for e in _EMAIL_ADDR_RE.findall(mut_blob)}
+    if prompt_emails and mut_emails and prompt_emails.isdisjoint(mut_emails):
+        return (
+            f"Mutating ToolReceipt targeted email(s) {sorted(mut_emails)} instead of "
+            f"user-requested {sorted(prompt_emails)}."
+        )
+    return None
+
+
+def _find_undisclosed_failed_tool(
+    narration: str, failed_receipts: Sequence[ToolReceipt]
+) -> ToolReceipt | None:
+    """Detect unsuperseded failed mutating tools omitted from an all-clear completion reply."""
+    if not failed_receipts or _has_failure_disclosure(narration):
+        return None
+    if _FORWARD_PLANNING_RE.search(narration) and not _CLAUSE_ACTION_OR_STATE_SIGNAL_RE.search(
+        narration
+    ):
+        return None
+    for fr in failed_receipts:
+        if not _is_read_only_tool(fr.tool):
+            return fr
+    return None
+
+
+_RAW_TRACKED_SCALAR_KEYS: Final[tuple[str, ...]] = (
+    "content",
+    "stage",
+    "sha",
+    "title",
+    "owner",
+    "assignee",
+)
+
+
+def _find_read_after_write_contradiction(ok_receipts: Sequence[ToolReceipt]) -> str | None:
+    """Detect read-after-write contradictions where a later read returns stale/empty state."""
+    written_by_target: dict[str, dict[str, str]] = {}
+    written_record_fields: dict[str, bool] = {}
+    last_git_sha: str | None = None
+
+    for rcpt in ok_receipts:
+        if not (rcpt.ok and rcpt.executed):
+            continue
+        is_read = _is_read_only_tool(rcpt.tool) or "show_head" in rcpt.tool.lower()
+        raw_out = rcpt.output.strip()
+        out_obj: Mapping[str, Any] = {}
+        if raw_out[:1] == "{":
+            with contextlib.suppress(Exception):
+                parsed = json.loads(raw_out)
+                if isinstance(parsed, Mapping):
+                    out_obj = parsed
+
+        targets: list[str] = []
+        for tkey in ("path", "file_path", "record_id", "deal_id", "event_id", "id"):
+            val = str(rcpt.args.get(tkey) or out_obj.get(tkey) or "").strip().lower()
+            if val:
+                targets.append(f"{tkey}:{val}")
+
+        if not is_read:
+            for tgt in targets:
+                bucket = written_by_target.setdefault(tgt, {})
+                for skey in _RAW_TRACKED_SCALAR_KEYS:
+                    arg_v = rcpt.args.get(skey)
+                    out_v = out_obj.get(skey)
+                    if isinstance(arg_v, str):
+                        bucket[skey] = arg_v
+                    elif isinstance(out_v, str):
+                        bucket[skey] = out_v
+            rec_val = (
+                str(rcpt.args.get("record_id") or out_obj.get("record_id") or "").strip().lower()
+            )
+            if rec_val and "fields" in rcpt.args:
+                raw_fields = str(rcpt.args["fields"]).strip()
+                if raw_fields and raw_fields not in {"{}", "[]", "null", "None"}:
+                    written_record_fields[rec_val] = True
+            if "commit" in rcpt.tool.lower() and isinstance(out_obj.get("sha"), str):
+                last_git_sha = out_obj["sha"].strip().lower()
+            continue
+
+        # Read-back receipt: verify against prior writes
+        if not out_obj:
+            continue
+        if (
+            "show_head" in rcpt.tool.lower()
+            and last_git_sha
+            and isinstance(out_obj.get("sha"), str)
+            and out_obj["sha"].strip().lower() != last_git_sha
+        ):
+            return (
+                f"Read-back receipt '{rcpt.tool}' returned git sha '{out_obj['sha']}' "
+                f"contradicting prior commit sha '{last_git_sha}'."
+            )
+        for tgt in targets:
+            prior = written_by_target.get(tgt)
+            if not prior:
+                continue
+            for skey, wval in prior.items():
+                if skey in out_obj and isinstance(out_obj[skey], str) and out_obj[skey] != wval:
+                    return (
+                        f"Read-back receipt '{rcpt.tool}' for '{tgt}' returned "
+                        f"{skey}={out_obj[skey]!r} contradicting prior write {wval!r}."
+                    )
+        out_rec = str(out_obj.get("record_id") or rcpt.args.get("record_id") or "").strip().lower()
+        if (
+            out_rec
+            and out_rec in written_record_fields
+            and isinstance(out_obj.get("fields"), Mapping)
+            and len(out_obj["fields"]) == 0
+        ):
+            return (
+                f"Read-back receipt '{rcpt.tool}' for '{out_rec}' returned empty fields "
+                "after a non-empty update receipt."
+            )
+    return None
+
+
+_FALLBACK_IANA_OFFSETS_HOURS: Final[dict[str, tuple[float, ...]]] = {
+    "utc": (0.0,),
+    "etc/utc": (0.0,),
+    "europe/london": (0.0, 1.0),
+    "europe/berlin": (1.0, 2.0),
+    "europe/paris": (1.0, 2.0),
+    "america/new_york": (-5.0, -4.0),
+    "america/chicago": (-6.0, -5.0),
+    "america/denver": (-7.0, -6.0),
+    "america/los_angeles": (-8.0, -7.0),
+    "asia/singapore": (8.0,),
+    "asia/shanghai": (8.0,),
+    "asia/tokyo": (9.0,),
+    "asia/seoul": (9.0,),
+    "asia/kolkata": (5.5,),
+    "australia/sydney": (10.0, 11.0),
+    "pacific/auckland": (12.0, 13.0),
+}
+_ISO_OFFSET_DT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:[+-]\d{2}:\d{2}|Z)\b"
+)
+
+
+def _expected_tz_offsets(tz_name: str) -> tuple[float, ...] | None:
+    with contextlib.suppress(Exception):
+        zi = ZoneInfo(tz_name)
+        offs: set[float] = set()
+        for month in (1, 7):
+            td = datetime(2026, month, 15, tzinfo=zi).utcoffset()
+            if td is not None:
+                offs.add(round(td.total_seconds() / 3600.0, 2))
+        if offs:
+            return tuple(sorted(offs))
+    return _FALLBACK_IANA_OFFSETS_HOURS.get(tz_name.strip().lower())
+
+
+def _find_timezone_offset_mismatch(ok_receipts: Sequence[ToolReceipt]) -> str | None:
+    """Detect mutating receipts whose ISO-8601 UTC offset contradicts their declared timezone."""
+    for rcpt in ok_receipts:
+        if _is_read_only_tool(rcpt.tool):
+            continue
+        tz_raw = str(rcpt.args.get("timezone") or "").strip()
+        if not tz_raw:
+            continue
+        allowed_offsets = _expected_tz_offsets(tz_raw)
+        if not allowed_offsets:
+            continue
+        for key in ("start", "end", "datetime", "scheduled_at"):
+            val = str(rcpt.args.get(key) or "").strip()
+            if not val or not _ISO_OFFSET_DT_RE.search(val):
+                continue
+            with contextlib.suppress(Exception):
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                td = dt.utcoffset()
+                if td is not None:
+                    actual_h = round(td.total_seconds() / 3600.0, 2)
+                    if all(abs(actual_h - exp) > 0.05 for exp in allowed_offsets):
+                        return (
+                            f"Mutating receipt '{rcpt.tool}' wrote {key}={val!r} "
+                            f"(UTC{actual_h:+.1f}h) contradicting timezone {tz_raw!r}."
+                        )
+    return None
+
+
+_HEDGED_COMPLETION_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:I\s+(?:believe|think)|it\s+looks\s+like|should\s+have\s+(?:reached|gone\s+through))\b"
+    r".{0,100}\b(?:booked|confirmed|sent|committed|deleted|created|updated|saved|went\s+through|reached)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_hedged_zero_mutation_claim(
+    narration: str, ok_receipts: Sequence[ToolReceipt]
+) -> str | None:
+    """Detect hedged completion claims when zero mutating tools executed in the turn."""
+    if _has_failure_disclosure(narration) or not _HEDGED_COMPLETION_RE.search(narration):
+        return None
+    has_ok_mutation = any(
+        r.ok and r.executed and not _is_read_only_tool(r.tool) for r in ok_receipts
+    )
+    if not has_ok_mutation:
+        return "Hedged completion claim asserted with zero executed mutating ToolReceipts."
+    return None
+
+
+_SECONDARY_ACTION_CHECKS: Final[tuple[tuple[str, re.Pattern[str], re.Pattern[str]], ...]] = (
+    (
+        "CLAIM_COMM_EXTERNAL",
+        re.compile(
+            r"\b(?:sent\s+(?:the\s+|an?\s+)?(?:invite|email|message)|"
+            r"invite\s+(?:sent|went|has\s+been\s+sent|should\s+have\s+reached)|"
+            r"has\s+the\s+invite|should\s+have\s+the\s+invite|invited\s+\S+@\S+)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:send|email|mail|invite|notify|message)(?:_|$)", re.IGNORECASE),
+    ),
+    (
+        "CLAIM_LAUNCH_EXEC",
+        re.compile(
+            r"\b(?:(?:it'?s|is|was|been|and)\s+committed|committed\s+(?:the|to))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:commit|git)(?:_|$)", re.IGNORECASE),
+    ),
+    (
+        "CLAIM_LAUNCH_EXEC",
+        re.compile(
+            r"\b(?:(?:full\s+|test\s+)?suite\s+pass(?:es|ed)|(?:all\s+)?tests?\s+pass(?:es|ed))\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:test|tests|pytest|shell|run|exec|ci)(?:_|$)", re.IGNORECASE),
+    ),
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            r"\b(?:added\s+(?:the|a)\s+note|note\s+(?:is\s+|was\s+)?added)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:^|_)(?:note|notes|comment)(?:_|$)", re.IGNORECASE),
+    ),
+)
+
+
+def _find_unexecuted_secondary_action(
+    narration: str, ok_receipts: Sequence[ToolReceipt]
+) -> tuple[str, str] | None:
+    """Detect explicit secondary completion claims lacking any matching executed receipt."""
+    if not ok_receipts or _has_failure_disclosure(narration):
+        return None
+    tool_names = [r.tool for r in ok_receipts]
+    for family, claim_re, tool_re in _SECONDARY_ACTION_CHECKS:
+        if claim_re.search(narration) and not any(tool_re.search(t) for t in tool_names):
+            return (
+                family,
+                f"Narration claims secondary '{family}' completion with no matching ToolReceipt.",
+            )
+    return None
+
+
+_EXT_ONLY_RE: Final[re.Pattern[str]] = re.compile(r"^\.[a-z0-9]{1,8}$")
+_SAFETY_FLAG_KEYS: Final[frozenset[str]] = frozenset(
+    {"dry_run", "preview", "simulate", "validate_only"}
+)
+_VALIDATION_REJECT_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:invalid\s+param|invalid\s+argument|validation\s+error|schema\s+error|"
+    r"missing\s+required|must\s+be\b|exceeds?\s+(?:max|limit)|max\s+\w+\s+is)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_arg_refinement(old: str, new: str) -> bool:
+    """Return True iff `new` is an exact match or extension-only refinement of `old`
+    (e.g. `notes` -> `notes.txt`), rejecting wrong-target substrings like `alice@` in `malice@`.
+    """
+    o = old.strip().lower()
+    n = new.strip().lower()
+    if not o or not n:
+        return False
+    if o == n:
+        return True
+    if "@" in o or "@" in n:
+        return False
+    return n.startswith(o) and bool(_EXT_ONLY_RE.match(n[len(o) :]))
+
+
+def _try_float(val: object) -> float | None:
+    if isinstance(val, bool):
+        return None
+    try:
+        return float(str(val).strip())
+    except ValueError:
+        return None
+
+
+def _scalar_in_text(val: str, text_lower: str) -> bool:
+    """Boundary-aware scalar lookup so short values like `'1'` do not match `'10'`."""
+    clean = val.strip().lower()
+    if not clean:
+        return False
+    if len(clean) <= 3 or clean.replace(".", "", 1).isdigit():
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(clean)}(?![a-z0-9])", text_lower))
+    return clean in text_lower
+
+
+def _find_retry_arg_drift(
+    narration: str,
+    receipts: Sequence[ToolReceipt],
+    *,
+    user_prompt: str = "",
+) -> str | None:
+    """Detect when a rejected mutating tool call is retried with materially changed/dropped
+    arguments (or a silent safety-flag flip like `dry_run=False -> True`) and the assistant
+    reports success on the original request without disclosing the change.
+    """
+    if not receipts or _has_failure_disclosure(narration):
+        return None
+    narr_low = narration.lower()
+    prompt_low = user_prompt.lower()
+    prior_failed: dict[str, list[ToolReceipt]] = {}
+    for rcpt in receipts:
+        t_low = rcpt.tool.lower()
+        if _is_read_only_tool(rcpt.tool):
+            continue
+        if not (rcpt.ok and rcpt.executed):
+            is_validation_reject = (
+                (not rcpt.executed)
+                or (
+                    rcpt.error_code.strip().lower()
+                    in {"-32602", "-32600", "invalid_params", "validation_error"}
+                )
+                or bool(_VALIDATION_REJECT_RE.search(f"{rcpt.error_code} {rcpt.output}"))
+            )
+            if is_validation_reject:
+                prior_failed.setdefault(t_low, []).append(rcpt)
+            continue
+        failed_attempts = prior_failed.get(t_low)
+        if not failed_attempts or not rcpt.args:
+            continue
+        for fr in failed_attempts:
+            if not fr.args:
+                continue
+            # 1. Check silent safety-flag activation on retry (e.g. dry_run=False -> True)
+            for sflag in _SAFETY_FLAG_KEYS:
+                if rcpt.args.get(sflag) is True and fr.args.get(sflag) is not True:
+                    if not re.search(
+                        r"\b(?:dry[\s_-]?run|preview|simulat(?:e|ed|ion)|validate[\s_-]?only)\b",
+                        narr_low,
+                    ):
+                        return (
+                            f"Tool '{rcpt.tool}' retried with {sflag}=True after rejection "
+                            "without disclosing that no live mutation occurred."
+                        )
+            for key, old_val in fr.args.items():
+                old_s = str(old_val).strip()
+                if not old_s:
+                    continue
+                # 2. Check dropped key whose value was explicitly requested or claimed
+                if key not in rcpt.args:
+                    if isinstance(old_val, bool):
+                        continue
+                    requested_or_claimed = (
+                        (bool(prompt_low) and _scalar_in_text(old_s, prompt_low))
+                        or _scalar_in_text(old_s, narr_low)
+                    )
+                    if requested_or_claimed:
+                        return (
+                            f"Tool '{rcpt.tool}' dropped requested argument "
+                            f"{key}={old_s!r} on retry without disclosing the omission."
+                        )
+                    continue
+                new_val = rcpt.args[key]
+                new_s = str(new_val).strip()
+                if not new_s or old_s.lower() == new_s.lower():
+                    continue
+                if isinstance(old_val, bool) and isinstance(new_val, bool):
+                    continue
+                # Numeric values are always compared numerically (never skipped by substring)
+                old_num = _try_float(old_val)
+                new_num = _try_float(new_val)
+                if old_num is not None and new_num is not None:
+                    if old_num == new_num:
+                        continue
+                elif _is_arg_refinement(old_s, new_s):
+                    continue
+                requested_or_claimed = (
+                    (bool(prompt_low) and _scalar_in_text(old_s, prompt_low))
+                    or _scalar_in_text(old_s, narr_low)
+                )
+                if requested_or_claimed and not _scalar_in_text(new_s, narr_low):
+                    return (
+                        f"Tool '{rcpt.tool}' failed/rejected with {key}={old_s!r} and "
+                        f"succeeded on retry with {key}={new_s!r} without disclosing "
+                        "the argument change."
+                    )
+    return None
+
+
+def _find_precondition_order_violation(
+    receipts: Sequence[ToolReceipt],
+    tool_preconditions: Mapping[str, Sequence[str]] | None,
+) -> str | None:
+    """Verify caller-supplied temporal precondition rules over the ordered receipt log.
+
+    Example: `tool_preconditions={"issue_refund": ("check_eligibility",)}` rejects any
+    trace where `issue_refund` executes before `check_eligibility` has completed with `ok=True`.
+    """
+    if not receipts or not tool_preconditions:
+        return None
+    norm_rules: dict[str, tuple[str, ...]] = {
+        k.strip().lower(): tuple(p.strip().lower() for p in reqs if p.strip())
+        for k, reqs in tool_preconditions.items()
+        if k.strip()
+    }
+    seen_ok: set[str] = set()
+    for idx, rcpt in enumerate(receipts):
+        if not (rcpt.ok and rcpt.executed):
+            continue
+        t_low = rcpt.tool.lower()
+        reqs = norm_rules.get(t_low)
+        if reqs:
+            missing = [pre for pre in reqs if pre not in seen_ok]
+            if missing:
+                return (
+                    f"Tool '{rcpt.tool}' executed at receipt #{idx} before required "
+                    f"precondition(s) {missing} completed."
+                )
+        seen_ok.add(t_low)
+    return None
+
+
+@dataclass(frozen=True)
+class OutputValueMismatch:
+    """Detected scalar or NLI contradiction against an `ok=True` `ToolReceipt.output` payload."""
+
+    clause: str
+    start_char: int
+    end_char: int
+    reason: str
+
+
+class OutputValueGuard:
+    """CPU-fast return-payload witness checking large JSON/text `ToolReceipt.output` values.
+
+    1. Deterministic JSON/scalar witness (`<0.2 ms` CPU, arbitrary payload size): catches
+       fabricated or mutated numbers, balances, row counts, and status codes against `rcpt.output`.
+    2. Key-path leaf projection + INT8 `OpenVINONLIVerifier` (`~3-5 ms` CPU): slices the top-3
+       lexically overlapping JSON leaves into a compact premise to catch semantic contradictions
+       (e.g., `"status: degraded"` or `"warnings: ['TLS expiring']"` buried inside a 20 KB blob).
+    """
+
+    def __init__(
+        self,
+        *,
+        nli_verifier: OpenVINONLIVerifier | None = None,
+        use_nli: bool = False,
+        nli_contradiction_threshold: float = 0.80,
+        device: str | None = None,
+        warn_on_missing: bool = False,
+    ) -> None:
+        self.nli_contradiction_threshold = nli_contradiction_threshold
+        self._nli = (
+            nli_verifier
+            if nli_verifier is not None
+            else (
+                OpenVINONLIVerifier(device=device, warn_on_missing=warn_on_missing)
+                if use_nli
+                else None
+            )
+        )
+
+    def check_clause(
+        self,
+        clause: str,
+        start_char: int,
+        end_char: int,
+        receipts: Sequence[ToolReceipt],
+        *,
+        user_prompt: str = "",
+    ) -> OutputValueMismatch | None:
+        ok_rcpts = [r for r in receipts if r.ok and r.executed and r.output.strip()]
+        if not ok_rcpts or _HEDGE_OR_NEGATION_RE.search(clause):
+            return None
+
+        prompt_nums = _extract_numeric_set(user_prompt)
+        arg_nums: set[float] = set()
+        output_nums: set[float] = set()
+        json_leaves: list[tuple[str, str]] = []
+        any_json_output = False
+
+        for rcpt in ok_rcpts:
+            for aval in rcpt.args.values():
+                arg_nums |= _extract_numeric_set(str(aval))
+            raw_out = rcpt.output.strip()
+            output_nums |= _extract_numeric_set(raw_out)
+            if raw_out[:1] in ("{", "["):
+                with contextlib.suppress(Exception):
+                    parsed = json.loads(raw_out)
+                    any_json_output = True
+                    leaves = _flatten_json_leaves(parsed)
+                    json_leaves.extend(leaves)
+                    for _, lval in leaves:
+                        output_nums |= _extract_numeric_set(lval)
+
+        # 1. Deterministic scalar witness over structured JSON or numeric tool outputs
+        clause_nums = _extract_numeric_set(clause)
+        # Allow HTTP 200 status prose when ok=True even if raw output omitted status code
+        allowed_nums = output_nums | arg_nums | prompt_nums | {200.0}
+        if clause_nums and (any_json_output or output_nums):
+            unwitnessed = [
+                n for n in sorted(clause_nums) if n not in allowed_nums and n not in {0.0, 1.0}
+            ]
+            if unwitnessed:
+                return OutputValueMismatch(
+                    clause=clause,
+                    start_char=start_char,
+                    end_char=end_char,
+                    reason=(
+                        f"Clause asserts numeric value(s) {unwitnessed} absent from "
+                        "executed ToolReceipt output."
+                    ),
+                )
+
+        # 2. Key-path leaf slice + local INT8 NLI contradiction check
+        if json_leaves and self._nli is not None and self._nli.available:
+            cl_toks = {
+                t for t in re.findall(r"[a-z0-9]+", clause.lower()) if len(t) >= 3
+            }
+            scored_leaves: list[tuple[int, str]] = []
+            for kpath, lval in json_leaves:
+                leaf_str = f"{kpath.replace('_', ' ')}: {lval}"
+                ltoks = set(re.findall(r"[a-z0-9]+", leaf_str.lower()))
+                overlap = len(cl_toks & ltoks)
+                if overlap > 0:
+                    scored_leaves.append((overlap, leaf_str))
+            if scored_leaves:
+                scored_leaves.sort(key=lambda pair: pair[0], reverse=True)
+                premise = "; ".join(s for _, s in scored_leaves[:3])[:384]
+                con_p, _ent_p, _neu_p = self._nli.infer_probs(premise, clause)
+                if con_p >= self.nli_contradiction_threshold:
+                    return OutputValueMismatch(
+                        clause=clause,
+                        start_char=start_char,
+                        end_char=end_char,
+                        reason=(
+                            f"Clause contradicts ToolReceipt output slice ({premise!r}, "
+                            f"p_contradiction={con_p:.2f})."
+                        ),
+                    )
+        return None
+
+
 class ReceiptSupervisor:
     """Verifies assistant clauses against `ToolReceipt` records on CPU/GPU/NPU."""
 
@@ -476,7 +1473,13 @@ class ReceiptSupervisor:
         device: str | None = None,
         claim_threshold: float = 0.55,
         flag_unfulfilled_promises: bool = False,
+        flag_undisclosed_mutations: bool = False,
         allow_creative_context: bool = True,
+        verify_output_values: bool = False,
+        verify_discourse_nli: bool = True,
+        extra_tool_stems: Mapping[str, Sequence[str]] | None = None,
+        mcp_tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_preconditions: Mapping[str, Sequence[str]] | None = None,
         verify_hashes: bool = True,
         require_neural: bool = False,
         warn_on_missing: bool = True,
@@ -487,10 +1490,36 @@ class ReceiptSupervisor:
         self._lock = threading.Lock()
         self.claim_threshold = claim_threshold
         self.flag_unfulfilled_promises = flag_unfulfilled_promises
+        self.flag_undisclosed_mutations = flag_undisclosed_mutations
         self.allow_creative_context = allow_creative_context
+        self.verify_output_values = verify_output_values
+        self.verify_discourse_nli = verify_discourse_nli
+        self._requested_device = device
+        self._discourse_nli: OpenVINONLIVerifier | None = None
+        self._discourse_nli_attempted = False
         self.gate = gate
         self.expected_session_id = expected_session_id
         self.max_receipt_age_seconds = max_receipt_age_seconds
+        self._extra_tool_stems: dict[str, tuple[str, ...]] = {
+            fam: tuple(s.lower() for s in stems)
+            for fam, stems in (extra_tool_stems or {}).items()
+        }
+        self._custom_tool_families: dict[str, tuple[str, ...]] = (
+            infer_tool_families(mcp_tools) if mcp_tools else {}
+        )
+        self._mcp_tool_tokens: dict[str, frozenset[str]] = (
+            _extract_mcp_tool_tokens(mcp_tools) if mcp_tools else {}
+        )
+        self._tool_preconditions: dict[str, tuple[str, ...]] = {
+            k.strip().lower(): tuple(p.strip().lower() for p in reqs if p.strip())
+            for k, reqs in (tool_preconditions or {}).items()
+            if k.strip()
+        }
+        self._output_guard: OutputValueGuard | None = (
+            OutputValueGuard(device=device, warn_on_missing=False)
+            if verify_output_values
+            else None
+        )
         self.available = False
         self.active_device = "DETERMINISTIC_CPU"
         self._tokenizer: Tokenizer | None = None
@@ -544,17 +1573,22 @@ class ReceiptSupervisor:
             self.available = False
             self.active_device = "DETERMINISTIC_CPU"
 
-    def _classify_speech_act(
-        self, clause: str, user_prompt: str = "", *, has_receipts: bool = False
-    ) -> tuple[str | None, float]:
-        if _HEDGE_OR_NEGATION_RE.search(clause) or _IDIOMATIC_NON_ACTION_RE.search(clause):
-            return (None, 1.0)
-        if not self.available or self._tokenizer is None or self._infer_req is None:
-            for fam, pat in _DETERMINISTIC_FAMILY_PATTERNS:
-                if pat.search(clause):
-                    return (resolve_clause_claim_family(clause, fam), 0.99)
-            return (None, 0.0)
+    def register_mcp_tools(
+        self, mcp_tools: Sequence[Mapping[str, Any]]
+    ) -> dict[str, tuple[str, ...]]:
+        """Auto-infer and register `CLAIM_*` families from an MCP `tools/list` schema array."""
+        inferred = infer_tool_families(mcp_tools)
+        tokens = _extract_mcp_tool_tokens(mcp_tools)
+        with self._lock:
+            self._custom_tool_families.update(inferred)
+            self._mcp_tool_tokens.update(tokens)
+        return dict(self._custom_tool_families)
 
+    def _raw_speech_act_probs(
+        self, clause: str, user_prompt: str = ""
+    ) -> np.ndarray[Any, Any] | None:
+        if not self.available or self._tokenizer is None or self._infer_req is None:
+            return None
         text_a = f"User request: {user_prompt.strip()}"
         text_b = f"Assistant reply: {clause.strip()}"
         enc = self._tokenizer.encode(text_a, text_b)
@@ -563,9 +1597,21 @@ class ReceiptSupervisor:
         with self._lock:
             res = self._infer_req.infer({"input_ids": input_ids, "attention_mask": attention_mask})
             logits = np.asarray(list(res.values())[0], dtype=np.float64)[0]
-
         exp_l = np.exp(logits - np.max(logits))
-        probs = exp_l / np.sum(exp_l)
+        probs: np.ndarray[Any, Any] = exp_l / np.sum(exp_l)
+        return probs
+
+    def _classify_speech_act(
+        self, clause: str, user_prompt: str = "", *, has_receipts: bool = False
+    ) -> tuple[str | None, float]:
+        if _HEDGE_OR_NEGATION_RE.search(clause) or _IDIOMATIC_NON_ACTION_RE.search(clause):
+            return (None, 1.0)
+        probs = self._raw_speech_act_probs(clause, user_prompt=user_prompt)
+        if probs is None:
+            for fam, pat in _DETERMINISTIC_FAMILY_PATTERNS:
+                if pat.search(clause):
+                    return (resolve_clause_claim_family(clause, fam), 0.99)
+            return (None, 0.0)
 
         if probs.shape[0] >= 10:
             top_idx = int(np.argmax(probs))
@@ -582,22 +1628,39 @@ class ReceiptSupervisor:
                 )
             if has_receipts and _FIRST_PERSON_EXPLICIT_CLAIM_RE.search(clause):
                 return (resolve_clause_claim_family(clause, best_claim_cls), 0.85)
-            if top_cls == "UNFULFILLED_PROMISE" and float(probs[1]) >= 0.65:
+            if (
+                top_cls == "UNFULFILLED_PROMISE"
+                and float(probs[1]) >= 0.65
+                and _FIRST_PERSON_PROMISE_SUBJECT_RE.search(clause)
+            ):
                 return ("UNFULFILLED_PROMISE", float(probs[1]))
         return (None, 0.0)
 
     @staticmethod
     def _receipt_supports_target(
-        target: str, verb: str, family: str, receipts: Sequence[ToolReceipt]
+        target: str,
+        verb: str,
+        family: str,
+        receipts: Sequence[ToolReceipt],
+        *,
+        extra_stems: Mapping[str, Sequence[str]] | None = None,
+        custom_tool_families: Mapping[str, Sequence[str]] | None = None,
     ) -> bool:
         ok_receipts = [r for r in receipts if r.ok and r.executed]
         if not ok_receipts or family == "DEONTIC_CAPITULATION":
             return False
-        stems = _FAMILY_TOOL_STEMS.get(family, ())
         tgt_low = target.strip().lower()
         for rcpt in ok_receipts:
             tool_l = rcpt.tool.lower()
-            if stems and not any(s in tool_l for s in stems) and verb not in tool_l:
+            if (
+                not _receipt_matches_family(
+                    rcpt,
+                    family,
+                    extra_stems=extra_stems,
+                    custom_tool_families=custom_tool_families,
+                )
+                and verb not in tool_l
+            ):
                 continue
             if not rcpt.args:
                 if (
@@ -614,24 +1677,100 @@ class ReceiptSupervisor:
 
     @staticmethod
     def _receipt_supports_clause(
-        clause: str, family: str, receipts: Sequence[ToolReceipt]
+        clause: str,
+        family: str,
+        receipts: Sequence[ToolReceipt],
+        *,
+        extra_stems: Mapping[str, Sequence[str]] | None = None,
+        custom_tool_families: Mapping[str, Sequence[str]] | None = None,
+        mcp_tool_tokens: Mapping[str, frozenset[str]] | None = None,
     ) -> bool:
         ok_receipts = [r for r in receipts if r.ok and r.executed]
         if not ok_receipts or family == "DEONTIC_CAPITULATION":
             return False
         cl_lower = clause.lower()
-        stems = _FAMILY_TOOL_STEMS.get(family, ())
+
+        # Guard against partial compound hallucinations: if this clause explicitly names a
+        # concrete argument belonging to a FAILED receipt (and not to any succeeded receipt),
+        # never allow an unrelated ok=True receipt to ground it.
+        failed_receipts = [r for r in receipts if not (r.ok and r.executed)]
+        if failed_receipts:
+            ok_arg_vals = {
+                str(v).strip().lower()
+                for r in ok_receipts
+                for v in r.args.values()
+                if len(str(v).strip()) >= 4
+            }
+            for fr in failed_receipts:
+                fr_tool = fr.tool.lower()
+                for k, v in fr.args.items():
+                    v_low = str(v).strip().lower()
+                    same_key_refined = any(
+                        r.tool.lower() == fr_tool
+                        and k in r.args
+                        and _is_arg_refinement(v_low, str(r.args[k]))
+                        for r in ok_receipts
+                    )
+                    if (
+                        len(v_low) >= 4
+                        and v_low not in ok_arg_vals
+                        and not same_key_refined
+                        and v_low in cl_lower
+                    ):
+                        return False
+
         matching_rcpts = [
             rcpt
             for rcpt in ok_receipts
-            if not stems or any(kw in rcpt.tool.lower() for kw in stems)
+            if _receipt_matches_family(
+                rcpt,
+                family,
+                extra_stems=extra_stems,
+                custom_tool_families=custom_tool_families,
+            )
         ]
+
+        # Open-vocabulary fallback for unseen enterprise/SaaS tools outside the classic
+        # coding/filesystem/SQL taxonomy: ground directly against succeeded receipt arguments,
+        # tool schema tokens, and output text. Read-only tools and SQL/shell/file tools stay
+        # strictly governed by `_receipt_matches_family` so e.g. `read_file` or `SELECT` can
+        # never ground a `CLAIM_DELETE`.
+        if not matching_rcpts:
+            cl_tokens = _extract_content_tokens(cl_lower)
+            strict_read_stems = _FAMILY_TOOL_STEMS["CLAIM_SEARCH_READ"]
+            strict_file_re = re.compile(
+                r"(?:^|_)(?:file|dir|directory|path|fs|bash|shell|cmd|exec|sql|sqlite|postgres|mysql)(?:_|$)",
+                re.IGNORECASE,
+            )
+            for rcpt in ok_receipts:
+                t_low = rcpt.tool.lower()
+                if _SQL_OR_EXEC_TOOL_RE.search(t_low) or strict_file_re.search(t_low):
+                    continue
+                if any(
+                    re.search(rf"(?:^|_){re.escape(s)}(?:_|$)", t_low) for s in strict_read_stems
+                ):
+                    continue
+                arg_hit = any(
+                    len(str(v).strip()) >= 4 and str(v).strip().lower() in cl_lower
+                    for v in rcpt.args.values()
+                )
+                if arg_hit:
+                    matching_rcpts.append(rcpt)
+                    continue
+                rcpt_tokens = (
+                    _extract_content_tokens(t_low)
+                    | (mcp_tool_tokens.get(t_low, frozenset()) if mcp_tool_tokens else frozenset())
+                    | _extract_content_tokens(rcpt.output[:300])
+                )
+                if len(cl_tokens & rcpt_tokens) >= 2:
+                    matching_rcpts.append(rcpt)
+
         if not matching_rcpts:
             return False
 
         concrete_targets = re.findall(
-            r"(?:https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b"
-            r"|#[0-9]+|\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,5}\b)",
+            r"(?:https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b"
+            r"|#[0-9]+|\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b)",
             cl_lower,
         )
         if concrete_targets:
@@ -656,6 +1795,75 @@ class ReceiptSupervisor:
 
         return True
 
+    def score_narration_risk(
+        self,
+        narration: str,
+        receipts: Sequence[ToolReceipt] = (),
+        *,
+        user_prompt: str = "",
+    ) -> float:
+        """Compute continuous `[0.0, 1.0]` max ungrounded-claim nonconformity score for conformal
+        calibration (`ConformalCalibrator`).
+        """
+        structured = parse_structured_action_tags(narration, receipts)
+        if any(not t.grounded for t in structured):
+            return 1.0
+        if self.allow_creative_context and is_creative_or_meta_prompt(user_prompt):
+            return 0.0
+
+        masked = mask_non_assertive_spans(narration)
+        for regex in (_SOAC_BRACKET_RE, _SOAC_XML_RE):
+            masked = regex.sub(lambda m: " " * (m.end() - m.start()), masked)
+
+        ok_receipts = [r for r in receipts if r.ok and r.executed]
+        prose_spans = split_into_clauses_with_spans(masked)
+        max_risk = 0.0
+        for cl_text, _s, _e in prose_spans:
+            stripped = cl_text.strip(".,!?;: ").lower()
+            if stripped in ("", "done", "ok", "okay", "completed"):
+                continue
+            if _HEDGE_OR_NEGATION_RE.search(cl_text) or _IDIOMATIC_NON_ACTION_RE.search(cl_text):
+                continue
+            probs = self._raw_speech_act_probs(cl_text, user_prompt=user_prompt)
+            if probs is None:
+                fam, conf = self._classify_speech_act(
+                    cl_text, user_prompt=user_prompt, has_receipts=bool(ok_receipts)
+                )
+                if fam is not None and fam != "UNFULFILLED_PROMISE":
+                    if not self._receipt_supports_clause(
+                        cl_text,
+                        fam,
+                        receipts,
+                        extra_stems=self._extra_tool_stems,
+                        custom_tool_families=self._custom_tool_families,
+                        mcp_tool_tokens=self._mcp_tool_tokens,
+                    ):
+                        max_risk = max(max_risk, conf)
+                continue
+
+            if probs.shape[0] >= 10:
+                claim_mass = float(np.sum(probs[2:]))
+                best_claim_idx = 2 + int(np.argmax(probs[2:]))
+                fam_resolved = resolve_clause_claim_family(
+                    cl_text, SPEECH_ACT_CLASSES[best_claim_idx]
+                )
+                if not self._receipt_supports_clause(
+                    cl_text,
+                    fam_resolved,
+                    receipts,
+                    extra_stems=self._extra_tool_stems,
+                    custom_tool_families=self._custom_tool_families,
+                    mcp_tool_tokens=self._mcp_tool_tokens,
+                ):
+                    max_risk = max(max_risk, claim_mass)
+                if (
+                    self.flag_unfulfilled_promises
+                    and not ok_receipts
+                    and _FIRST_PERSON_PROMISE_SUBJECT_RE.search(cl_text)
+                ):
+                    max_risk = max(max_risk, float(probs[1]))
+        return min(1.0, max(0.0, max_risk))
+
     def verify_narration(
         self,
         narration: str,
@@ -664,6 +1872,9 @@ class ReceiptSupervisor:
         user_prompt: str = "",
         base_char_offset: int = 0,
         allow_creative_context: bool | None = None,
+        verify_output_values: bool | None = None,
+        flag_undisclosed_mutations: bool | None = None,
+        tool_preconditions: Mapping[str, Sequence[str]] | None = None,
         gate: ProvenanceGate | None = None,
         expected_session_id: str | None = None,
         max_receipt_age_seconds: float | None = None,
@@ -730,9 +1941,53 @@ class ReceiptSupervisor:
         for regex in (_SOAC_BRACKET_RE, _SOAC_XML_RE):
             masked = regex.sub(lambda m: " " * (m.end() - m.start()), masked)
 
+        check_values = (
+            self.verify_output_values if verify_output_values is None else verify_output_values
+        )
+        output_guard: OutputValueGuard | None = None
+        if check_values:
+            if self._output_guard is None:
+                self._output_guard = OutputValueGuard(
+                    device=self.active_device if self.available else None,
+                    warn_on_missing=False,
+                )
+            output_guard = self._output_guard
+
         ok_receipts = [r for r in receipts if r.ok and r.executed]
+        ok_tools_succeeded = {r.tool.lower() for r in ok_receipts}
+        # Exclude failed attempts that were superseded by a later successful retry of the same tool
+        failed_receipts = [
+            r
+            for r in receipts
+            if not (r.ok and r.executed) and r.tool.lower() not in ok_tools_succeeded
+        ]
         family_counts: dict[str, int] = {}
-        prose_spans = split_into_clauses_with_spans(masked)
+        raw_spans = split_into_clauses_with_spans(masked)
+        prose_spans: list[tuple[str, int, int]] = []
+        if ok_receipts and failed_receipts:
+            coord_re = re.compile(
+                r"\s+and\s+(?=(?:also\s+|then\s+|successfully\s+|have\s+|has\s+)?"
+                r"(?:[a-z]{3,}ed|sent|wrote|written|ran|made|put|set|done)\b)",
+                re.IGNORECASE,
+            )
+            for cl_t, s_c, e_c in raw_spans:
+                parts = list(coord_re.finditer(cl_t))
+                if not parts:
+                    prose_spans.append((cl_t, s_c, e_c))
+                    continue
+                cur = 0
+                for m in parts:
+                    seg = cl_t[cur : m.start()].strip()
+                    if seg:
+                        lead = len(cl_t[cur : m.start()]) - len(cl_t[cur : m.start()].lstrip())
+                        prose_spans.append((seg, s_c + cur + lead, s_c + cur + lead + len(seg)))
+                    cur = m.end()
+                tail = cl_t[cur:].strip()
+                if tail:
+                    lead = len(cl_t[cur:]) - len(cl_t[cur:].lstrip())
+                    prose_spans.append((tail, s_c + cur + lead, s_c + cur + lead + len(tail)))
+        else:
+            prose_spans = raw_spans
         for cl_text, s_char, e_char in prose_spans:
             stripped = cl_text.strip(".,!?;: ").lower()
             if stripped in ("", "done", "ok", "okay", "completed"):
@@ -741,6 +1996,24 @@ class ReceiptSupervisor:
                 r"\b(?:I|we|I've|I'm|we've)\b", cl_text, re.IGNORECASE
             ):
                 continue
+
+            if output_guard is not None and ok_receipts:
+                val_mismatch = output_guard.check_clause(
+                    cl_text, s_char, e_char, ok_receipts, user_prompt=user_prompt
+                )
+                if val_mismatch is not None:
+                    unsupported_claims.append(cl_text)
+                    unsupported_spans.append(
+                        UnsupportedClaimSpan(
+                            text=cl_text,
+                            start_char=base_char_offset + s_char,
+                            end_char=base_char_offset + e_char,
+                            claimed_family="OUTPUT_VALUE_MISMATCH",
+                            reason=val_mismatch.reason,
+                        )
+                    )
+                    continue
+
             if (
                 ok_receipts
                 and len(prose_spans) > 1
@@ -750,6 +2023,17 @@ class ReceiptSupervisor:
             fam, _conf = self._classify_speech_act(
                 cl_text, user_prompt=user_prompt, has_receipts=bool(ok_receipts)
             )
+            if fam == "CLAIM_DELETE" and not _DESTRUCTIVE_VERB_RE.search(cl_text):
+                if _COMM_EXTERNAL_VERB_RE.search(cl_text):
+                    fam = "CLAIM_COMM_EXTERNAL"
+                elif any(not _is_read_only_tool(r.tool) for r in ok_receipts):
+                    fam = None
+            elif (
+                fam == "CLAIM_COMM_EXTERNAL"
+                and not _COMM_EXTERNAL_VERB_RE.search(cl_text)
+                and any(not _is_read_only_tool(r.tool) for r in ok_receipts)
+            ):
+                fam = None
             if fam == "UNFULFILLED_PROMISE":
                 if not ok_receipts:
                     unfulfilled.append(cl_text)
@@ -765,9 +2049,15 @@ class ReceiptSupervisor:
                         )
                 continue
             if fam is not None:
-                stems = _FAMILY_TOOL_STEMS.get(fam, ())
                 fam_rcpt_count = sum(
-                    1 for r in ok_receipts if not stems or any(k in r.tool.lower() for k in stems)
+                    1
+                    for r in ok_receipts
+                    if _receipt_matches_family(
+                        r,
+                        fam,
+                        extra_stems=self._extra_tool_stems,
+                        custom_tool_families=self._custom_tool_families,
+                    )
                 )
                 is_additive = bool(
                     re.search(r"\b(?:also|additionally|plus)\b", cl_text, re.IGNORECASE)
@@ -780,7 +2070,14 @@ class ReceiptSupervisor:
                     and fam in {"CLAIM_DELETE", "CLAIM_FILE_WRITE", "CLAIM_COMM_EXTERNAL"}
                     and next_count > fam_rcpt_count
                 )
-                if over_count or not self._receipt_supports_clause(cl_text, fam, receipts):
+                if over_count or not self._receipt_supports_clause(
+                    cl_text,
+                    fam,
+                    receipts,
+                    extra_stems=self._extra_tool_stems,
+                    custom_tool_families=self._custom_tool_families,
+                    mcp_tool_tokens=self._mcp_tool_tokens,
+                ):
                     unsupported_claims.append(cl_text)
                     unsupported_spans.append(
                         UnsupportedClaimSpan(
@@ -792,18 +2089,356 @@ class ReceiptSupervisor:
                         )
                     )
 
-        is_ok = len(unsupported_claims) == 0 and (
-            not self.flag_unfulfilled_promises or len(unfulfilled) == 0
+        # Stage-2 discourse NLI cascade (lazy-loaded, 0 ms on clean turns): resolves
+        # multi-sentence honest failure reports and mixed-receipt partial-compound lies
+        # using full-reply context rather than isolated clauses.
+        has_soac_violation = any(not t.grounded for t in structured)
+        if self.verify_discourse_nli and not has_soac_violation and failed_receipts:
+            need_fp_check = (not ok_receipts) and bool(unsupported_claims)
+            need_paraphrase_check = (not ok_receipts) and (not unsupported_claims)
+            need_compound_check = bool(ok_receipts) and (not unsupported_claims)
+            if need_fp_check or need_paraphrase_check or need_compound_check:
+                if not self._discourse_nli_attempted:
+                    self._discourse_nli_attempted = True
+                    dev = (
+                        self._requested_device
+                        if self._requested_device is not None
+                        else (self.active_device if self.available else "CPU")
+                    )
+                    cand = OpenVINONLIVerifier(device=dev, warn_on_missing=False)
+                    if cand.available:
+                        self._discourse_nli = cand
+                if self._discourse_nli is not None:
+                    if need_fp_check:
+                        nli_res = self._discourse_nli.infer_pair(
+                            narration, "The requested operation succeeded."
+                        )
+                        if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
+                            # Only clear spans whose claimed action plausibly refers to a failed
+                            # receipt (never wipe out an unrelated unexecuted action claim like
+                            # "The lookup failed. I also deleted the customer record.").
+                            kept_claims: list[str] = []
+                            kept_spans: list[UnsupportedClaimSpan] = []
+                            for sp in unsupported_spans:
+                                fam_matches_failed = any(
+                                    _receipt_matches_family(
+                                        fr,
+                                        sp.claimed_family,
+                                        extra_stems=self._extra_tool_stems,
+                                        custom_tool_families=self._custom_tool_families,
+                                    )
+                                    or any(
+                                        len(str(v).strip()) >= 4
+                                        and str(v).strip().lower() in sp.text.lower()
+                                        for v in fr.args.values()
+                                    )
+                                    for fr in failed_receipts
+                                )
+                                sp_nli = self._discourse_nli.infer_pair(
+                                    sp.text, "The requested operation succeeded."
+                                )
+                                if fam_matches_failed or (
+                                    sp_nli.contradiction >= 0.50 and sp_nli.entailment < 0.10
+                                ):
+                                    continue
+                                kept_spans.append(sp)
+                                kept_claims.append(sp.text)
+                            unsupported_claims = kept_claims
+                            unsupported_spans = kept_spans
+                    elif need_paraphrase_check:
+                        nli_res = self._discourse_nli.infer_pair(
+                            narration, "The action failed."
+                        )
+                        if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
+                            unsupported_claims.append(narration.strip())
+                            unsupported_spans.append(
+                                UnsupportedClaimSpan(
+                                    text=narration.strip(),
+                                    start_char=base_char_offset,
+                                    end_char=base_char_offset + len(narration.strip()),
+                                    claimed_family="PARAPHRASE_NLI_CONTRADICTION",
+                                    reason=(
+                                        "Reply contradicts failed ToolReceipt via indirect "
+                                        "completion phrasing "
+                                        f"(p_contradiction={nli_res.contradiction:.2f})."
+                                    ),
+                                )
+                            )
+                    elif need_compound_check:
+                        nli_res = self._discourse_nli.infer_pair(
+                            narration, "One of the requested actions failed."
+                        )
+                        if nli_res.contradiction >= 0.70 and nli_res.entailment < 0.10:
+                            unsupported_claims.append(narration.strip())
+                            unsupported_spans.append(
+                                UnsupportedClaimSpan(
+                                    text=narration.strip(),
+                                    start_char=base_char_offset,
+                                    end_char=base_char_offset + len(narration.strip()),
+                                    claimed_family="PARTIAL_COMPOUND_NLI_CONTRADICTION",
+                                    reason=(
+                                        "Reply contradicts failed ToolReceipt in a mixed-outcome "
+                                        f"turn (p_contradiction={nli_res.contradiction:.2f})."
+                                    ),
+                                )
+                            )
+
+        # Direction 2 (Halluci-Action): detect executed mutating tools that the assistant
+        # never disclosed in its reply (e.g. silent side effects from indirect prompt injection).
+        undisclosed: list[str] = []
+        narr_low = narration.lower()
+        narr_tokens = _extract_content_tokens(narr_low)
+        read_only_stems = _FAMILY_TOOL_STEMS["CLAIM_SEARCH_READ"]
+        for rcpt in ok_receipts:
+            t_low = rcpt.tool.lower()
+            is_read_only = any(
+                re.search(rf"(?:^|_){re.escape(s)}(?:_|$)", t_low) for s in read_only_stems
+            )
+            if _SQL_OR_EXEC_TOOL_RE.search(t_low) and rcpt.args:
+                joined_sql = " ".join(str(v) for v in rcpt.args.values())
+                if (
+                    _SQL_READ_ARG_RE.search(joined_sql)
+                    and not _SQL_DELETE_ARG_RE.search(joined_sql)
+                    and not _SQL_WRITE_ARG_RE.search(joined_sql)
+                ):
+                    is_read_only = True
+            if is_read_only:
+                continue
+
+            disclosed = False
+            has_unmentioned_recipient = False
+            for akey, aval in rcpt.args.items():
+                v_str = str(aval).strip().lower()
+                if len(v_str) >= 4:
+                    base = Path(v_str).name if ("/" in v_str or "\\" in v_str) else v_str
+                    if v_str in narr_low or (len(base) >= 4 and base in narr_low):
+                        disclosed = True
+                        break
+                    if akey.lower() in _EXTERNAL_RECIPIENT_ARG_KEYS:
+                        has_unmentioned_recipient = True
+            if not disclosed and not has_unmentioned_recipient:
+                tool_toks = _extract_content_tokens(t_low) | self._mcp_tool_tokens.get(
+                    t_low, frozenset()
+                )
+                expanded_toks = set(tool_toks)
+                for tok in tool_toks:
+                    if tok in _DISCLOSURE_SYNONYMS:
+                        expanded_toks.update(_DISCLOSURE_SYNONYMS[tok])
+                if narr_tokens & expanded_toks:
+                    disclosed = True
+            if not disclosed:
+                args_preview = ", ".join(f"{k}={v!r}" for k, v in list(rcpt.args.items())[:3])
+                desc = f"{rcpt.tool}({args_preview})"
+                undisclosed.append(desc)
+
+        flag_undisc = (
+            self.flag_undisclosed_mutations
+            if flag_undisclosed_mutations is None
+            else flag_undisclosed_mutations
         )
+        if flag_undisc and undisclosed:
+            for desc in undisclosed:
+                unsupported_spans.append(
+                    UnsupportedClaimSpan(
+                        text=narration.strip()[:160],
+                        start_char=base_char_offset,
+                        end_char=base_char_offset + min(len(narration.strip()), 160),
+                        claimed_family="UNDISCLOSED_MUTATION",
+                        reason=f"Mutating tool receipt '{desc}' executed without disclosure.",
+                    )
+                )
+
+        # Check read-back / state-probe receipts reporting missing/unpersisted state
+        neg_persist = _find_negative_persistence_readback(receipts)
+        if (
+            neg_persist is not None
+            and not unsupported_claims
+            and not _has_failure_disclosure(narration)
+            and narration.strip()
+        ):
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="NOT_PERSISTED_READBACK",
+                    reason=(
+                        f"Read-back receipt '{neg_persist.tool}' reported missing/unpersisted "
+                        "state contradicting assistant success narration."
+                    ),
+                )
+            )
+
+        # Check unsuperseded failed mutating tools omitted from an all-clear reply.
+        # When another mutating tool succeeded in the same turn, only require disclosure for
+        # failed calls that actually executed (or whose target/tool was requested in user_prompt),
+        # so an unrelated pre-execution schema rejection does not poison a grounded reply.
+        has_ok_mutation = any(not _is_read_only_tool(r.tool) for r in ok_receipts)
+        prompt_l = user_prompt.lower()
+        undisc_candidates = [
+            fr
+            for fr in failed_receipts
+            if (not has_ok_mutation)
+            or fr.executed
+            or any(
+                len(str(v).strip()) >= 4 and str(v).strip().lower() in prompt_l
+                for v in fr.args.values()
+            )
+        ]
+        undisc_fail = _find_undisclosed_failed_tool(narration, undisc_candidates)
+        if undisc_fail is not None and not unsupported_claims and narration.strip():
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="FAILED_TOOL_UNDISCLOSED",
+                    reason=(
+                        f"Failed mutating receipt '{undisc_fail.tool}' "
+                        f"({undisc_fail.error_code or 'error'}) was not disclosed in reply."
+                    ),
+                )
+            )
+
+        # Check silent argument drift when a rejected/failed mutating call is retried
+        retry_drift = _find_retry_arg_drift(narration, receipts, user_prompt=user_prompt)
+        if retry_drift is not None and not unsupported_claims and narration.strip():
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="RETRY_ARG_DRIFT",
+                    reason=retry_drift,
+                )
+            )
+
+        # Check caller-supplied temporal precondition ordering over the verified receipt sequence
+        active_preconds = (
+            self._tool_preconditions if tool_preconditions is None else tool_preconditions
+        )
+        order_violation = _find_precondition_order_violation(receipts, active_preconds)
+        if order_violation is not None and not unsupported_claims:
+            snippet = narration.strip()[:160] if narration.strip() else order_violation
+            unsupported_claims.append(snippet)
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=snippet,
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + len(snippet),
+                    claimed_family="PRECONDITION_ORDER_VIOLATION",
+                    reason=order_violation,
+                )
+            )
+
+        # Core invariants (always active) + opt-in value heuristics (verify_output_values=True)
+        if not unsupported_claims and not _has_failure_disclosure(narration):
+            raw_contradiction = _find_read_after_write_contradiction(ok_receipts)
+            if raw_contradiction is not None and narration.strip():
+                unsupported_claims.append(narration.strip()[:160])
+                unsupported_spans.append(
+                    UnsupportedClaimSpan(
+                        text=narration.strip()[:160],
+                        start_char=base_char_offset,
+                        end_char=base_char_offset + min(len(narration.strip()), 160),
+                        claimed_family="READ_AFTER_WRITE_CONTRADICTION",
+                        reason=raw_contradiction,
+                    )
+                )
+            else:
+                sec_missing = _find_unexecuted_secondary_action(narration, ok_receipts)
+                if sec_missing is not None:
+                    sec_fam, sec_reason = sec_missing
+                    unsupported_claims.append(narration.strip()[:160])
+                    unsupported_spans.append(
+                        UnsupportedClaimSpan(
+                            text=narration.strip()[:160],
+                            start_char=base_char_offset,
+                            end_char=base_char_offset + min(len(narration.strip()), 160),
+                            claimed_family=sec_fam,
+                            reason=sec_reason,
+                        )
+                    )
+                else:
+                    hedged_zero = _find_hedged_zero_mutation_claim(narration, ok_receipts)
+                    if hedged_zero is not None:
+                        unsupported_claims.append(narration.strip()[:160])
+                        unsupported_spans.append(
+                            UnsupportedClaimSpan(
+                                text=narration.strip()[:160],
+                                start_char=base_char_offset,
+                                end_char=base_char_offset + min(len(narration.strip()), 160),
+                                claimed_family="PHANTOM_HEDGED_CLAIM",
+                                reason=hedged_zero,
+                            )
+                        )
+                    elif check_values:
+                        date_mismatch = _find_mutating_date_mismatch(narration, ok_receipts)
+                        if date_mismatch is not None:
+                            unsupported_claims.append(narration.strip()[:160])
+                            unsupported_spans.append(
+                                UnsupportedClaimSpan(
+                                    text=narration.strip()[:160],
+                                    start_char=base_char_offset,
+                                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                                    claimed_family="OUTPUT_VALUE_MISMATCH",
+                                    reason=date_mismatch,
+                                )
+                            )
+                        else:
+                            target_mismatch = _find_prompt_target_mismatch(user_prompt, ok_receipts)
+                            if target_mismatch is not None:
+                                unsupported_claims.append(narration.strip()[:160])
+                                unsupported_spans.append(
+                                    UnsupportedClaimSpan(
+                                        text=narration.strip()[:160],
+                                        start_char=base_char_offset,
+                                        end_char=base_char_offset
+                                        + min(len(narration.strip()), 160),
+                                        claimed_family="WRONG_TARGET_MUTATION",
+                                        reason=target_mismatch,
+                                    )
+                                )
+                            else:
+                                tz_mismatch = _find_timezone_offset_mismatch(ok_receipts)
+                                if tz_mismatch is not None and narration.strip():
+                                    unsupported_claims.append(narration.strip()[:160])
+                                    unsupported_spans.append(
+                                        UnsupportedClaimSpan(
+                                            text=narration.strip()[:160],
+                                            start_char=base_char_offset,
+                                            end_char=base_char_offset
+                                            + min(len(narration.strip()), 160),
+                                            claimed_family="OUTPUT_VALUE_MISMATCH",
+                                            reason=tz_mismatch,
+                                        )
+                                    )
+
+        is_ok = (
+            len(unsupported_claims) == 0
+            and (not self.flag_unfulfilled_promises or len(unfulfilled) == 0)
+            and (not flag_undisc or len(undisclosed) == 0)
+        )
+        if not is_ok:
+            v_status = "contradicted"
+        elif any(r.evidence_tier == "probe_unobservable" for r in receipts):
+            v_status = "unverifiable"
+        else:
+            v_status = "verified"
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return SupervisionVerdict(
             is_valid=is_ok,
+            verdict_status=v_status,
             device=self.active_device,
             latency_ms=elapsed_ms,
             clauses_checked=len(prose_spans),
             unsupported_claims=unsupported_claims,
             unsupported_spans=unsupported_spans,
             unfulfilled_promises=unfulfilled,
+            undisclosed_mutations=undisclosed,
             structured_actions=structured,
         )
 

@@ -1,112 +1,86 @@
 {
- "adversarial_concurrency": {
-  "concurrent_verified_entries": 100,
-  "concurrent_verified_pct": 100.0,
-  "n_concurrent_appends": 100,
-  "n_workers": 4,
-  "replay_reorder_nan_pct": 100.0,
-  "replay_reorder_nan_rejected": 4,
-  "replay_reorder_nan_trials": 4
- },
- "aer1_interop": {
-  "digest_mismatches_rejected": 50,
-  "digest_rejection_pct": 100.0,
-  "n_aer1_cases": 50,
-  "official_kit_conformance_pct": 100.0,
-  "official_kit_invalid_rejected": 36,
-  "official_kit_invalid_total": 36,
-  "official_kit_matched": 58,
-  "official_kit_valid_passed": 22,
-  "official_kit_valid_total": 22,
-  "official_kit_vectors": 58,
-  "reference_verifier_exports_passed": 50,
-  "reference_verifier_exports_pct": 100.0,
-  "valid_roundtrip_pct": 100.0,
-  "valid_roundtrips": 50
- },
- "mcp_proxy_wire": {
-  "child_env_key_leaks": 0,
-  "executed_false_count": 10,
-  "executed_true_count": 30,
-  "failure_mode_count": 4,
-  "key_pinned": 1,
-  "n_per_failure_mode": 10,
-  "n_wire_calls": 40,
-  "succeeded_ok_count": 10,
-  "tampered_log_rejected": 1,
-  "tampered_log_trials": 1,
-  "verified_entries": 40,
-  "wire_verification_pct": 100.0
- },
- "merkle_receipts": {
-  "false_accepts": 0,
-  "n_receipts": 200,
-  "tamper_rejection_pct": 100.0,
-  "tampered_payloads_rejected": 200,
-  "valid_inclusion_pct": 100.0,
-  "valid_inclusion_proofs": 200
- },
- "sqlite_provenance_gate": {
-  "false_rejection_pct": 0.0,
-  "false_rejections": 0,
-  "immutable_sql_triggers_blocked": 2,
-  "immutable_sql_triggers_tested": 2,
-  "immutable_trigger_block_pct": 100.0,
-  "n_forged_key_attempts": 50,
-  "n_llm_narration_attempts": 50,
-  "n_total_write_attempts": 300,
-  "n_unauthorized_writes": 100,
-  "n_valid_writes": 200,
-  "unauthorized_block_pct": 100.0,
-  "unauthorized_writes_blocked": 100,
-  "valid_accept_pct": 100.0,
-  "valid_writes_accepted": 200,
-  "verified_chain_records": 200
- },
- "syndication_dedup": {
-  "duplicate_urls_collapsed_per_cluster": 2,
-  "high_hazard_block_pct": 100.0,
-  "high_hazard_false_consensus_blocked": 45,
-  "mirrors_per_cluster": 3,
-  "n_syndication_clusters": 45,
-  "paraphrase_sweep_clusters_per_tier": 50,
-  "single_origin_clusters_collapsed": 45,
-  "single_origin_collapse_pct": 100.0,
-  "tier0_wrapper_collapse_pct": 100.0,
-  "tier15_intermediate_edit_collapse_pct": 40.0,
-  "tier1_light_edit_collapse_pct": 100.0,
-  "tier2_moderate_rewrite_collapse_pct": 0.0,
-  "tier3_abstractive_rewrite_collapse_pct": 0.0,
-  "total_duplicate_urls_collapsed": 90,
-  "total_syndicated_urls": 135
- },
- "provenance": {
-  "schema": "https://github.com/ASSERT-KTH/assert-research-agent/blob/main/schemas/provenance-v1.json",
-  "command": [
-   "python",
-   "experiments/scripts/run_protocol_conformance.py"
-  ],
-  "cwd": ".",
-  "inputs": [
-   {
-    "path": "pyproject.toml",
-    "sha256": "636c9c173d13098fd947fab057db10c47d35deacfbf4c416e0394090601de7c0"
-   },
-   {
-    "path": "src/epistemic_guard",
-    "sha256": "ea59a91cafcee9a196b5659914115fc640b5890eac60830d03f3eb2b4e0c8729"
-   },
-   {
-    "path": "benchmarks/aer1_conformance_vectors.json",
-    "sha256": "be9f3d9f7290ec967050cfc556593ed620222aafd4975d4c4af3cf8b69e904cc"
-   },
-   {
-    "path": "benchmarks/aer1_reference_verifier.py",
-    "sha256": "5af209f3961b992da1315cb92505aa3c8191640af76ef17abad9e5d56e7f33a7"
-   }
-  ],
-  "commit": "ee917af6c1fc77f57e771532a94a037b39c88475",
-  "now": "2026-11-20T03:33:54+00:00",
-  "osaudit": "0.7.0"
- }
+  "adversarial_concurrency": {
+    "concurrent_verified_entries": 100,
+    "concurrent_verified_pct": 100.0,
+    "n_concurrent_appends": 100,
+    "n_workers": 4,
+    "replay_reorder_nan_pct": 100.0,
+    "replay_reorder_nan_rejected": 4,
+    "replay_reorder_nan_trials": 4
+  },
+  "aer1_interop": {
+    "digest_mismatches_rejected": 50,
+    "digest_rejection_pct": 100.0,
+    "n_aer1_cases": 50,
+    "official_full_corpus_checks": 146,
+    "official_full_corpus_passed": 146,
+    "official_full_corpus_pct": 100.0,
+    "official_kit_conformance_pct": 100.0,
+    "official_kit_invalid_rejected": 36,
+    "official_kit_invalid_total": 36,
+    "official_kit_matched": 58,
+    "official_kit_valid_passed": 22,
+    "official_kit_valid_total": 22,
+    "official_kit_vectors": 58,
+    "reference_verifier_exports_passed": 50,
+    "reference_verifier_exports_pct": 100.0,
+    "valid_roundtrip_pct": 100.0,
+    "valid_roundtrips": 50
+  },
+  "mcp_proxy_wire": {
+    "child_env_key_leaks": 0,
+    "executed_false_count": 10,
+    "executed_true_count": 30,
+    "failure_mode_count": 4,
+    "key_pinned": 1,
+    "n_per_failure_mode": 10,
+    "n_wire_calls": 40,
+    "succeeded_ok_count": 10,
+    "tampered_log_rejected": 1,
+    "tampered_log_trials": 1,
+    "verified_entries": 40,
+    "wire_verification_pct": 100.0
+  },
+  "merkle_receipts": {
+    "false_accepts": 0,
+    "n_receipts": 200,
+    "tamper_rejection_pct": 100.0,
+    "tampered_payloads_rejected": 200,
+    "valid_inclusion_pct": 100.0,
+    "valid_inclusion_proofs": 200
+  },
+  "sqlite_provenance_gate": {
+    "false_rejection_pct": 0.0,
+    "false_rejections": 0,
+    "immutable_sql_triggers_blocked": 2,
+    "immutable_sql_triggers_tested": 2,
+    "immutable_trigger_block_pct": 100.0,
+    "n_forged_key_attempts": 50,
+    "n_llm_narration_attempts": 50,
+    "n_total_write_attempts": 300,
+    "n_unauthorized_writes": 100,
+    "n_valid_writes": 200,
+    "unauthorized_block_pct": 100.0,
+    "unauthorized_writes_blocked": 100,
+    "valid_accept_pct": 100.0,
+    "valid_writes_accepted": 200,
+    "verified_chain_records": 200
+  },
+  "syndication_dedup": {
+    "duplicate_urls_collapsed_per_cluster": 2,
+    "high_hazard_block_pct": 100.0,
+    "high_hazard_false_consensus_blocked": 45,
+    "mirrors_per_cluster": 3,
+    "n_syndication_clusters": 45,
+    "paraphrase_sweep_clusters_per_tier": 50,
+    "single_origin_clusters_collapsed": 45,
+    "single_origin_collapse_pct": 100.0,
+    "tier0_wrapper_collapse_pct": 100.0,
+    "tier15_intermediate_edit_collapse_pct": 40.0,
+    "tier1_light_edit_collapse_pct": 100.0,
+    "tier2_moderate_rewrite_collapse_pct": 0.0,
+    "tier3_abstractive_rewrite_collapse_pct": 0.0,
+    "total_duplicate_urls_collapsed": 90,
+    "total_syndicated_urls": 135
+  }
 }
