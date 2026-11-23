@@ -1081,6 +1081,60 @@ _WEB_SEARCH_TOOL_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def sanitize_untrusted_tool_annotations(annotations: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply monotonic ('remove, never add') sanitization to untrusted MCP tool annotations.
+
+    Untrusted server hints may only narrow privilege (e.g. `destructiveHint: true`,
+    `openWorldHint: true`), never widen it (`readOnlyHint: true`, `destructiveHint: false`,
+    `idempotentHint: true`, `openWorldHint: false`). Contradictory hints drop the
+    privilege-widening claim while keeping the restrictive hint.
+    """
+    cleaned: dict[str, Any] = {}
+    for k, v in annotations.items():
+        if k == "readOnlyHint" and v is True:
+            continue
+        if k == "destructiveHint" and v is False:
+            continue
+        if k == "idempotentHint" and v is True:
+            continue
+        if k == "openWorldHint" and v is False:
+            continue
+        cleaned[k] = v
+    return cleaned
+
+
+def _sanitize_tools_list_item(item: Mapping[str, object]) -> tuple[dict[str, object], bool]:
+    res = item.get("result")
+    if not isinstance(res, Mapping):
+        return (dict(item), False)
+    tools = res.get("tools")
+    if not isinstance(tools, list):
+        return (dict(item), False)
+    changed = False
+    new_tools: list[object] = []
+    for tdef in tools:
+        if isinstance(tdef, Mapping) and isinstance(tdef.get("annotations"), Mapping):
+            orig_ann = tdef["annotations"]
+            san_ann = sanitize_untrusted_tool_annotations(orig_ann)
+            if san_ann != dict(orig_ann):
+                tcopy = dict(tdef)
+                if san_ann:
+                    tcopy["annotations"] = san_ann
+                else:
+                    tcopy.pop("annotations", None)
+                new_tools.append(tcopy)
+                changed = True
+                continue
+        new_tools.append(tdef)
+    if not changed:
+        return (dict(item), False)
+    out = dict(item)
+    new_res = dict(res)
+    new_res["tools"] = new_tools
+    out["result"] = new_res
+    return (out, True)
+
+
 def compute_mcp_tool_sha256(tool_def: Mapping[str, Any]) -> str:
     """Compute canonical SHA-256 over `(name, description, inputSchema[, annotations])`."""
     canonical: dict[str, Any] = {
@@ -1205,6 +1259,7 @@ class McpStdioProxy:
         writer: ReceiptLogWriter,
         *,
         pin_tools: bool = False,
+        strip_untrusted_annotations: bool = False,
         raise_on_rugpull: bool = False,
         filter_web_results: bool = False,
         endpoint_id: str = "",
@@ -1214,6 +1269,7 @@ class McpStdioProxy:
     ) -> None:
         self._writer = writer
         self._pin_tools = pin_tools
+        self._strip_untrusted_annotations = strip_untrusted_annotations
         self._raise_on_rugpull = raise_on_rugpull
         self._filter_web_results = filter_web_results
         self._endpoint_id = endpoint_id
@@ -1483,6 +1539,11 @@ class McpStdioProxy:
                     }
                     out_items.append(err_item)
                     rewritten = True
+                elif self._strip_untrusted_annotations:
+                    san_item, san_changed = _sanitize_tools_list_item(item)
+                    out_items.append(san_item)
+                    if san_changed:
+                        rewritten = True
                 else:
                     out_items.append(item)
                 continue
@@ -1665,6 +1726,7 @@ def run_mcp_stdio_proxy(
     truncate_log: bool = False,
     include_aer1: bool = False,
     pin_tools: bool = False,
+    strip_untrusted_annotations: bool = False,
     filter_web_results: bool = False,
     session_id: str | None = None,
     prev_log_path: Path | str | None = None,
@@ -1692,6 +1754,7 @@ def run_mcp_stdio_proxy(
     proxy = McpStdioProxy(
         writer,
         pin_tools=pin_tools,
+        strip_untrusted_annotations=strip_untrusted_annotations,
         filter_web_results=filter_web_results,
         endpoint_id=f"stdio:{Path(server_cmd[0]).name}",
         probe_fs_root=probe_fs_root,

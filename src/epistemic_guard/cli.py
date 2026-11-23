@@ -267,6 +267,7 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             truncate_log=args.truncate,
             include_aer1=args.aer1,
             pin_tools=args.pin_tools,
+            strip_untrusted_annotations=args.strip_untrusted_annotations,
             filter_web_results=args.filter_web_results,
             session_id=args.session_id,
             prev_log_path=args.prev_log,
@@ -762,6 +763,15 @@ def main(argv: list[str] | None = None) -> int:
         "--pin-tools",
         action="store_true",
         help="Pin SHA-256 of initial tools/list schemas and block mid-session rug-pulls",
+    )
+    mp.add_argument(
+        "--strip-untrusted-annotations",
+        action="store_true",
+        help=(
+            "Monotonically strip privilege-raising MCP tool annotations "
+            "(readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=false) "
+            "from tools/list responses before forwarding to the client"
+        ),
     )
     mp.add_argument(
         "--filter-web-results",

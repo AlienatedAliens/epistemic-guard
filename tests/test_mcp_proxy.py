@@ -659,3 +659,67 @@ def test_active_rehash_reorder_aer1_tamper_and_cli_bounds_rejected(
     err_file = json.loads(capsys.readouterr().out)
     assert err_file["log_valid"] is False
 
+
+
+
+def test_strip_untrusted_annotations_monotonic_sanitization(tmp_path: Path) -> None:
+    """`--strip-untrusted-annotations` enforces the monotonic ('remove, never add') rule:
+    privilege-raising wire hints are stripped before forwarding `tools/list`, while
+    restrictive hints (`destructiveHint: true`, `openWorldHint: true`) and `title` remain,
+    and `--pin-tools` still pins the raw server-sent annotations against rug-pulls.
+    """
+    from epistemic_guard.mcp_proxy import McpStdioProxy, ReceiptLogWriter
+    from epistemic_guard.provenance import SignerFactory
+
+    log_path = tmp_path / "ann_proxy.jsonl"
+    signer = SignerFactory.from_master_key(b"\x33" * 32).tool_verified()
+    writer = ReceiptLogWriter(log_path, signer)
+    proxy = McpStdioProxy(
+        writer,
+        pin_tools=True,
+        strip_untrusted_annotations=True,
+    )
+
+    req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+    proxy.process_client_line(req + b"\n")
+
+    resp = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "tools": [
+                {
+                    "name": "update_issue_labels",
+                    "description": "Update labels on an issue",
+                    "inputSchema": {"type": "object"},
+                    "annotations": {
+                        "title": "Update Issue Labels",
+                        "readOnlyHint": True,
+                        "destructiveHint": False,
+                        "idempotentHint": True,
+                        "openWorldHint": False,
+                    },
+                },
+                {
+                    "name": "drop_table",
+                    "description": "Contradictory hints",
+                    "inputSchema": {"type": "object"},
+                    "annotations": {
+                        "readOnlyHint": True,
+                        "destructiveHint": True,
+                        "openWorldHint": True,
+                    },
+                },
+            ]
+        },
+    }
+    forwarded = proxy.process_server_line(json.dumps(resp).encode() + b"\n")
+    out_doc = json.loads(forwarded.decode("utf-8"))
+    t0, t1 = out_doc["result"]["tools"]
+
+    # Privilege-raising hints stripped; display title kept
+    assert t0["annotations"] == {"title": "Update Issue Labels"}
+    # Contradictory readOnlyHint=True dropped; restrictive destructiveHint/openWorldHint kept
+    assert t1["annotations"] == {"destructiveHint": True, "openWorldHint": True}
+    # Pinning still recorded raw server-sent annotations
+    assert "update_issue_labels" in proxy.tool_pins
