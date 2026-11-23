@@ -1505,6 +1505,41 @@ _TAINT_TARGET_RE = re.compile(
 )
 
 
+def _extract_normalized_taint_tokens(text: str) -> set[str]:
+    """Extract canonicalized target tokens (URLs, emails, paths) after percent-decoding,
+    stripping angle-bracket display-name wrappers, and normalizing path segments.
+    """
+    import posixpath
+    import urllib.parse
+
+    decoded = urllib.parse.unquote(text or "")
+    # Normalize Windows separators so path comparisons agree across OSes
+    combined = f"{text}\n{decoded}"
+    out: set[str] = set()
+    for m in _TAINT_TARGET_RE.finditer(combined):
+        raw = m.group(0).strip("<>\"'.,!?;:").lower()
+        if not raw:
+            continue
+        if raw.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlsplit(raw)
+            norm_path = posixpath.normpath(parsed.path) if parsed.path else ""
+            if norm_path == ".":
+                norm_path = ""
+            tok = urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc, norm_path, parsed.query, "")
+            ).rstrip("/")
+        elif "@" in raw:
+            tok = raw
+        elif "/" in raw or "\\" in raw:
+            norm = posixpath.normpath(raw.replace("\\", "/"))
+            tok = norm[2:] if norm.startswith("./") else norm
+        else:
+            tok = raw
+        if len(tok) >= 5:
+            out.add(tok)
+    return out
+
+
 def _find_tainted_call_arg(
     all_receipts: Sequence[ToolReceipt],
     user_prompt: str,
@@ -1512,29 +1547,28 @@ def _find_tainted_call_arg(
     """Detect Layer-2 call-standing violations (indirect prompt injection):
     a concrete target (email, URL, or file path) passed as an argument to a mutating
     tool that originated in a prior read-only tool's output and never appeared in `user_prompt`.
+    Normalizes both sides (lowercase, percent-decode, display-name strip, path canonicalization).
     """
     prompt_low = user_prompt.lower()
+    prompt_tokens = _extract_normalized_taint_tokens(user_prompt)
     seen_untrusted: dict[str, str] = {}
     for rcpt in all_receipts:
         if not (rcpt.ok and rcpt.executed):
             continue
         is_mut = (not _is_read_only_tool(rcpt.tool)) or _receipt_has_verified_mutation(rcpt)
         if not is_mut:
-            out_low = (rcpt.output or "").lower()
-            for m in _TAINT_TARGET_RE.finditer(out_low):
-                tok = m.group(0).rstrip(".,!?;:\"'")
-                if len(tok) >= 5 and tok not in prompt_low:
+            for tok in _extract_normalized_taint_tokens(rcpt.output or ""):
+                if tok not in prompt_tokens and tok not in prompt_low:
                     seen_untrusted.setdefault(tok, rcpt.tool)
             continue
         if not seen_untrusted:
             continue
         for aval in rcpt.args.values():
-            v_low = str(aval).strip().lower()
-            if len(v_low) < 5 or v_low in prompt_low:
+            val_s = str(aval).strip()
+            if len(val_s) < 5:
                 continue
-            for m in _TAINT_TARGET_RE.finditer(v_low):
-                tok = m.group(0).rstrip(".,!?;:\"'")
-                if tok in seen_untrusted and tok not in prompt_low:
+            for tok in _extract_normalized_taint_tokens(val_s):
+                if tok in seen_untrusted and tok not in prompt_tokens and tok not in prompt_low:
                     return (rcpt, tok, seen_untrusted[tok])
     return None
 
