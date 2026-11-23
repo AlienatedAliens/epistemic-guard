@@ -5,7 +5,7 @@
 **Check what an AI agent claims it did against cryptographically signed receipts of what actually happened.**  
 `epistemic-guard` wraps any MCP server (`mcp-proxy` / `mcp-http-proxy`) or Claude Code / Codex session (`hook`) to emit Ed25519 + RFC 6962 Merkle tool receipts, optionally verifies local side effects out-of-band (`--probe-fs`, `--probe-git`, `--probe-sqlite`), and checks post-turn replies locally on CPU (`~8-11 ms`, `0 MiB` VRAM, zero LLM API fees, MIT License) with three-state verdicts (`verified`, `contradicted`, `unverifiable`). Optional modules add Ed25519 SQLite memory write-gating and RAG source deduplication.
 
-[Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
+[arXiv Paper (`2611.27095`)](https://arxiv.org/abs/2611.27095) · [Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
 
 ---
 
@@ -316,4 +316,4 @@ To test generalization outside our own synthetic datasets, we evaluated `epistem
 
 - **Source Code:** [MIT License](LICENSE) (`Copyright (c) 2026 Sean Maxwell` · [ORCID `0009-0004-0133-0463`](https://orcid.org/0009-0004-0133-0463) · Built by [RollSolo](https://rollsolo.app), Member of NVIDIA Inception).
 - **INT8 Model Weights:** Derived from `Apache-2.0` / `MIT` upstream checkpoints (`cross-encoder/nli-MiniLM2-L6-H768`, `cross-encoder/ms-marco-MiniLM-L-6-v2`, `cross-encoder/nli-deberta-v3-xsmall`); see [`MODEL_NOTICES.md`](MODEL_NOTICES.md).
-- **Citation & Preprints:** [`CITATION.cff`](CITATION.cff) · Zenodo DOIs [`10.5281/zenodo.23649049`](https://doi.org/10.5281/zenodo.23649049), [`10.5281/zenodo.23901452`](https://doi.org/10.5281/zenodo.23901452), [`10.5281/zenodo.23901605`](https://doi.org/10.5281/zenodo.23901605), [`10.5281/zenodo.23901683`](https://doi.org/10.5281/zenodo.23901683).
+- **Citation & Preprints:** [`arXiv:2611.27095` (`cs.SE`)](https://arxiv.org/abs/2611.27095) · [`CITATION.cff`](CITATION.cff) · Zenodo DOIs [`10.5281/zenodo.23649049`](https://doi.org/10.5281/zenodo.23649049), [`10.5281/zenodo.23901452`](https://doi.org/10.5281/zenodo.23901452), [`10.5281/zenodo.23901605`](https://doi.org/10.5281/zenodo.23901605), [`10.5281/zenodo.23901683`](https://doi.org/10.5281/zenodo.23901683).

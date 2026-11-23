@@ -9,9 +9,21 @@ authors:
 repository-code: "https://github.com/AlienatedAliens/epistemic-guard"
 url: "https://pypi.org/project/epistemic-guard/"
 doi: 10.5281/zenodo.23649049
-version: "0.5.2"
-date-released: "2026-11-19"
+version: "0.6.5"
+date-released: "2026-11-23"
 license: MIT
+preferred-citation:
+  type: article
+  title: "Epistemic Guard: Out-of-Process MCP Receipt Proxying, Post-Turn Prose Supervision, and Provenance-Gated Memory for Tool-Using Autonomous Agents"
+  authors:
+    - family-names: Maxwell
+      given-names: Sean
+      orcid: "https://orcid.org/0009-0004-0133-0463"
+  year: 2026
+  identifiers:
+    - type: other
+      value: "arXiv:2611.27095"
+  url: "https://arxiv.org/abs/2611.27095"
 keywords:
   - ai-agents
   - mcp
