@@ -74,6 +74,8 @@ def receipt_to_otel_attributes(
         f"{prefix}.receipt.aer1_output_hash": str(aer1["output_hash"]),
         f"{prefix}.receipt.signed": receipt.signature.startswith("ed25519:"),
     }
+    if receipt.evidence_tier:
+        attrs[f"{prefix}.receipt.evidence_tier"] = receipt.evidence_tier
     if receipt.error_code:
         attrs[f"{prefix}.receipt.error_code"] = receipt.error_code
     if receipt.session_id:
@@ -93,6 +95,7 @@ def verdict_to_otel_attributes(
     """Export a `SupervisionVerdict` into flat OpenTelemetry / Langfuse span attributes."""
     attrs: dict[str, str | int | float | bool] = {
         f"{prefix}.narration.is_valid": verdict.is_valid,
+        f"{prefix}.narration.verdict_status": verdict.verdict_status,
         f"{prefix}.narration.device": verdict.device,
         f"{prefix}.narration.latency_ms": round(float(verdict.latency_ms), 3),
         f"{prefix}.narration.clauses_checked": verdict.clauses_checked,
