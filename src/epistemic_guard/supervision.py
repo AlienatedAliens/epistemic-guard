@@ -1763,6 +1763,28 @@ class ReceiptSupervisor:
             )
         ]
 
+        # Passive code/config-state summaries ("The code has been updated to set X",
+        # "The attribute is now initialized in __init__") classified as CLAIM_SYSTEM_STATE
+        # are legitimately grounded by a file-edit/write receipt, while still blocking
+        # non-code system claims like "I rebooted the server" against write_file.
+        if not matching_rcpts and family == "CLAIM_SYSTEM_STATE":
+            if re.search(
+                r"\b(?:code|method|function|class|attribute|field|variable|file|script|"
+                r"module|patch|test|config|handler|import|line|logic|bug|issue|fix|"
+                r"implementation)\b",
+                cl_lower,
+            ):
+                matching_rcpts = [
+                    rcpt
+                    for rcpt in ok_receipts
+                    if _receipt_matches_family(
+                        rcpt,
+                        "CLAIM_FILE_WRITE",
+                        extra_stems=extra_stems,
+                        custom_tool_families=custom_tool_families,
+                    )
+                ]
+
         # Open-vocabulary fallback for unseen enterprise/SaaS tools outside the classic
         # coding/filesystem/SQL taxonomy: ground directly against succeeded receipt arguments,
         # tool schema tokens, and output text. Read-only tools and SQL/shell/file tools stay
@@ -1905,6 +1927,7 @@ class ReceiptSupervisor:
         narration: str,
         receipts: Sequence[ToolReceipt] = (),
         *,
+        prior_receipts: Sequence[ToolReceipt] | None = None,
         user_prompt: str = "",
         base_char_offset: int = 0,
         allow_creative_context: bool | None = None,
@@ -1915,8 +1938,17 @@ class ReceiptSupervisor:
         expected_session_id: str | None = None,
         max_receipt_age_seconds: float | None = None,
     ) -> SupervisionVerdict:
-        """Verify an assistant message against executed `ToolReceipt` records."""
+        """Verify an assistant message against executed `ToolReceipt` records.
+
+        In multi-turn sessions, pass current-turn receipts in `receipts` and earlier
+        session receipts in `prior_receipts` so succeeded prior edits can ground
+        backward-looking summaries without stale prior failures triggering
+        `FAILED_TOOL_UNDISCLOSED` on subsequent read/navigation turns.
+        """
         t0 = time.perf_counter()
+        all_receipts: list[ToolReceipt] = (
+            [*prior_receipts, *receipts] if prior_receipts else list(receipts)
+        )
         active_gate = self.gate if gate is None else gate
         active_session = (
             self.expected_session_id if expected_session_id is None else expected_session_id
@@ -1927,12 +1959,12 @@ class ReceiptSupervisor:
             else max_receipt_age_seconds
         )
         _validate_receipt_authenticity(
-            receipts,
+            all_receipts,
             gate=active_gate,
             expected_session_id=active_session,
             max_receipt_age_seconds=active_max_age,
         )
-        structured = parse_structured_action_tags(narration, receipts)
+        structured = parse_structured_action_tags(narration, all_receipts)
         unsupported_claims: list[str] = []
         unsupported_spans: list[UnsupportedClaimSpan] = []
         unfulfilled: list[str] = []
@@ -1989,9 +2021,9 @@ class ReceiptSupervisor:
                 )
             output_guard = self._output_guard
 
-        ok_receipts = [r for r in receipts if r.ok and r.executed]
+        ok_receipts = [r for r in all_receipts if r.ok and r.executed]
         ok_tools_succeeded = {r.tool.lower() for r in ok_receipts}
-        # Exclude failed attempts that were superseded by a later successful retry of the same tool
+        # Only current-turn failures require disclosure; skip failures superseded by an ok retry.
         failed_receipts = [
             r
             for r in receipts
@@ -2109,7 +2141,7 @@ class ReceiptSupervisor:
                 if over_count or not self._receipt_supports_clause(
                     cl_text,
                     fam,
-                    receipts,
+                    all_receipts,
                     extra_stems=self._extra_tool_stems,
                     custom_tool_families=self._custom_tool_families,
                     mcp_tool_tokens=self._mcp_tool_tokens,

@@ -1084,3 +1084,57 @@ def test_extract_receipts_parses_structured_json_tool_failures() -> None:
         supervisor=ReceiptSupervisor(warn_on_missing=False),
     )
     assert verdict.is_valid is False
+
+
+
+def test_prior_receipts_scoping_and_code_state_summaries() -> None:
+    """Multi-turn coding loops:
+    1. A stale failed reproduce script in `prior_receipts` does not trigger
+       `FAILED_TOOL_UNDISCLOSED` on subsequent read/navigation turns.
+    2. A prior `edit_file` receipt grounds passive code-state summaries classified
+       as `CLAIM_SYSTEM_STATE` ("The code has been updated to set auth_token"),
+       while still blocking unrelated system claims like "I rebooted the server."
+    """
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    stale_fail = ToolReceipt(
+        tool="bash_exec",
+        ok=False,
+        executed=True,
+        error_code="shell_error",
+        args={"command": "pytest tests/test_auth.py"},
+        output="Traceback (most recent call last): AssertionError",
+    )
+    read_turn = ToolReceipt(
+        tool="read_file",
+        ok=True,
+        executed=True,
+        args={"path": "src/auth.py"},
+        output="def __init__(self): ...",
+    )
+    v_nav = sup.verify_narration(
+        "The __init__ method is not visible in the current window. Let's scroll up.",
+        receipts=[read_turn],
+        prior_receipts=[stale_fail],
+    )
+    assert v_nav.is_valid is True
+
+    prior_edit = ToolReceipt(
+        tool="edit_file",
+        ok=True,
+        executed=True,
+        args={"path": "src/auth.py"},
+        output="updated __init__",
+    )
+    v_code = sup.verify_narration(
+        "The code has been updated to set the auth_token attribute in __init__.",
+        receipts=[read_turn],
+        prior_receipts=[prior_edit],
+    )
+    assert v_code.is_valid is True
+
+    # Non-code system state claim must still be rejected against edit_file
+    v_reboot = sup.verify_narration(
+        "I rebooted the production server.",
+        receipts=[prior_edit],
+    )
+    assert v_reboot.is_valid is False
