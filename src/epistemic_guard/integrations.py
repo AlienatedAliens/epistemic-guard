@@ -539,27 +539,33 @@ def _parse_raw_args_map(raw_args: object) -> dict[str, str | int | float | bool]
     return {}
 
 
-def _content_indicates_tool_failure(content_str: str) -> bool:
+def _content_indicates_tool_failure(content: str | Mapping[str, Any]) -> bool:
     """Return True if a tool message payload explicitly signals failure via text prefix or JSON."""
-    stripped = content_str.strip()
-    if stripped.lower().startswith(("error:", "traceback")):
-        return True
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            obj = json.loads(stripped)
-        except (TypeError, ValueError):
-            return False
-        if isinstance(obj, Mapping):
-            if obj.get("ok") is False or obj.get("success") is False:
-                return True
-            if obj.get("isError") is True or obj.get("is_error") is True:
-                return True
-            err_val = obj.get("error")
-            if err_val not in (None, False, "", [], {}):
-                return True
-            status_val = str(obj.get("status", "")).strip().lower()
-            if status_val in {"error", "failed", "failure", "denied", "rejected"}:
-                return True
+    obj: Mapping[str, Any] | None = None
+    if isinstance(content, Mapping):
+        obj = content
+    else:
+        stripped = content.strip()
+        if stripped.lower().startswith(("error:", "traceback")):
+            return True
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+            except (TypeError, ValueError):
+                return False
+            if isinstance(parsed, Mapping):
+                obj = parsed
+    if obj is not None:
+        if obj.get("ok") is False or obj.get("success") is False:
+            return True
+        if obj.get("isError") is True or obj.get("is_error") is True:
+            return True
+        err_val = obj.get("error")
+        if err_val not in (None, False, "", [], {}):
+            return True
+        status_val = str(obj.get("status", "")).strip().lower()
+        if status_val in {"error", "failed", "failure", "denied", "rejected"}:
+            return True
     return False
 
 
@@ -617,8 +623,8 @@ def extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> lis
                         res_txt = raw_res
                     else:
                         res_txt = json.dumps(raw_res, sort_keys=True, separators=(",", ":"))
-                    is_err = bool(blk.get("is_error", False)) or res_txt.lower().startswith(
-                        ("error:", "traceback")
+                    is_err = bool(blk.get("is_error", False)) or _content_indicates_tool_failure(
+                        res_txt
                     )
                     tname, parsed_args = call_meta.get(
                         cid, (str(blk.get("name", "tool")), {})
@@ -659,13 +665,12 @@ def extract_receipts_from_messages(messages: Sequence[Mapping[str, Any]]) -> lis
                     else:
                         q = gemini_pending_by_name.get(tname)
                         parsed_args = q.pop(0) if q else {}
-                    is_err = False
                     if isinstance(resp_obj, Mapping):
-                        if bool(resp_obj.get("is_error", False)) or "error" in resp_obj:
-                            is_err = True
+                        is_err = _content_indicates_tool_failure(resp_obj)
                         out_txt = json.dumps(resp_obj, sort_keys=True, separators=(",", ":"))
                     else:
                         out_txt = str(resp_obj)
+                        is_err = _content_indicates_tool_failure(out_txt)
                     extracted.append(
                         ToolReceipt(
                             tool=tname,

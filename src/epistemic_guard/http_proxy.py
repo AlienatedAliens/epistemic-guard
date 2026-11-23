@@ -23,6 +23,7 @@ from epistemic_guard.mcp_proxy import (
     ReceiptLogWriter,
     _coerce_scalar,
     _extract_mcp_result_text,
+    _sanitize_tools_list_item,
     compute_mcp_tool_sha256,
     filter_mcp_result_object,
     load_or_create_mcp_signer,
@@ -120,6 +121,7 @@ class McpStreamableHttpProxy:
         writer: ReceiptLogWriter,
         *,
         pin_tools: bool = False,
+        strip_untrusted_annotations: bool = False,
         raise_on_rugpull: bool = False,
         filter_web_results: bool = False,
         timeout_s: float = 30.0,
@@ -132,6 +134,7 @@ class McpStreamableHttpProxy:
         self.upstream_url = upstream_url.strip()
         self.writer = writer
         self.pin_tools = pin_tools
+        self.strip_untrusted_annotations = strip_untrusted_annotations
         self.raise_on_rugpull = raise_on_rugpull
         self.filter_web_results = filter_web_results
         self.timeout_s = timeout_s
@@ -588,6 +591,11 @@ class McpStreamableHttpProxy:
                             {"Content-Type": "application/json"},
                             json.dumps(rug_err, separators=(",", ":")).encode("utf-8"),
                         )
+                    if self.strip_untrusted_annotations and not is_sse:
+                        san_obj, san_changed = _sanitize_tools_list_item(msg_obj)
+                        if san_changed:
+                            resp_body = json.dumps(san_obj, separators=(",", ":")).encode("utf-8")
+                            out_headers["Content-Length"] = str(len(resp_body))
 
         if is_single_map and method == "tools/call":
             matched_resp: dict[str, object] | None = None
@@ -709,6 +717,7 @@ def run_mcp_http_proxy(
     truncate_log: bool = False,
     include_aer1: bool = False,
     pin_tools: bool = False,
+    strip_untrusted_annotations: bool = False,
     filter_web_results: bool = False,
     session_id: str | None = None,
     prev_log_path: Path | str | None = None,
@@ -730,6 +739,7 @@ def run_mcp_http_proxy(
         upstream_url,
         writer,
         pin_tools=pin_tools,
+        strip_untrusted_annotations=strip_untrusted_annotations,
         filter_web_results=filter_web_results,
         timeout_s=timeout_s,
     )

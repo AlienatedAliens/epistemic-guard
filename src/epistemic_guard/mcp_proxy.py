@@ -1511,6 +1511,26 @@ class McpStdioProxy:
 
         for item in items:
             if not isinstance(item, Mapping) or "method" in item:
+                if (
+                    isinstance(item, Mapping)
+                    and item.get("method") == "notifications/tools/list_changed"
+                    and self._pin_tools
+                ):
+                    self._writer.append(
+                        ToolReceipt(
+                            call_id=f"mcp-list-changed-{uuid4().hex[:8]}",
+                            tool="tools/list",
+                            ok=True,
+                            executed=True,
+                            error_code="mcp_tools_list_changed",
+                            args={},
+                            output=(
+                                "Server emitted notifications/tools/list_changed "
+                                "while --pin-tools is active."
+                            ),
+                            endpoint_id=self._endpoint_id,
+                        )
+                    )
                 out_items.append(item)
                 continue
             id_key = _rpc_id_key(item.get("id"))

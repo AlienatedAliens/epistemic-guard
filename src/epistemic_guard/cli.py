@@ -293,6 +293,7 @@ def _cmd_mcp_http_proxy(args: argparse.Namespace) -> int:
             truncate_log=args.truncate,
             include_aer1=args.aer1,
             pin_tools=args.pin_tools,
+            strip_untrusted_annotations=args.strip_untrusted_annotations,
             filter_web_results=args.filter_web_results,
             session_id=args.session_id,
             prev_log_path=args.prev_log,
@@ -890,6 +891,14 @@ def main(argv: list[str] | None = None) -> int:
     mhp.add_argument("--aer1", action="store_true", help="Include AER-1 export on each log entry")
     mhp.add_argument(
         "--pin-tools", action="store_true", help="Pin tools/list SHA-256 against rug-pulls"
+    )
+    mhp.add_argument(
+        "--strip-untrusted-annotations",
+        action="store_true",
+        help=(
+            "Monotonically strip privilege-raising MCP tool annotations "
+            "from tools/list responses before forwarding to the client"
+        ),
     )
     mhp.add_argument(
         "--filter-web-results",

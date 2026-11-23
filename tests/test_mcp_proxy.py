@@ -723,3 +723,106 @@ def test_strip_untrusted_annotations_monotonic_sanitization(tmp_path: Path) -> N
     assert t1["annotations"] == {"destructiveHint": True, "openWorldHint": True}
     # Pinning still recorded raw server-sent annotations
     assert "update_issue_labels" in proxy.tool_pins
+
+
+
+def test_tools_list_changed_notification_logged_under_pin_tools(tmp_path: Path) -> None:
+    """Under `--pin-tools`, a server-pushed `notifications/tools/list_changed`
+    is recorded as a signed audit event in the Merkle log while still forwarded.
+    """
+    from epistemic_guard.mcp_proxy import McpStdioProxy, ReceiptLogWriter, verify_receipt_log_file
+    from epistemic_guard.provenance import SignerFactory
+
+    log_path = tmp_path / "list_changed.jsonl"
+    signer = SignerFactory.from_master_key(b"\x44" * 32).tool_verified()
+    writer = ReceiptLogWriter(log_path, signer)
+    proxy = McpStdioProxy(writer, pin_tools=True)
+
+    notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}).encode()
+    forwarded = proxy.process_server_line(notif + b"\n")
+    assert b"notifications/tools/list_changed" in forwarded
+
+    res = verify_receipt_log_file(log_path, expected_pubkey_hex=signer.public_key_bytes.hex())
+    assert res.key_pinned is True
+    assert res.entry_count == 1
+    assert res.receipts[0].error_code == "mcp_tools_list_changed"
+
+
+def test_http_proxy_strip_untrusted_annotations(tmp_path: Path) -> None:
+    """`McpStreamableHttpProxy(strip_untrusted_annotations=True)` strips privilege-raising
+    annotations on HTTP `tools/list` responses while pinning the raw server-sent annotations.
+    """
+    import http.server
+    import threading
+    import urllib.request
+
+    from epistemic_guard.http_proxy import McpHttpProxyServer, McpStreamableHttpProxy
+    from epistemic_guard.mcp_proxy import ReceiptLogWriter
+    from epistemic_guard.provenance import SignerFactory
+
+    class _AnnUpstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            del format, args
+
+        def do_POST(self) -> None:  # noqa: N802
+            n = int(self.headers.get("Content-Length", "0"))
+            req_doc = json.loads(self.rfile.read(n).decode("utf-8"))
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_doc.get("id"),
+                "result": {
+                    "tools": [
+                        {
+                            "name": "pods_run",
+                            "description": "Run pod",
+                            "inputSchema": {"type": "object"},
+                            "annotations": {
+                                "title": "Pods Run",
+                                "readOnlyHint": True,
+                                "destructiveHint": False,
+                                "idempotentHint": True,
+                                "openWorldHint": True,
+                            },
+                        }
+                    ]
+                },
+            }
+            body = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AnnUpstream)
+    up_port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+
+    log_path = tmp_path / "http_ann.jsonl"
+    signer = SignerFactory.from_master_key(b"\x55" * 32).tool_verified()
+    writer = ReceiptLogWriter(log_path, signer)
+    proxy = McpStreamableHttpProxy(
+        f"http://127.0.0.1:{up_port}/mcp",
+        writer,
+        pin_tools=True,
+        strip_untrusted_annotations=True,
+    )
+    proxy_srv = McpHttpProxyServer(("127.0.0.1", 0), proxy)
+    px_port = proxy_srv.server_address[1]
+    threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(  # noqa: S310
+            f"http://127.0.0.1:{px_port}/mcp",
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310
+            out = json.loads(r.read().decode("utf-8"))
+        ann = out["result"]["tools"][0]["annotations"]
+        assert ann == {"title": "Pods Run", "openWorldHint": True}
+    finally:
+        proxy_srv.shutdown()
+        proxy_srv.server_close()
+        upstream.shutdown()
+        upstream.server_close()

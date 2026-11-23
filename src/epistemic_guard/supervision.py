@@ -1496,6 +1496,49 @@ class OutputValueGuard:
         return None
 
 
+_TAINT_TARGET_RE = re.compile(
+    r"(?:https?://[^\s,;)']+|"
+    r"[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|"
+    r"(?:[a-z]:\\|/)?[a-z0-9_.-]+(?:[/\\][a-z0-9_.-]+)+|"
+    r"\b[a-z0-9_.-]+\.(?:txt|json|csv|sql|db|py|sh|env|pem|key|yaml|yml|md|pdf|docx|xlsx)\b)",
+    re.IGNORECASE,
+)
+
+
+def _find_tainted_call_arg(
+    all_receipts: Sequence[ToolReceipt],
+    user_prompt: str,
+) -> tuple[ToolReceipt, str, str] | None:
+    """Detect Layer-2 call-standing violations (indirect prompt injection):
+    a concrete target (email, URL, or file path) passed as an argument to a mutating
+    tool that originated in a prior read-only tool's output and never appeared in `user_prompt`.
+    """
+    prompt_low = user_prompt.lower()
+    seen_untrusted: dict[str, str] = {}
+    for rcpt in all_receipts:
+        if not (rcpt.ok and rcpt.executed):
+            continue
+        is_mut = (not _is_read_only_tool(rcpt.tool)) or _receipt_has_verified_mutation(rcpt)
+        if not is_mut:
+            out_low = (rcpt.output or "").lower()
+            for m in _TAINT_TARGET_RE.finditer(out_low):
+                tok = m.group(0).rstrip(".,!?;:\"'")
+                if len(tok) >= 5 and tok not in prompt_low:
+                    seen_untrusted.setdefault(tok, rcpt.tool)
+            continue
+        if not seen_untrusted:
+            continue
+        for aval in rcpt.args.values():
+            v_low = str(aval).strip().lower()
+            if len(v_low) < 5 or v_low in prompt_low:
+                continue
+            for m in _TAINT_TARGET_RE.finditer(v_low):
+                tok = m.group(0).rstrip(".,!?;:\"'")
+                if tok in seen_untrusted and tok not in prompt_low:
+                    return (rcpt, tok, seen_untrusted[tok])
+    return None
+
+
 class ReceiptSupervisor:
     """Verifies assistant clauses against `ToolReceipt` records on CPU/GPU/NPU."""
 
@@ -1507,6 +1550,7 @@ class ReceiptSupervisor:
         claim_threshold: float = 0.55,
         flag_unfulfilled_promises: bool = False,
         flag_undisclosed_mutations: bool = False,
+        flag_tainted_call_args: bool = False,
         allow_creative_context: bool = True,
         verify_output_values: bool = False,
         verify_discourse_nli: bool = True,
@@ -1524,6 +1568,7 @@ class ReceiptSupervisor:
         self.claim_threshold = claim_threshold
         self.flag_unfulfilled_promises = flag_unfulfilled_promises
         self.flag_undisclosed_mutations = flag_undisclosed_mutations
+        self.flag_tainted_call_args = flag_tainted_call_args
         self.allow_creative_context = allow_creative_context
         self.verify_output_values = verify_output_values
         self.verify_discourse_nli = verify_discourse_nli
@@ -1933,6 +1978,7 @@ class ReceiptSupervisor:
         allow_creative_context: bool | None = None,
         verify_output_values: bool | None = None,
         flag_undisclosed_mutations: bool | None = None,
+        flag_tainted_call_args: bool | None = None,
         tool_preconditions: Mapping[str, Sequence[str]] | None = None,
         gate: ProvenanceGate | None = None,
         expected_session_id: str | None = None,
@@ -2375,6 +2421,30 @@ class ReceiptSupervisor:
 
         # Check silent argument drift when a rejected/failed mutating call is retried
         retry_drift = _find_retry_arg_drift(narration, receipts, user_prompt=user_prompt)
+
+        # Optional Layer-2 call-standing check (indirect prompt-injection argument taint)
+        check_taint = (
+            self.flag_tainted_call_args
+            if flag_tainted_call_args is None
+            else flag_tainted_call_args
+        )
+        if check_taint and all_receipts:
+            tainted = _find_tainted_call_arg(all_receipts, user_prompt)
+            if tainted is not None:
+                t_rcpt, t_tok, t_src = tainted
+                unsupported_claims.append(f"{t_rcpt.tool}({t_tok})")
+                unsupported_spans.append(
+                    UnsupportedClaimSpan(
+                        text=f"{t_rcpt.tool}({t_tok})",
+                        start_char=base_char_offset,
+                        end_char=base_char_offset + min(len(narration.strip()), 160),
+                        claimed_family="TAINTED_CALL_ARG",
+                        reason=(
+                            f"Mutating tool '{t_rcpt.tool}' argument '{t_tok}' originated from "
+                            f"prior untrusted tool output '{t_src}' rather than user_prompt."
+                        ),
+                    )
+                )
         if retry_drift is not None and not unsupported_claims and narration.strip():
             unsupported_claims.append(narration.strip()[:160])
             unsupported_spans.append(
