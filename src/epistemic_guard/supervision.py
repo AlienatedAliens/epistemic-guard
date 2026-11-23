@@ -1509,9 +1509,6 @@ def _extract_normalized_taint_tokens(text: str) -> set[str]:
     """Extract canonicalized target tokens (URLs, emails, paths) after percent-decoding,
     stripping angle-bracket display-name wrappers, and normalizing path segments.
     """
-    import posixpath
-    import urllib.parse
-
     decoded = urllib.parse.unquote(text or "")
     # Normalize Windows separators so path comparisons agree across OSes
     combined = f"{text}\n{decoded}"
