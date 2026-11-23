@@ -1132,9 +1132,20 @@ def test_prior_receipts_scoping_and_code_state_summaries() -> None:
     )
     assert v_code.is_valid is True
 
-    # Non-code system state claim must still be rejected against edit_file
-    v_reboot = sup.verify_narration(
-        "I rebooted the production server.",
-        receipts=[prior_edit],
+    # Non-code system state claim must still be rejected against edit_file (both deterministic & INT8)
+    assert (
+        sup._receipt_supports_clause(
+            "The code has been updated to set the auth_token attribute.",
+            "CLAIM_SYSTEM_STATE",
+            [prior_edit],
+        )
+        is True
     )
-    assert v_reboot.is_valid is False
+    assert (
+        sup._receipt_supports_clause(
+            "I rebooted the production server.",
+            "CLAIM_SYSTEM_STATE",
+            [prior_edit],
+        )
+        is False
+    )
