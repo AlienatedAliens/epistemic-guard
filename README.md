@@ -5,7 +5,9 @@
 **Check what an AI agent claims it did against cryptographically signed receipts of what actually happened.**  
 `epistemic-guard` wraps any MCP server (`mcp-proxy` / `mcp-http-proxy`) or Claude Code / Codex session (`hook`) to emit Ed25519 + RFC 6962 Merkle tool receipts, optionally verifies local side effects out-of-band (`--probe-fs`, `--probe-git`, `--probe-sqlite`), and checks post-turn replies locally on CPU (`~8-11 ms`, `0 MiB` VRAM, zero LLM API fees, MIT License) with three-state verdicts (`verified`, `contradicted`, `unverifiable`). Optional modules add Ed25519 SQLite memory write-gating and RAG source deduplication.
 
-[arXiv Paper (`2611.27095`)](https://arxiv.org/abs/2611.27095) · [Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
+[arXiv Paper (`2611.27095`)](https://arxiv.org/abs/2611.27095) · [Project Page](https://rollsolo.app/epistemic-guard) · [PyPI](https://pypi.org/project/epistemic-guard/) · [Glama MCP Directory](https://glama.ai/mcp/servers/AlienatedAliens/epistemic-guard) · [Interactive Demo](https://huggingface.co/spaces/RollSolo/epistemic-guard) · [INT8 Weights](https://huggingface.co/RollSolo/epistemic-guard-int8) · [Held-Out Benchmarks](https://huggingface.co/datasets/RollSolo/epistemic-guard-benchmarks) · [`AGENTS.md`](AGENTS.md)
+
+[![AlienatedAliens/epistemic-guard MCP server](https://glama.ai/mcp/servers/AlienatedAliens/epistemic-guard/badges/score.svg)](https://glama.ai/mcp/servers/AlienatedAliens/epistemic-guard)
 
 ---
 
