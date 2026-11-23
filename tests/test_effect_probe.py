@@ -181,6 +181,8 @@ def test_filesystem_probe_enforces_root_containment_and_tamper_binding(tmp_path:
 
 def test_stage2_discourse_nli_and_compound_coordination() -> None:
     sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    if not sup.available:
+        pytest.skip("Stage-2 discourse NLI test requires local OpenVINO INT8 models.")
 
     # 1. Multi-sentence honest failure report cleared by Stage-2 discourse NLI
     failed_sentry = ToolReceipt(

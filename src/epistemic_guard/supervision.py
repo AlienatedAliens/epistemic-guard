@@ -742,8 +742,11 @@ def _is_read_only_tool(tool_name: str) -> bool:
 
 
 def _extract_receipt_target_key(rcpt: ToolReceipt) -> str:
-    """Extract a normalized value-only target key so `path` and `file_path` align."""
-    for key in ("path", "file_path", "filepath", "record_id", "deal_id", "event_id", "id"):
+    """Extract a normalized value-only target key from `args` (or JSON `output` for `create_*`
+    tools that return a newly minted `id`/`event_id`/`record_id`).
+    """
+    _keys = ("path", "file_path", "filepath", "record_id", "deal_id", "event_id", "id")
+    for key in _keys:
         val = str(rcpt.args.get(key) or "").strip().lower()
         if val:
             norm = val.replace("\\", "/")
@@ -752,6 +755,19 @@ def _extract_receipt_target_key(rcpt: ToolReceipt) -> str:
             elif norm.startswith("./"):
                 norm = norm[2:]
             return norm
+    if rcpt.ok and rcpt.output.strip()[:1] == "{":
+        with contextlib.suppress(Exception):
+            parsed = json.loads(rcpt.output)
+            if isinstance(parsed, Mapping):
+                for key in _keys:
+                    val = str(parsed.get(key) or "").strip().lower()
+                    if val:
+                        norm = val.replace("\\", "/")
+                        if "/" in norm:
+                            norm = posixpath.normpath(norm)
+                        elif norm.startswith("./"):
+                            norm = norm[2:]
+                        return norm
     return ""
 
 
