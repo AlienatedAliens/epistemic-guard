@@ -10,6 +10,7 @@ import posixpath
 import re
 import threading
 import time
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
