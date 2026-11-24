@@ -433,7 +433,11 @@ def resolve_clause_claim_family(clause_text: str, neural_claim_cls: str) -> str:
         r"workspace|entry|keys?|checklist|ticket|issue|\.[a-z0-9]{2,8})\b|"
         r"\b(?:ticket|issue|entry)\b.*\bopened\s+in\s+[a-z0-9_.-]+\.[a-z0-9]{2,8}\b|"
         r"\b(?:file|note)\s+is\s+(?:now\s+)?saved\b|"
-        r"\bupdated\s+[a-z0-9_.-]+\.(?:json|yaml|yml|toml|md|txt|conf|ini|env|gitignore|nvmrc)\b",
+        r"\bupdated\s+[a-z0-9_./-]+\.(?:json|yaml|yml|toml|md|txt|conf|ini|env|gitignore|nvmrc|"
+        r"py|js|jsx|ts|tsx|go|rs|java|c|h|cpp|hpp|cs|rb|php|sh|ps1|sql|html|css|xml|cfg|lock|"
+        r"dockerfile)\b|"
+        r"(?:\b(?:file|code|function|method|class|module|script)|`[^`]+`)\s+(?:has|have)\s+"
+        r"(?:now\s+)?been\s+(?:successfully\s+)?(?:updated|modified|edited|changed)\b",
         c_low,
     ):
         return "CLAIM_FILE_WRITE"

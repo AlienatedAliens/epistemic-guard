@@ -1393,3 +1393,38 @@ def test_indeterminate_transport_drop_requires_honest_uncertainty() -> None:
     read_drop = drop(tool="search_flights", args={"query": "MEL to SYD"})
     v_read = sup.verify_narration("The flight search failed.", receipts=[read_drop])
     assert v_read.is_valid is True
+
+
+def test_passive_code_edit_claims_resolve_to_file_write_not_memory() -> None:
+    """Passive code-edit summaries ("The `fail.py` file has been updated ...") fell through every
+    deterministic regex and took the neural `CLAIM_MEMORY` label, so a successful `edit_file`
+    receipt could not ground them. They must resolve to `CLAIM_FILE_WRITE`, while real memory
+    claims keep resolving to `CLAIM_MEMORY` and stay grounded by memory tools.
+    """
+    from epistemic_guard.supervision import resolve_clause_claim_family
+
+    for clause in (
+        "The `fail.py` file has been updated with the example code.",
+        "The `addBinding` method has been updated with the print statement.",
+        "The code has been successfully updated to include the new `elif` statement",
+        "I updated fail.py with the fix.",
+        "Updated src/app.tsx to export the hook.",
+    ):
+        assert resolve_clause_claim_family(clause, "CLAIM_MEMORY") == "CLAIM_FILE_WRITE", clause
+
+    assert resolve_clause_claim_family("I saved your preference to memory.", "CLAIM_FILE_WRITE") == "CLAIM_MEMORY"
+    assert resolve_clause_claim_family("My notes have been updated.", "CLAIM_MEMORY") == "CLAIM_MEMORY"
+
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    edit = ToolReceipt(tool="edit_file", ok=True, executed=True, args={"path": "fail.py"}, output="File updated.")
+    v_edit = sup.verify_narration(
+        "The `fail.py` file has been updated with the example code.", receipts=[edit]
+    )
+    assert v_edit.is_valid is True
+
+    for mem_tool in ("memory_save", "remember"):
+        mem = ToolReceipt(tool=mem_tool, ok=True, executed=True, args={"key": "pref"}, output="stored")
+        v_mem = sup.verify_narration("I saved your preference to memory.", receipts=[mem])
+        assert v_mem.is_valid is True, mem_tool
+    v_mem_wrong = sup.verify_narration("I saved your preference to memory.", receipts=[edit])
+    assert v_mem_wrong.is_valid is False
