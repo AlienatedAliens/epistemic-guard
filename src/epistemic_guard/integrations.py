@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import json
 import math
+import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, ParamSpec, Protocol, TypeVar, overload, runtime_checkable
 
@@ -57,6 +58,21 @@ class SupportsOtelSpan(Protocol):
     def set_attribute(self, key: str, value: str | int | float | bool) -> object: ...
 
 
+def _redact_endpoint_id(endpoint_id: str) -> str:
+    """Drop userinfo, query and fragment from a URL-shaped endpoint id before it leaves the
+    process in telemetry; `https://user:token@host/mcp?key=x` becomes `https://host/mcp`.
+    Non-URL ids (`stdio:demo`, `hook:post-tool`) pass through unchanged.
+    """
+    parts = urllib.parse.urlsplit(endpoint_id)
+    if not (parts.scheme and parts.netloc):
+        return endpoint_id
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def receipt_to_otel_attributes(
     receipt: ToolReceipt,
     *,
@@ -77,6 +93,8 @@ def receipt_to_otel_attributes(
     }
     if receipt.evidence_tier:
         attrs[f"{prefix}.receipt.evidence_tier"] = receipt.evidence_tier
+    if receipt.endpoint_id:
+        attrs[f"{prefix}.receipt.endpoint_id"] = _redact_endpoint_id(receipt.endpoint_id)
     if receipt.error_code:
         attrs[f"{prefix}.receipt.error_code"] = receipt.error_code
     if receipt.session_id:
