@@ -27,6 +27,8 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
   blocked with `--pin-tools`). Without the flag nothing changes. The file holds digests only, is
   written atomically, and loading fails closed on an unreadable, malformed or other-server file. Use
   one file per server; the stdio endpoint id is the executable name only. Not wired into `wrap-mcp-config`.
+- The stdio MCP server reported `serverInfo.version` 0.5.2 and `server.json` (the MCP registry
+  manifest) said 0.6.0; both now say 0.6.8, and a test fails if any release version drifts.
 - The source distribution now includes `CHANGELOG.md` and `benchmarks/aer1_full_corpus.json`, so the
   test suite runs from an unpacked sdist.
 
