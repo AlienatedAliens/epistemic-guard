@@ -77,6 +77,8 @@ include = [
     "/tests",
     "/AGENTS.md",
     "/CHANGELOG.md",
+    "/CITATION.cff",
+    "/server.json",
     "/benchmarks/aer1_full_corpus.json",
     "/LICENSE",
     "/MODEL_NOTICES.md",
