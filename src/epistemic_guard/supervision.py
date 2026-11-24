@@ -27,6 +27,7 @@ from epistemic_guard.hazard import split_into_clauses_with_spans
 from epistemic_guard.models import resolve_managed_model_dir
 from epistemic_guard.nli import OpenVINONLIVerifier
 from epistemic_guard.provenance import ProvenanceGate
+from epistemic_guard.result_status import _MUTATING_TOOL_VERB_RE, _READBACK_TOOL_RE
 from epistemic_guard.schemas import (
     StructuredActionTag,
     SupervisionVerdict,
@@ -713,17 +714,6 @@ def _extract_numeric_set(text: str) -> set[float]:
     return nums
 
 
-_READBACK_TOOL_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:^|_)(?:get|read|search|query|fetch|check|verify|inspect|stat|status|scan|lookup|probe|list|find|show)(?:_|$)",
-    re.IGNORECASE,
-)
-_MUTATING_TOOL_VERB_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:^|_)(?:create|write|edit|update|set|put|post|patch|delete|remove|drop|insert|add|"
-    r"append|send|email|mail|invite|pay|transfer|refund|book|schedule|commit|push|merge|"
-    r"deploy|exec|execute|run|bash|shell|kill|stop|start|restart|enable|disable|toggle|"
-    r"revoke|cancel|archive|wipe|purge|move|rename|copy|upload|publish|assign|protect)(?:_|$)",
-    re.IGNORECASE,
-)
 _DELETE_TOOL_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:^|_)(?:delete|remove|unlink|drop|purge|wipe|erase|cancel|revoke|rm)(?:_|$)",
     re.IGNORECASE,
@@ -911,6 +901,111 @@ def _has_failure_disclosure(narration: str) -> bool:
     """Return True if narration genuinely discloses an error/failure/caveat."""
     cleaned = _NO_ERROR_PHRASE_RE.sub(" ", narration)
     return bool(_FAILURE_DISCLOSURE_RE.search(cleaned))
+
+
+# Convention: the final segment of `error_code` is `indeterminate`
+# (`mcp_http_upstream_indeterminate`), and the segment before it is not a negation
+# (`not_indeterminate`, `non_indeterminate`).
+_INDETERMINATE_ERROR_CODE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|[_.:-])(?<!\bnot[_.:-])(?<!\bnon[_.:-])(?<!\bno[_.:-])indeterminate$"
+)
+# Transport codes that predate the `indeterminate` token but mean the same thing: the request
+# was dispatched and no response arrived. `McpStdioProxy` writes `mcp_server_eof` when the server
+# exits mid-call; a 502/504 from `McpStreamableHttpProxy` means a gateway lost or timed out on the
+# upstream, which may already have acted. Plain 500/503 stay definite failures.
+_KNOWN_INDETERMINATE_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {"mcp_server_eof", "mcp_http_502", "mcp_http_504"}
+)
+# Uncertainty only discloses an indeterminate call when it is about that call's outcome, not about
+# some other detail ("the reason is unknown", "it may have been a glitch", "not sure why").
+_UNCERTAIN_WORD = (
+    r"(?:unknown|unclear|uncertain|unsure|indeterminate|unconfirmed|unverified|"
+    r"not\s+(?:yet\s+)?(?:sure|certain|clear|known|confirmed|verified))"
+)
+_EFFECT_PHRASE = (
+    r"(?:went\s+through|gone\s+through|succeeded|completed|took\s+effect|taken\s+effect|"
+    r"(?:was|were|been)\s+(?:booked|placed|processed|applied|sent|charged|created|saved|"
+    r"written|executed|completed|made|submitted|delivered|committed|recorded|accepted|posted|"
+    r"paid|transferred|deleted|removed|updated|cancell?ed|scheduled|registered|published|"
+    r"refunded|issued|stored))"
+)
+_OUTCOME_UNCERTAINTY_RE: Final[re.Pattern[str]] = re.compile(
+    # "unsure whether ...", "can't confirm if ...", "don't know whether ..."
+    rf"\b(?:{_UNCERTAIN_WORD}|(?:cannot|can't|could\s+not|couldn't|unable\s+to)\s+(?:yet\s+)?"
+    r"(?:confirm|verify|tell|determine)|(?:don't|do\s+not|didn't|did\s+not)\s+know)\s+"
+    r"(?:yet\s+)?(?:whether|if)\b|"
+    # "may or may not have gone through", "might have already gone through"
+    r"\b(?:may|might)\s+or\s+(?:may|might)\s+not\s+have\b|"
+    rf"\b(?:may|might)\s+(?:already\s+)?(?:not\s+)?have\s+(?:already\s+)?{_EFFECT_PHRASE}|"
+    # "it is possible the booking went through", "whether it went through or not"
+    rf"\bpossible\s+(?:that\s+)?(?:it|the\s+\w+)\s+(?:\w+\s+)?{_EFFECT_PHRASE}|"
+    rf"\b{_EFFECT_PHRASE}\s+or\s+not\b",
+    re.IGNORECASE,
+)
+# "<subject> is unknown": counts when the subject is the outcome itself or names the call's tool.
+_SUBJECT_UNCERTAIN_RE: Final[re.Pattern[str]] = re.compile(
+    rf"\b([a-z][a-z0-9]*)\s+(?:is|was|remains|are)\s+(?:still\s+|currently\s+)?{_UNCERTAIN_WORD}\b",
+    re.IGNORECASE,
+)
+_OUTCOME_NOUNS: Final[frozenset[str]] = frozenset({"outcome", "result", "status", "state"})
+_GENERIC_TOOL_TOKENS: Final[frozenset[str]] = frozenset(
+    {"get", "set", "run", "tool", "mcp", "api", "call", "the", "and", "for", "new"}
+)
+
+
+def _tool_name_tokens(tool: str) -> set[str]:
+    parts = re.split(r"[^a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", tool).lower())
+    return {p for p in parts if len(p) >= 3 and p not in _GENERIC_TOOL_TOKENS}
+
+
+def _discloses_outcome_uncertainty(narration: str, rcpt: ToolReceipt) -> bool:
+    """Return True when `narration` states that the outcome of `rcpt`'s call is unknown."""
+    if _OUTCOME_UNCERTAINTY_RE.search(narration):
+        return True
+    tool_toks = _tool_name_tokens(rcpt.tool)
+    for m in _SUBJECT_UNCERTAIN_RE.finditer(narration):
+        subj = m.group(1).lower()
+        if subj in _OUTCOME_NOUNS or any(subj.startswith(t[:4]) for t in tool_toks):
+            return True
+    return False
+
+
+def _is_indeterminate_receipt(rcpt: ToolReceipt) -> bool:
+    """Return True for a dispatched call whose outcome is unknown (e.g. the upstream transport
+    dropped before a response, so the side effect may or may not have happened).
+
+    Producers mark this state with an `error_code` carrying the `indeterminate` token, as
+    `McpHttpProxyServer` does with `mcp_http_upstream_indeterminate`. `executed=False` means the
+    call was never dispatched, so its outcome is known and it is never indeterminate.
+    """
+    code = (rcpt.error_code or "").lower()
+    return (
+        rcpt.executed
+        and not rcpt.ok
+        and (
+            code in _KNOWN_INDETERMINATE_ERROR_CODES
+            or bool(_INDETERMINATE_ERROR_CODE_RE.search(code))
+        )
+    )
+
+
+def _find_misstated_indeterminate_outcome(
+    narration: str, failed_receipts: Sequence[ToolReceipt]
+) -> ToolReceipt | None:
+    """Detect a reply that reports a definite failure for a mutating call whose outcome is
+    indeterminate. Asserting "it failed" invites an unsafe retry if the call actually took effect;
+    the honest report is that the outcome is unknown.
+    """
+    if not _has_failure_disclosure(narration):
+        return None
+    for fr in failed_receipts:
+        if (
+            _is_indeterminate_receipt(fr)
+            and not _is_read_only_tool(fr.tool)
+            and not _discloses_outcome_uncertainty(narration, fr)
+        ):
+            return fr
+    return None
 
 
 def _find_mutating_date_mismatch(
@@ -2435,6 +2530,29 @@ class ReceiptSupervisor:
                 for v in fr.args.values()
             )
         ]
+        # An indeterminate receipt (call dispatched, outcome unknown) is disclosed by stating
+        # the uncertainty, and is misreported by asserting a definite failure.
+        undisc_candidates = [
+            fr
+            for fr in undisc_candidates
+            if not (_is_indeterminate_receipt(fr) and _discloses_outcome_uncertainty(narration, fr))
+        ]
+        misstated = _find_misstated_indeterminate_outcome(narration, undisc_candidates)
+        if misstated is not None and not unsupported_claims and narration.strip():
+            unsupported_claims.append(narration.strip()[:160])
+            unsupported_spans.append(
+                UnsupportedClaimSpan(
+                    text=narration.strip()[:160],
+                    start_char=base_char_offset,
+                    end_char=base_char_offset + min(len(narration.strip()), 160),
+                    claimed_family="INDETERMINATE_OUTCOME_MISSTATED",
+                    reason=(
+                        f"Receipt '{misstated.tool}' ({misstated.error_code}) has an "
+                        "indeterminate outcome, but the reply reports a definite failure "
+                        "instead of disclosing that the call may have taken effect."
+                    ),
+                )
+            )
         undisc_fail = _find_undisclosed_failed_tool(narration, undisc_candidates)
         if undisc_fail is not None and not unsupported_claims and narration.strip():
             unsupported_claims.append(narration.strip()[:160])
@@ -2597,7 +2715,9 @@ class ReceiptSupervisor:
         )
         if not is_ok:
             v_status = "contradicted"
-        elif any(r.evidence_tier == "probe_unobservable" for r in receipts):
+        elif any(r.evidence_tier == "probe_unobservable" for r in receipts) or any(
+            _is_indeterminate_receipt(r) for r in failed_receipts
+        ):
             v_status = "unverifiable"
         else:
             v_status = "verified"

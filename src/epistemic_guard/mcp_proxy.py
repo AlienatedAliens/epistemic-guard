@@ -32,6 +32,7 @@ from epistemic_guard.exceptions import (
     ToolPinMismatchError,
 )
 from epistemic_guard.provenance import DomainSigner, ProvenanceGate
+from epistemic_guard.result_status import ResultStatus, classify_tool_result
 from epistemic_guard.schemas import Provenance, ToolReceipt
 from epistemic_guard.store import MerkleReceiptLog
 from epistemic_guard.web_filters import clean_scraped_passage, cluster_near_duplicate_sources
@@ -1039,8 +1040,41 @@ def verify_receipt_log_file(
     )
 
 
+def _classify_mcp_result(result: object, tool: str = "") -> tuple[ResultStatus, str, bool]:
+    """Return `(status, output_text, is_validation_rejection)` for an MCP `tools/call` result.
+
+    `isError` is not the only failure signal: many servers report a failure, or a write that is
+    unknown or partly applied, only inside `structuredContent` or a JSON text block. Those
+    machine-readable signals are read with `classify_tool_result`; free prose is not.
+    """
+    if not isinstance(result, Mapping):
+        return ("ok", json.dumps(result, sort_keys=True, separators=(",", ":")), False)
+    ok, output_text, is_validation = _extract_mcp_result_text(result)
+    statuses: list[ResultStatus] = []
+    structured = result.get("structuredContent")
+    if isinstance(structured, Mapping):
+        statuses.append(classify_tool_result(structured, tool=tool))
+    content = result.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, Mapping) and block.get("type") == "text":
+                txt = block.get("text")
+                if isinstance(txt, str):
+                    statuses.append(classify_tool_result(txt, tool=tool))
+    if "indeterminate" in statuses:
+        return ("indeterminate", output_text, False)
+    if not ok:
+        return ("failed", output_text, is_validation)
+    if "failed" in statuses:
+        lowered = output_text.lower()
+        return ("failed", output_text, any(m in lowered for m in _MCP_VALIDATION_MARKERS))
+    return ("ok", output_text, False)
+
+
 def _extract_mcp_result_text(result: object) -> tuple[bool, str, bool]:
-    """Return `(ok, output_text, is_validation_rejection)` for an MCP `tools/call` result."""
+    """Return `(ok, output_text, is_validation_rejection)` for an MCP `tools/call` result,
+    from `isError` alone. Use `_classify_mcp_result` for the full set of failure signals.
+    """
     if not isinstance(result, Mapping):
         return (True, json.dumps(result, sort_keys=True, separators=(",", ":")), False)
 
@@ -1597,6 +1631,42 @@ class McpStdioProxy:
         """Inspect a server->client JSON-RPC line and commit receipts for completed calls."""
         self.process_server_line(raw_line)
 
+    def abandon_undelivered_line(self, fwd_line: bytes) -> None:
+        """Record `executed=False` receipts for `tools/call` requests in `fwd_line` that could not
+        be written to the MCP server (it had already exited), so they are never dispatched and must
+        not be reported later as in-flight `mcp_server_eof` calls with an unknown outcome.
+        """
+        try:
+            payload = json.loads(fwd_line.strip().decode("utf-8"))
+        except Exception:
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        undelivered: list[_PendingToolCall] = []
+        with self._lock:
+            for item in items:
+                if not isinstance(item, Mapping) or item.get("method") != "tools/call":
+                    continue
+                id_key = _rpc_id_key(item.get("id"))
+                queue = self._pending.get(id_key) if id_key is not None else None
+                if queue:
+                    undelivered.append(queue.pop())
+                    if not queue:
+                        self._pending.pop(id_key, None)
+        for pending in undelivered:
+            self._writer.append(
+                ToolReceipt(
+                    call_id=pending.call_id,
+                    tool=pending.tool,
+                    ok=False,
+                    executed=False,
+                    error_code="mcp_server_unreachable",
+                    args=pending.args,
+                    output="MCP server had exited; request was never delivered.",
+                    tool_definition_sha256=pending.tool_def_sha256,
+                    endpoint_id=self._endpoint_id,
+                )
+            )
+
     def flush_abandoned_calls(self, exit_code: int) -> None:
         """Record `ok=False` receipts for in-flight calls if the MCP server exits early."""
         with self._lock:
@@ -1648,12 +1718,28 @@ class McpStdioProxy:
                 endpoint_id=self._endpoint_id,
             )
 
-        ok, output_text, is_validation = _extract_mcp_result_text(response.get("result"))
+        status, output_text, is_validation = _classify_mcp_result(
+            response.get("result"), pending.tool
+        )
+        ok = status == "ok"
         any_probe_enabled = (
             self._probe_fs_root is not None
             or self._probe_git_repo is not None
             or self._probe_sqlite_path is not None
         )
+        if status == "indeterminate":
+            return ToolReceipt(
+                call_id=pending.call_id,
+                tool=pending.tool,
+                ok=False,
+                executed=True,
+                error_code="mcp_tool_result_indeterminate",
+                args=pending.args,
+                output=output_text,
+                tool_definition_sha256=pending.tool_def_sha256,
+                endpoint_id=self._endpoint_id,
+                evidence_tier="server_reported" if any_probe_enabled else "",
+            )
         if ok:
             probe_result: tuple[bool | None, dict[str, Any]] | None = None
             if pending.fs_probe is not None:
@@ -1813,8 +1899,12 @@ def run_mcp_stdio_proxy(
                             out_stream.write(rep)
                         out_stream.flush()
                 if fwd_line:
-                    child_stdin.write(fwd_line)
-                    child_stdin.flush()
+                    try:
+                        child_stdin.write(fwd_line)
+                        child_stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        proxy.abandon_undelivered_line(fwd_line)
+                        raise
         except (BrokenPipeError, OSError, ValueError):
             pass
         finally:

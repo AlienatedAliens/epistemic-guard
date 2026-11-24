@@ -21,8 +21,8 @@ from epistemic_guard.exceptions import ToolPinMismatchError
 from epistemic_guard.mcp_proxy import (
     _PRE_EXEC_JSONRPC_CODES,
     ReceiptLogWriter,
+    _classify_mcp_result,
     _coerce_scalar,
-    _extract_mcp_result_text,
     _sanitize_tools_list_item,
     compute_mcp_tool_sha256,
     filter_mcp_result_object,
@@ -280,8 +280,22 @@ class McpStreamableHttpProxy:
                 endpoint_id=self.upstream_url,
             )
 
-        ok, output_text, is_validation = _extract_mcp_result_text(response_obj.get("result"))
-        if ok:
+        status, output_text, is_validation = _classify_mcp_result(
+            response_obj.get("result"), tool_name
+        )
+        if status == "indeterminate":
+            return ToolReceipt(
+                call_id=call_id,
+                tool=tool_name,
+                ok=False,
+                executed=True,
+                error_code="mcp_tool_result_indeterminate",
+                args=args_map,
+                output=output_text,
+                tool_definition_sha256=tool_def_sha256,
+                endpoint_id=self.upstream_url,
+            )
+        if status == "ok":
             return ToolReceipt(
                 call_id=call_id,
                 tool=tool_name,

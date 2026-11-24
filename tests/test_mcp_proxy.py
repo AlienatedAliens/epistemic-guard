@@ -826,3 +826,132 @@ def test_http_proxy_strip_untrusted_annotations(tmp_path: Path) -> None:
         proxy_srv.server_close()
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_undelivered_call_is_not_executed_and_eof_call_is_indeterminate(tmp_path: Path) -> None:
+    """A `tools/call` that could not be written to a dead server was never dispatched
+    (`executed=False`, `mcp_server_unreachable`), while one forwarded before the server exited
+    keeps `mcp_server_eof`, which the verifier treats as an indeterminate outcome.
+    """
+    from epistemic_guard import McpStdioProxy, ReceiptSupervisor
+
+    signer = load_or_create_mcp_signer(key_file=tmp_path / "signer.key")
+    log_file = tmp_path / "receipts.jsonl"
+    proxy = McpStdioProxy(ReceiptLogWriter(log_file, signer))
+
+    def call(rpc_id: int, tool: str) -> bytes:
+        msg = {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/call",
+               "params": {"name": tool, "arguments": {"order_id": "ORD-1001"}}}
+        return (json.dumps(msg) + "\n").encode("utf-8")
+
+    sent_line, _ = proxy.process_client_line(call(1, "book_ticket"))
+    assert sent_line
+    unsent_line, _ = proxy.process_client_line(call(2, "cancel_ticket"))
+    proxy.abandon_undelivered_line(unsent_line)
+    proxy.flush_abandoned_calls(1)
+
+    receipts = {r.tool: r for r in verify_receipt_log_file(log_file).receipts}
+    assert len(receipts) == 2
+    assert receipts["cancel_ticket"].executed is False
+    assert receipts["cancel_ticket"].error_code == "mcp_server_unreachable"
+    assert receipts["book_ticket"].executed is True
+    assert receipts["book_ticket"].error_code == "mcp_server_eof"
+
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    v_eof = sup.verify_narration(
+        "The booking failed, so I did not book the ticket.", receipts=[receipts["book_ticket"]]
+    )
+    assert v_eof.is_valid is False
+    assert v_eof.unsupported_spans[0].claimed_family == "INDETERMINATE_OUTCOME_MISSTATED"
+    v_eof_honest = sup.verify_narration(
+        "The server exited before replying, so I can't confirm whether the ticket was booked.",
+        receipts=[receipts["book_ticket"]],
+    )
+    assert v_eof_honest.is_valid is True
+    assert v_eof_honest.verdict_status == "unverifiable"
+    v_unsent = sup.verify_narration(
+        "The cancellation failed because the server was down.", receipts=[receipts["cancel_ticket"]]
+    )
+    assert v_unsent.is_valid is True
+
+
+def test_proxies_read_machine_readable_failures_and_unknown_writes_without_is_error(
+    tmp_path: Path,
+) -> None:
+    """Servers often report a failure, or a write that is unknown or partly applied, without
+    `isError`. Both proxies and the transcript extractor read the same machine-readable signals
+    (`structuredContent` and JSON text), never free prose.
+    """
+    from epistemic_guard import (
+        McpStdioProxy,
+        McpStreamableHttpProxy,
+        extract_receipts_from_messages,
+    )
+    from epistemic_guard.result_status import classify_tool_result
+
+    def text(obj: object) -> dict[str, object]:
+        return {"content": [{"type": "text", "text": json.dumps(obj)}]}
+
+    results: dict[str, tuple[str, dict[str, object], str]] = {
+        "clean": ("book_ticket", text({"booking_id": "B-1", "status": "confirmed"}), "ok"),
+        "json_fail": ("book_ticket", text({"success": False, "message": "sold out"}), "failed"),
+        "structured_fail": (
+            "send_email",
+            {"content": [{"type": "text", "text": "done"}], "structuredContent": {"status": "failed"}},
+            "failed",
+        ),
+        "prefix_fail": ("send_email", {"content": [{"type": "text", "text": "Error: SMTP 550"}]}, "failed"),
+        "partial": ("update_records", text({"status": "partially_applied", "updated": 3}), "indeterminate"),
+        "unknown": ("charge_card", {"content": [], "structuredContent": {"outcome": "unknown"}}, "indeterminate"),
+        # A read tool's status describes the record it fetched, not the call.
+        "read_status": ("get_order", text({"order_id": 7, "status": "unknown"}), "ok"),
+        # Prose is not a machine-readable signal.
+        "prose_only": ("book_ticket", {"content": [{"type": "text", "text": "The write may be partial."}]}, "ok"),
+    }
+    expected_code = {"ok": "", "failed": "mcp_tool_error", "indeterminate": "mcp_tool_result_indeterminate"}
+
+    signer = load_or_create_mcp_signer(key_file=tmp_path / "signer.key")
+    stdio_log = tmp_path / "stdio.jsonl"
+    stdio = McpStdioProxy(ReceiptLogWriter(stdio_log, signer))
+    http = McpStreamableHttpProxy("http://127.0.0.1:9/mcp", ReceiptLogWriter(tmp_path / "http.jsonl", signer))
+
+    for i, (name, (tool, result, status)) in enumerate(results.items(), start=1):
+        call = {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+        stdio.process_client_line((json.dumps(call) + "\n").encode("utf-8"))
+        stdio.process_server_line((json.dumps({"jsonrpc": "2.0", "id": i, "result": result}) + "\n").encode("utf-8"))
+
+        h = http._build_receipt(f"h-{i}", tool, {}, {"jsonrpc": "2.0", "id": i, "result": result})
+        assert (h.ok, h.error_code) == (status == "ok", expected_code[status]), name
+
+    stdio_by_tool_order = verify_receipt_log_file(stdio_log).receipts
+    assert len(stdio_by_tool_order) == len(results)
+    for rcpt, (name, (_tool, _result, status)) in zip(stdio_by_tool_order, results.items(), strict=True):
+        assert (rcpt.ok, rcpt.error_code) == (status == "ok", expected_code[status]), name
+        assert rcpt.executed is True, name
+
+    # Transcript extractor: same classifier, same answers.
+    assert classify_tool_result('{"status": "partial"}', tool="update_records") == "indeterminate"
+    msgs = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "update_records", "arguments": "{}"}},
+            {"id": "c2", "function": {"name": "get_order", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": '{"status": "partially_applied"}'},
+        {"role": "tool", "tool_call_id": "c2", "content": '{"status": "unknown"}'},
+    ]
+    ext = {r.tool: r for r in extract_receipts_from_messages(msgs)}
+    assert (ext["update_records"].ok, ext["update_records"].error_code) == (False, "tool_result_indeterminate")
+    assert ext["get_order"].ok is True
+
+    from epistemic_guard import ReceiptSupervisor
+
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    partial = ext["update_records"]
+    v_failed = sup.verify_narration("The record update failed.", receipts=[partial])
+    assert v_failed.is_valid is False
+    assert v_failed.unsupported_spans[0].claimed_family == "INDETERMINATE_OUTCOME_MISSTATED"
+    v_honest = sup.verify_narration(
+        "The record update may have been partly applied, so the outcome is unknown; I'll check.",
+        receipts=[partial],
+    )
+    assert v_honest.is_valid is True
