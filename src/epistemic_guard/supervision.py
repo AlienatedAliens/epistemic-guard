@@ -426,6 +426,33 @@ _CREATE_TOOL_RE: Final = re.compile(
 _NON_CREATE_TOOL_RE: Final = re.compile(
     r"(?:^|_)(?:upsert|update|set|add|put|patch|ensure|sync)(?:_|$)", re.IGNORECASE
 )
+# Claim families whose named target may be recorded as unconfirmable (rather than contradicted)
+# when the write receipt names no target. Destructive, external and exec claims stay strict.
+_UNCONFIRMABLE_TARGET_FAMILIES: Final = frozenset({"CLAIM_FILE_WRITE", "CLAIM_SYSTEM_STATE"})
+# Same target shapes as the concrete-target check in `_receipt_supports_clause`, plus bare paths.
+_CONCRETE_TARGET_RE: Final = re.compile(
+    r"https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|#[0-9]+|"
+    r"\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|(?:^|\s)~?[\\/][\w.\-\\/]+"
+)
+_TARGET_ARG_KEY_RE: Final = re.compile(
+    r"(?:^|_)(?:path|paths|file|files|filename|filepath|dir|directory|target|dest|destination|"
+    r"url|uri|href|endpoint|key|id|name|table|database|db|repo|branch|channel|to|recipient|"
+    r"email|address)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def _args_name_a_target(args: Mapping[str, object]) -> bool:
+    """True when tool args identify what the call acted on: a target-named key with a value, or
+    any value shaped like a path, URL, email, file name or `#id`."""
+    for key, val in args.items():
+        if _TARGET_ARG_KEY_RE.search(str(key)) and str(val).strip():
+            return True
+        if _CONCRETE_TARGET_RE.search(str(val).lower()):
+            return True
+    return False
+
+
 # Sentinel passed as the neural label to detect clauses no deterministic family rule matched.
 _NO_DETERMINISTIC_FAMILY: Final = "__NO_DETERMINISTIC_FAMILY__"
 # Words that make a clause genuinely about memory, so a neural CLAIM_MEMORY label stays strict.
@@ -1950,6 +1977,7 @@ class ReceiptSupervisor:
         extra_stems: Mapping[str, Sequence[str]] | None = None,
         custom_tool_families: Mapping[str, Sequence[str]] | None = None,
         mcp_tool_tokens: Mapping[str, frozenset[str]] | None = None,
+        unconfirmable_out: list[str] | None = None,
     ) -> bool:
         ok_receipts = [r for r in receipts if r.ok and r.executed]
         if not ok_receipts or family == "DEONTIC_CAPITULATION":
@@ -2112,6 +2140,16 @@ class ReceiptSupervisor:
             cl_lower,
         )
         if concrete_targets:
+            # A write receipt whose args name no target at all (no path, URL, email or #id) can
+            # neither confirm nor contradict the file a claim names. For non-destructive families
+            # that is recorded as unconfirmable (verdict `unverifiable`, tool listed) instead of
+            # flagged. Only a caller that passes `unconfirmable_out` opts in.
+            targetless_rcpts = [
+                rcpt
+                for rcpt in matching_rcpts
+                if rcpt.args and not _args_name_a_target(rcpt.args)
+            ]
+            unconfirmed_here: list[str] = []
             for tgt in concrete_targets:
                 clean_tgt = tgt.rstrip(".,!?;:")
                 in_args = any(
@@ -2127,8 +2165,19 @@ class ReceiptSupervisor:
                     )
                     for rcpt in matching_rcpts
                 )
-                if not (in_args or in_zero_arg_rcpt):
-                    return False
+                if in_args or in_zero_arg_rcpt:
+                    continue
+                if (
+                    unconfirmable_out is not None
+                    and family in _UNCONFIRMABLE_TARGET_FAMILIES
+                    and targetless_rcpts
+                    and len(targetless_rcpts) == len(matching_rcpts)
+                ):
+                    unconfirmed_here.extend(r.tool for r in targetless_rcpts)
+                    continue
+                return False
+            if unconfirmable_out is not None:
+                unconfirmable_out.extend(dict.fromkeys(unconfirmed_here))
             return True
 
         return True
@@ -2249,6 +2298,7 @@ class ReceiptSupervisor:
         unsupported_claims: list[str] = []
         unsupported_spans: list[UnsupportedClaimSpan] = []
         unfulfilled: list[str] = []
+        unconfirmed_target_tools: list[str] = []
 
         for tag in structured:
             if not tag.grounded:
@@ -2426,6 +2476,7 @@ class ReceiptSupervisor:
                     extra_stems=self._extra_tool_stems,
                     custom_tool_families=self._custom_tool_families,
                     mcp_tool_tokens=self._mcp_tool_tokens,
+                    unconfirmable_out=unconfirmed_target_tools,
                 ):
                     unsupported_claims.append(cl_text)
                     unsupported_spans.append(
@@ -2823,8 +2874,10 @@ class ReceiptSupervisor:
         )
         if not is_ok:
             v_status = "contradicted"
-        elif any(r.evidence_tier == "probe_unobservable" for r in receipts) or any(
-            _is_indeterminate_receipt(r) for r in failed_receipts
+        elif (
+            any(r.evidence_tier == "probe_unobservable" for r in receipts)
+            or any(_is_indeterminate_receipt(r) for r in failed_receipts)
+            or unconfirmed_target_tools
         ):
             v_status = "unverifiable"
         else:
@@ -2841,6 +2894,7 @@ class ReceiptSupervisor:
             unfulfilled_promises=unfulfilled,
             undisclosed_mutations=undisclosed,
             structured_actions=structured,
+            unconfirmed_target_tools=list(dict.fromkeys(unconfirmed_target_tools)),
         )
 
     def stream(

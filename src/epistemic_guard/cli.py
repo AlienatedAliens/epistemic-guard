@@ -512,6 +512,7 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                     "effect_contradictions": contradicted_effects,
                     "narration_valid": verdict.is_valid,
                     "verdict_status": verdict.verdict_status,
+                    "unconfirmed_target_tools": list(verdict.unconfirmed_target_tools),
                     "device": verdict.device,
                     "unsupported_claims": list(verdict.unsupported_claims),
                     "undisclosed_mutations": list(verdict.undisclosed_mutations),
@@ -638,6 +639,7 @@ def _cmd_hook(args: argparse.Namespace) -> int:
         out_doc: dict[str, Any] = {
             "decision": decision,
             "verdict_status": verdict.verdict_status,
+            "unconfirmed_target_tools": list(verdict.unconfirmed_target_tools),
             "is_valid": verdict.is_valid,
             "unsupported_claims": list(verdict.unsupported_claims),
             "undisclosed_mutations": list(verdict.undisclosed_mutations),

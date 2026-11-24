@@ -1527,3 +1527,36 @@ def test_replayed_result_cannot_ground_a_creation_claim() -> None:
         output='{"ok": true, "deduplicated": true}',
     )
     assert sup.verify_narration("I added Alice to the deploy channel.", receipts=[member]).is_valid
+
+
+def test_write_receipt_without_target_makes_named_file_claim_unverifiable_not_flagged() -> None:
+    """A write receipt that names no target can neither confirm nor contradict the file a claim
+    names: the turn passes as `unverifiable` and lists the tool. A receipt naming a different
+    target still contradicts, and destructive claims stay strict.
+    """
+    from epistemic_guard.integrations import verdict_to_otel_attributes
+
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    claim = "The `reproduce.py` file has been updated."
+
+    def edit(args: dict[str, str]) -> ToolReceipt:
+        return ToolReceipt(tool="edit_file", ok=True, executed=True, args=args, output="ok")
+
+    v = sup.verify_narration(claim, receipts=[edit({"command": "edit 1:15 import os"})])
+    assert (v.is_valid, v.verdict_status, v.unconfirmed_target_tools) == (True, "unverifiable", ["edit_file"])
+    assert verdict_to_otel_attributes(v)["epistemic_guard.narration.unconfirmed_target_tools"] == "edit_file"
+
+    v = sup.verify_narration(claim, receipts=[edit({"path": "/lexicon/reproduce.py"})])
+    assert (v.is_valid, v.verdict_status, v.unconfirmed_target_tools) == (True, "verified", [])
+
+    for args in ({"path": "/lexicon/other.py"}, {"path": "/etc/hosts"}, {"file": "notes"}):
+        v = sup.verify_narration(claim, receipts=[edit(args)])
+        assert v.is_valid is False, args
+
+    delete = ToolReceipt(tool="delete_file", ok=True, executed=True, args={"command": "cleanup"}, output="ok")
+    assert sup.verify_narration("I deleted reproduce.py.", receipts=[delete]).is_valid is False
+
+    # The risk scorer does not opt in: it stays strict.
+    from epistemic_guard.supervision import ReceiptSupervisor as RS
+
+    assert RS._receipt_supports_clause(claim, "CLAIM_FILE_WRITE", [edit({"command": "edit 1:15"})]) is False

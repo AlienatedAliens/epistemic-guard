@@ -753,6 +753,9 @@ class SupervisionVerdict(BaseModel):
     unfulfilled_promises: list[str] = Field(default_factory=list)
     undisclosed_mutations: list[str] = Field(default_factory=list)
     structured_actions: list[StructuredActionTag] = Field(default_factory=list)
+    # Tools whose receipt named no target, so a claim naming a file could be neither confirmed nor
+    # contradicted. Drives `verdict_status="unverifiable"`; count these per tool before trusting it.
+    unconfirmed_target_tools: list[str] = Field(default_factory=list)
 
     def to_retry_prompt(self, executed_receipts: Sequence[ToolReceipt] | None = None) -> str:
         """Build a concise system/developer correction prompt for automatic LLM retry loops."""

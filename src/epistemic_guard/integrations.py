@@ -106,6 +106,10 @@ def verdict_to_otel_attributes(
         attrs[f"{prefix}.narration.unsupported_claims_json"] = json.dumps(
             list(verdict.unsupported_claims), separators=(",", ":")
         )
+    if verdict.unconfirmed_target_tools:
+        attrs[f"{prefix}.narration.unconfirmed_target_tools"] = ",".join(
+            verdict.unconfirmed_target_tools
+        )
     if merkle_root:
         attrs[f"{prefix}.merkle_root"] = merkle_root
     if session_id:
