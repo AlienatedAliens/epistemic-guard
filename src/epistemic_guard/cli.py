@@ -275,6 +275,7 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             probe_fs_root=args.probe_fs,
             probe_git_repo=args.probe_git,
             probe_sqlite_path=args.probe_sqlite,
+            pin_file=args.pin_file,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
@@ -299,6 +300,7 @@ def _cmd_mcp_http_proxy(args: argparse.Namespace) -> int:
             prev_log_path=args.prev_log,
             prev_pubkey_file=args.prev_pubkey_file,
             timeout_s=float(args.timeout),
+            pin_file=args.pin_file,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-http-proxy error: {exc}", file=sys.stderr)
@@ -778,6 +780,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Pin SHA-256 of initial tools/list schemas and block mid-session rug-pulls",
     )
     mp.add_argument(
+        "--pin-file",
+        default=None,
+        help=(
+            "Persist tools/list SHA-256 pins in this file (trust on first use): a server whose "
+            "tool definitions changed since an earlier connection is reported as a rug-pull. "
+            "Use one file per server."
+        ),
+    )
+    mp.add_argument(
         "--strip-untrusted-annotations",
         action="store_true",
         help=(
@@ -903,6 +914,15 @@ def main(argv: list[str] | None = None) -> int:
     mhp.add_argument("--aer1", action="store_true", help="Include AER-1 export on each log entry")
     mhp.add_argument(
         "--pin-tools", action="store_true", help="Pin tools/list SHA-256 against rug-pulls"
+    )
+    mhp.add_argument(
+        "--pin-file",
+        default=None,
+        help=(
+            "Persist tools/list SHA-256 pins in this file (trust on first use): a server whose "
+            "tool definitions changed since an earlier connection is reported as a rug-pull. "
+            "Use one file per server."
+        ),
     )
     mhp.add_argument(
         "--strip-untrusted-annotations",

@@ -29,6 +29,7 @@ from epistemic_guard.mcp_proxy import (
     load_or_create_mcp_signer,
 )
 from epistemic_guard.schemas import ToolReceipt
+from epistemic_guard.tool_pins import load_tool_pins, save_tool_pins
 
 _META_OP_KEYS: Final[tuple[str, ...]] = (
     "operation_key",
@@ -125,6 +126,7 @@ class McpStreamableHttpProxy:
         raise_on_rugpull: bool = False,
         filter_web_results: bool = False,
         timeout_s: float = 30.0,
+        pin_file: Path | str | None = None,
     ) -> None:
         parsed = urllib.parse.urlsplit(upstream_url.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -141,7 +143,10 @@ class McpStreamableHttpProxy:
         self._lock = threading.Lock()
         self._call_seq = 0
         self._rugpull_seq = 0
-        self._tool_pins: dict[str, str] = {}
+        self._pin_file = Path(pin_file) if pin_file is not None else None
+        self._tool_pins: dict[str, str] = (
+            load_tool_pins(self._pin_file, self.upstream_url) if self._pin_file else {}
+        )
         self._compromised_tools: set[str] = set()
         self._observed_tools: dict[str, dict[str, Any]] = {}
 
@@ -221,6 +226,9 @@ class McpStreamableHttpProxy:
                         self._tool_pins[tname] = digest
                         self._observed_tools[tname] = dict(tdef)
 
+            if self._pin_file is not None:
+                save_tool_pins(self._pin_file, self.upstream_url, self._tool_pins)
+
         for tname, old_h, new_h in mutated:
             with self._lock:
                 self._rugpull_seq += 1
@@ -278,6 +286,7 @@ class McpStreamableHttpProxy:
                 output=f"JSON-RPC {code}: {msg}",
                 tool_definition_sha256=tool_def_sha256,
                 endpoint_id=self.upstream_url,
+                evidence_tier="server_reported" if executed else "attempted",
             )
 
         status, output_text, is_validation = _classify_mcp_result(
@@ -294,6 +303,7 @@ class McpStreamableHttpProxy:
                 output=output_text,
                 tool_definition_sha256=tool_def_sha256,
                 endpoint_id=self.upstream_url,
+                evidence_tier="server_reported",
             )
         if status == "ok":
             return ToolReceipt(
@@ -306,6 +316,7 @@ class McpStreamableHttpProxy:
                 output=output_text,
                 tool_definition_sha256=tool_def_sha256,
                 endpoint_id=self.upstream_url,
+                evidence_tier="server_reported",
             )
         return ToolReceipt(
             call_id=call_id,
@@ -317,6 +328,7 @@ class McpStreamableHttpProxy:
             output=output_text,
             tool_definition_sha256=tool_def_sha256,
             endpoint_id=self.upstream_url,
+            evidence_tier="attempted" if is_validation else "server_reported",
         )
 
     def handle_post(
@@ -737,6 +749,7 @@ def run_mcp_http_proxy(
     prev_log_path: Path | str | None = None,
     prev_pubkey_file: Path | str | None = None,
     timeout_s: float = 30.0,
+    pin_file: Path | str | None = None,
 ) -> int:
     """Run a blocking Streamable HTTP MCP receipt proxy until `KeyboardInterrupt`."""
     signer = load_or_create_mcp_signer(key_file=key_file, pubkey_out=pubkey_out)
@@ -756,6 +769,7 @@ def run_mcp_http_proxy(
         strip_untrusted_annotations=strip_untrusted_annotations,
         filter_web_results=filter_web_results,
         timeout_s=timeout_s,
+        pin_file=pin_file,
     )
     httpd = McpHttpProxyServer((host, port), proxy)
     try:

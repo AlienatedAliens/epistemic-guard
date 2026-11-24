@@ -16,11 +16,22 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
   `side_effect_status` that reads unknown. `retry_safe: false` alone is not a signal. The same checks
   run on `structuredContent`, JSON text blocks and one `result`/`data` level. Read-only tools stay
   exempt, and honest `failed`/`ok` results are unchanged.
+- **HTTP proxy receipts carry an evidence tier.** `mcp-http-proxy` has no local probes, so every
+  executed result is now signed `evidence_tier="server_reported"` (it was empty), and a call refused
+  before execution (JSON-RPC -32700/-32600/-32601/-32602, or invalid arguments) is `attempted`. This
+  matches the README, which already described remote HTTP tools as `server_reported`. It does not
+  change any verdict: the supervisor reads only `independently_verified` and `probe_unobservable`.
+- **`--pin-file PATH`** (`mcp-proxy` and `mcp-http-proxy`, or `pin_file=` in the Python API): keeps the
+  first-seen SHA-256 of each tool definition on disk (trust on first use). A server whose definitions
+  changed since an earlier connection takes the existing rug-pull path (`mcp_tool_rugpull` receipt;
+  blocked with `--pin-tools`). Without the flag nothing changes. The file holds digests only, is
+  written atomically, and loading fails closed on an unreadable, malformed or other-server file. Use
+  one file per server; the stdio endpoint id is the executable name only. Not wired into `wrap-mcp-config`.
 - The source distribution now includes `CHANGELOG.md` and `benchmarks/aer1_full_corpus.json`, so the
   test suite runs from an unpacked sdist.
 
 ### Not verified
-- The classifier change is covered by unit tests only. It has not been run against real MCP servers
+- The classifier, evidence-tier and pin-file changes are covered by unit tests only. It has not been run against real MCP servers
   or any benchmark, and its false-positive rate on real traffic is unmeasured.
 - The `_unknown`/`_uncertain` error-code and `side_effect_status` shapes follow a report of what real
   servers emit; they were not found by name in the public codebook of the 100-server study.

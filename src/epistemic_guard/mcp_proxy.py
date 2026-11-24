@@ -35,6 +35,7 @@ from epistemic_guard.provenance import DomainSigner, ProvenanceGate
 from epistemic_guard.result_status import ResultStatus, classify_tool_result
 from epistemic_guard.schemas import Provenance, ToolReceipt
 from epistemic_guard.store import MerkleReceiptLog
+from epistemic_guard.tool_pins import load_tool_pins, save_tool_pins
 from epistemic_guard.web_filters import clean_scraped_passage, cluster_near_duplicate_sources
 
 _PRE_EXEC_JSONRPC_CODES: Final[frozenset[int]] = frozenset({-32700, -32600, -32601, -32602})
@@ -1300,6 +1301,7 @@ class McpStdioProxy:
         probe_fs_root: Path | str | None = None,
         probe_git_repo: Path | str | None = None,
         probe_sqlite_path: Path | str | None = None,
+        pin_file: Path | str | None = None,
     ) -> None:
         self._writer = writer
         self._pin_tools = pin_tools
@@ -1319,7 +1321,10 @@ class McpStdioProxy:
         self._pending: dict[tuple[str, str], list[_PendingToolCall]] = {}
         self._pending_tools_list: set[tuple[str, str]] = set()
         self._seen_rpc_counts: dict[tuple[str, str], int] = {}
-        self._tool_pins: dict[str, str] = {}
+        self._pin_file = Path(pin_file) if pin_file is not None else None
+        self._tool_pins: dict[str, str] = (
+            load_tool_pins(self._pin_file, endpoint_id) if self._pin_file else {}
+        )
         self._compromised_tools: set[str] = set()
         self._observed_tools: dict[str, dict[str, Any]] = {}
         self._rugpull_count = 0
@@ -1503,6 +1508,8 @@ class McpStdioProxy:
                     else:
                         self._tool_pins[raw_name] = digest
                         self._observed_tools[raw_name] = dict(tdef)
+            if self._pin_file is not None:
+                save_tool_pins(self._pin_file, self._endpoint_id, self._tool_pins)
         for tname, old_h, new_h in mutations:
             with self._lock:
                 self._rugpull_count += 1
@@ -1840,6 +1847,7 @@ def run_mcp_stdio_proxy(
     probe_fs_root: Path | str | None = None,
     probe_git_repo: Path | str | None = None,
     probe_sqlite_path: Path | str | None = None,
+    pin_file: Path | str | None = None,
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -1866,6 +1874,7 @@ def run_mcp_stdio_proxy(
         probe_fs_root=probe_fs_root,
         probe_git_repo=probe_git_repo,
         probe_sqlite_path=probe_sqlite_path,
+        pin_file=pin_file,
     )
 
     child_env = _scrub_child_env(os.environ)
