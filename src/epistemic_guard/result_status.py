@@ -76,7 +76,14 @@ _SUCCESS_STATUSES: Final[frozenset[str]] = frozenset(
     {"ok", "success", "succeeded", "successful", "completed", "complete", "done"}
 )
 _BATCH_KEYS: Final[tuple[str, ...]] = ("results", "items", "responses", "operations", "batch")
-_ITEM_SIGNAL_KEYS: Final[tuple[str, ...]] = ("status", "ok", "success", "error", "isError", "is_error")
+_ITEM_SIGNAL_KEYS: Final[tuple[str, ...]] = (
+    "status",
+    "ok",
+    "success",
+    "error",
+    "isError",
+    "is_error",
+)
 
 
 def _has_error_value(val: object) -> bool:
