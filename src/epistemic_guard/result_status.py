@@ -69,13 +69,67 @@ def _norm_status(val: object) -> str:
     return re.sub(r"[\s-]+", "_", str(val).strip().lower()) if isinstance(val, str) else ""
 
 
+_NO_ERROR_STRINGS: Final[frozenset[str]] = frozenset(
+    {"none", "null", "false", "no", "no error", "no errors", "n/a", "na", "nil", "0", "ok"}
+)
+_SUCCESS_STATUSES: Final[frozenset[str]] = frozenset(
+    {"ok", "success", "succeeded", "successful", "completed", "complete", "done"}
+)
+_BATCH_KEYS: Final[tuple[str, ...]] = ("results", "items", "responses", "operations", "batch")
+_ITEM_SIGNAL_KEYS: Final[tuple[str, ...]] = ("status", "ok", "success", "error", "isError", "is_error")
+
+
+def _has_error_value(val: object) -> bool:
+    """Return True when an `error` field carries a real error, not a null/empty placeholder."""
+    if val is None or val is False or val == 0:
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() not in _NO_ERROR_STRINGS and bool(val.strip())
+    if isinstance(val, (list, tuple, dict, set)):
+        return bool(val)
+    return True
+
+
+def _item_failed(item: Mapping[str, Any]) -> bool:
+    return bool(
+        item.get("ok") is False
+        or item.get("success") is False
+        or item.get("isError") is True
+        or item.get("is_error") is True
+        or _has_error_value(item.get("error"))
+        or _norm_status(item.get("status")) in _FAILED_STATUSES
+    )
+
+
+def _batch_items(obj: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """Return per-item result mappings when `obj` is a batch result with per-item statuses."""
+    for key in _BATCH_KEYS:
+        val = obj.get(key)
+        if (
+            isinstance(val, list)
+            and val
+            and all(isinstance(i, Mapping) for i in val)
+            and all(any(k in i for k in _ITEM_SIGNAL_KEYS) for i in val)
+        ):
+            return list(val)
+    return None
+
+
 def classify_tool_result(content: str | Mapping[str, Any], *, tool: str = "") -> ResultStatus:
     """Classify a tool result from explicit, machine-readable signals.
 
     `indeterminate`: a top-level `status`/`outcome` of unknown or partly applied, for a tool that is
-    not read-only (a read tool's `status` usually describes the record it fetched, not the call).
+    not read-only (a read tool's `status` usually describes the record it fetched, not the call);
+    or a non-empty `error` that contradicts an explicit success signal (see below).
     `failed`: `ok`/`success` false, `isError`/`is_error` true, a non-empty `error`, a failed
     `status`, or text starting with `Error:`/`Traceback`.
+
+    A null, empty, false, zero or `"none"`-like `error` is no error. When a non-empty top-level
+    `error` sits next to per-item statuses (`results`/`items`/`responses`/`operations`/`batch`),
+    the items decide: all items succeeded is `ok`, all failed is `failed`, a mix is
+    `indeterminate`. A non-empty `error` next to `ok: true`/`success: true`/a success `status`
+    with no per-item statuses is ambiguous: `indeterminate` for a mutating tool, `failed` for a
+    read-only one.
     """
     if isinstance(content, str) and content.strip().lower().startswith(("error:", "traceback")):
         return "failed"
@@ -83,13 +137,29 @@ def classify_tool_result(content: str | Mapping[str, Any], *, tool: str = "") ->
     if obj is None:
         return "ok"
     statuses = {_norm_status(obj.get("status")), _norm_status(obj.get("outcome"))}
-    if not (tool and is_read_only_tool(tool)) and statuses & _INDETERMINATE_STATUSES:
+    read_only = bool(tool) and is_read_only_tool(tool)
+    if not read_only and statuses & _INDETERMINATE_STATUSES:
         return "indeterminate"
     if obj.get("ok") is False or obj.get("success") is False:
         return "failed"
     if obj.get("isError") is True or obj.get("is_error") is True:
         return "failed"
-    if obj.get("error") not in (None, False, "", [], {}):
+    if _has_error_value(obj.get("error")):
+        items = _batch_items(obj)
+        if items is not None:
+            failed_n = sum(1 for i in items if _item_failed(i))
+            if failed_n == 0:
+                return "ok"
+            if failed_n == len(items):
+                return "failed"
+            return "indeterminate"
+        claims_success = (
+            obj.get("ok") is True
+            or obj.get("success") is True
+            or bool(statuses & _SUCCESS_STATUSES)
+        )
+        if claims_success and not read_only:
+            return "indeterminate"
         return "failed"
     if statuses & _FAILED_STATUSES:
         return "failed"

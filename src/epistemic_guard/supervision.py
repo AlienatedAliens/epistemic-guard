@@ -83,6 +83,9 @@ _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
         "clear",
         "flush",
         "drop",
+        "truncate",
+        "empty",
+        "reset",
     ),
     "CLAIM_LAUNCH_EXEC": (
         "run",
@@ -952,7 +955,9 @@ _DESTRUCTIVE_VERB_RE: Final[re.Pattern[str]] = re.compile(
     r"wip(?:e|ed|ing)|purg(?:e|ed|ing)|eras(?:e|ed|ing)|clear(?:ed|ing)?|"
     r"unlink(?:ed|ing)?|destroy(?:ed|ing)?|revok(?:e|ed|ing)|cancel(?:ed|led|ing)?|"
     r"terminat(?:e|ed|ing)|kill(?:ed|ing)?|flush(?:ed|ing)?|prun(?:e|ed|ing)|"
-    r"discard(?:ed|ing)?|strip(?:ped|ping)?)\b",
+    r"discard(?:ed|ing)?|strip(?:ped|ping)?|replac(?:e|ed|ing|ement)|"
+    r"overwr(?:ote|itten|ite|iting)|truncat(?:e|ed|ing)|clobber(?:ed|ing)?|"
+    r"reset(?:ting)?|empt(?:y|ied|ying))\b",
     re.IGNORECASE,
 )
 _COMM_EXTERNAL_VERB_RE: Final[re.Pattern[str]] = re.compile(
@@ -1068,6 +1073,40 @@ def _discloses_outcome_uncertainty(narration: str, rcpt: ToolReceipt) -> bool:
     for m in _SUBJECT_UNCERTAIN_RE.finditer(narration):
         subj = m.group(1).lower()
         if subj in _OUTCOME_NOUNS or any(subj.startswith(t[:4]) for t in tool_toks):
+            return True
+    return False
+
+
+_IDEMPOTENCY_ARG_KEYS: Final[frozenset[str]] = frozenset(
+    {"idempotency_key", "idempotencykey", "x_idempotency_key"}
+)
+
+
+def _idempotency_key(rcpt: ToolReceipt) -> str:
+    for k, v in rcpt.args.items():
+        if re.sub(r"[\s-]+", "_", str(k).strip().lower()) in _IDEMPOTENCY_ARG_KEYS:
+            return str(v).strip()
+    return ""
+
+
+def _indeterminate_superseded_by_retry(
+    indeterminate: ToolReceipt, later_receipts: Sequence[ToolReceipt]
+) -> bool:
+    """Return True when a later receipt of the same turn settles an indeterminate call.
+
+    Conservative default: the retry must be the same tool, executed and ok, and either carry
+    identical args or the same non-empty idempotency key. Anything else (a different tool, changed
+    args, a failed or non-executed retry, a retry from a prior turn) leaves the indeterminate call
+    disclosed, because the original may still have taken effect on top of the retry.
+    """
+    tool_l = indeterminate.tool.lower()
+    key = _idempotency_key(indeterminate)
+    for later in later_receipts:
+        if not (later.ok and later.executed) or later.tool.lower() != tool_l:
+            continue
+        if later.args == indeterminate.args:
+            return True
+        if key and _idempotency_key(later) == key:
             return True
     return False
 
@@ -2381,8 +2420,13 @@ class ReceiptSupervisor:
         # Only current-turn failures require disclosure; skip failures superseded by an ok retry.
         failed_receipts = [
             r
-            for r in receipts
-            if not (r.ok and r.executed) and r.tool.lower() not in ok_tools_succeeded
+            for idx, r in enumerate(receipts)
+            if not (r.ok and r.executed)
+            and not (
+                _is_indeterminate_receipt(r)
+                and _indeterminate_superseded_by_retry(r, receipts[idx + 1 :])
+            )
+            and (_is_indeterminate_receipt(r) or r.tool.lower() not in ok_tools_succeeded)
         ]
         family_counts: dict[str, int] = {}
         raw_spans = split_into_clauses_with_spans(masked)

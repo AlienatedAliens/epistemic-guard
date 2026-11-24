@@ -1650,7 +1650,7 @@ class McpStdioProxy:
                 queue = self._pending.get(id_key) if id_key is not None else None
                 if queue:
                     undelivered.append(queue.pop())
-                    if not queue:
+                    if not queue and id_key is not None:
                         self._pending.pop(id_key, None)
         for pending in undelivered:
             self._writer.append(
