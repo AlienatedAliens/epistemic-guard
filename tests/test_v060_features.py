@@ -1431,50 +1431,99 @@ def test_passive_code_edit_claims_resolve_to_file_write_not_memory() -> None:
 
 
 def test_neural_only_memory_label_is_grounded_as_generic_state_change() -> None:
-    """A CLAIM_MEMORY label that only the neural classifier produced, on a clause with no memory
-    vocabulary, is grounded by a succeeded write receipt and never by a read receipt. Clauses a
-    rule resolves to CLAIM_MEMORY, or that use memory words, keep requiring a memory tool.
+    """A CLAIM_MEMORY label only the neural classifier produced, on a clause with no memory or
+    persistence wording, is grounded by a succeeded write receipt about the same thing, never
+    by a read and never by an unrelated write.
     """
     from epistemic_guard.supervision import ReceiptSupervisor as RS
 
-    edit = ToolReceipt(tool="edit_file", ok=True, executed=True, args={"path": "h.py"}, output="ok")
-    read = ToolReceipt(tool="read_file", ok=True, executed=True, args={"path": "h.py"}, output="x")
+    edit = ToolReceipt(tool="edit_file", ok=True, executed=True, args={"path": "handler.py"}, output="ok")
+    read = ToolReceipt(tool="read_file", ok=True, executed=True, args={"path": "handler.py"}, output="x")
+    ticket = ToolReceipt(tool="create_ticket", ok=True, executed=True, args={"title": "refund"}, output='{"id":"T-9"}')
     patched = "The handler has been patched to skip empty rows."
     assert RS._receipt_supports_clause(patched, "CLAIM_MEMORY", [edit]) is True
     assert RS._receipt_supports_clause(patched, "CLAIM_MEMORY", [read]) is False
-    # Rule-resolved memory claim: stays strict.
+    assert RS._receipt_supports_clause(patched, "CLAIM_MEMORY", [ticket]) is False
+    # Rule-resolved memory claim, or memory/persistence wording: stays strict.
     assert RS._receipt_supports_clause("I saved that to memory.", "CLAIM_MEMORY", [edit]) is False
-    # Neural-only label, but the clause is about memory: stays strict.
     assert RS._receipt_supports_clause("I remembered your preference.", "CLAIM_MEMORY", [edit]) is False
-    # Other neural-only families are unaffected (a write never grounds a delete).
-    assert RS._receipt_supports_clause("The rows are gone now.", "CLAIM_DELETE", [edit]) is False
+    assert (
+        RS._receipt_supports_clause("I've stored your dietary preference for next time.", "CLAIM_MEMORY", [ticket])
+        is False
+    )
+
+
+def test_passive_edit_pattern_does_not_swallow_stronger_families() -> None:
+    """Compound "updated and executed/deployed/installed" claims keep their exec family, and a
+    backticked setting keeps CLAIM_SYSTEM_STATE; an edit receipt grounds neither.
+    """
+    from epistemic_guard.supervision import resolve_clause_claim_family as r
+
+    for clause in (
+        "The migration script has been updated and executed against production.",
+        "The handler code has been updated and deployed to production.",
+        "The module has been updated and installed on the server.",
+    ):
+        assert r(clause, "CLAIM_MEMORY") == "CLAIM_LAUNCH_EXEC", clause
+    assert r("The `vpn` has been changed to the Sydney endpoint.", "CLAIM_SYSTEM_STATE") == "CLAIM_SYSTEM_STATE"
+    assert r("The `brightness` has been changed to 40%.", "CLAIM_SYSTEM_STATE") == "CLAIM_SYSTEM_STATE"
+    assert r("The `addBinding` method has been updated.", "CLAIM_MEMORY") == "CLAIM_FILE_WRITE"
+    assert r("The `fail.py` file has been updated.", "CLAIM_MEMORY") == "CLAIM_FILE_WRITE"
+
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+    edit = ToolReceipt(tool="edit_file", ok=True, executed=True, args={"path": "migrate.py"}, output="File updated.")
+    assert not sup.verify_narration(
+        "The migration script has been updated and executed against production.", receipts=[edit]
+    ).is_valid
+    bright = ToolReceipt(tool="set_brightness", ok=True, executed=True, args={"level": 40}, output="Brightness set to 40%")
+    assert sup.verify_narration("The `brightness` has been changed to 40%.", receipts=[bright]).is_valid
 
 
 def test_replayed_result_cannot_ground_a_creation_claim() -> None:
-    """An idempotent replay (`created: false`, `replayed: true`) is a successful result for an
-    object an earlier call created. It grounds "already existed", not "I created".
+    """An idempotent replay from a create-type tool grounds "already existed", not "I created".
+    Upserts and membership adds that report `created: false` are not replays.
     """
     from epistemic_guard.result_status import is_replayed_result
 
     assert is_replayed_result('{"id": "T-1", "created": false}') is True
     assert is_replayed_result({"id": "T-1", "replayed": True}) is True
+    assert is_replayed_result('{"result": {"created": false}}') is True
+    assert is_replayed_result('{"created": "false"}') is True
+    assert is_replayed_result({"content": [{"type": "text", "text": '{"created": false}'}]}) is True
+    assert is_replayed_result({"structuredContent": {"replayed": True}}) is True
     assert is_replayed_result('{"id": "T-1", "created": true}') is False
     assert is_replayed_result("Ticket T-1 created") is False
     assert is_replayed_result('{"id": "T-1"}') is False
 
     sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
 
-    def rcpt(out: str) -> ToolReceipt:
-        return ToolReceipt(
-            tool="create_ticket", ok=True, executed=True, args={"title": "deploy migration"}, output=out
-        )
+    def ticket(out: str) -> ToolReceipt:
+        return ToolReceipt(tool="create_ticket", ok=True, executed=True, args={"title": "deploy migration"}, output=out)
 
-    fresh = rcpt('{"id": "T-1", "created": true}')
-    replay = rcpt('{"id": "T-1", "created": false}')
+    fresh = ticket('{"id": "T-1", "created": true}')
+    replay = ticket('{"id": "T-1", "created": false}')
     assert sup.verify_narration("I created ticket T-1 for the deploy migration.", receipts=[fresh]).is_valid
-    v = sup.verify_narration("I created ticket T-1 for the deploy migration.", receipts=[replay])
-    assert v.is_valid is False
+    for claim in (
+        "I created ticket T-1 for the deploy migration.",
+        "I created ticket T-1 for the deploy migration to replace the original one.",
+        "I created ticket T-1 for the deploy migration and it is still open.",
+        "I set up ticket T-1 for the deploy migration.",
+        "I logged ticket T-1 for the deploy migration.",
+    ):
+        assert sup.verify_narration(claim, receipts=[replay]).is_valid is False, claim
+    # Creation verb plus wording that attributes the object to the earlier call: grounded.
     assert sup.verify_narration(
-        "Ticket T-1 for the deploy migration already existed from the earlier attempt.",
+        "Ticket T-1 for the deploy migration was already created by the earlier attempt.",
         receipts=[replay],
     ).is_valid
+
+    upsert = ToolReceipt(
+        tool="upsert_contact", ok=True, executed=True, args={"id": "C-9", "phone": "555-0101"},
+        output='{"id": "C-9", "created": false}',
+    )
+    assert sup.verify_narration("I added the phone number to contact C-9.", receipts=[upsert]).is_valid
+    member = ToolReceipt(
+        tool="add_channel_member", ok=True, executed=True, args={"channel": "deploy", "user": "alice"},
+        output='{"ok": true, "deduplicated": true}',
+    )
+    assert sup.verify_narration("I added Alice to the deploy channel.", receipts=[member]).is_valid

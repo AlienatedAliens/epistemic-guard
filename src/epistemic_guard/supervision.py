@@ -402,21 +402,37 @@ _VERB_TO_FAMILY: Final[dict[str, str]] = {
 
 # Clauses that claim this turn brought something into existence.
 _CREATION_CLAIM_RE: Final = re.compile(
-    r"\b(?:created|opened|filed|booked|placed|submitted|registered|issued|generated|added)\b",
+    r"\b(?:created|opened|filed|booked|placed|submitted|registered|issued|generated|"
+    r"set\s+up|made|logged|raised|provisioned|scheduled|reserved|inserted|wrote|written)\b",
     re.IGNORECASE,
 )
-# Wording that attributes the effect to an earlier call, which a replayed result does support.
+# Wording that attributes the object to an earlier call, which a replayed result does support.
+# Kept to phrases bound to the effect; a bare "still"/"again"/"original" elsewhere in a
+# fresh-creation clause must not switch the check off.
 _PRIOR_EFFECT_RE: Final = re.compile(
-    r"\b(?:already|previously|earlier|existing|still|again|original(?:ly)?|"
-    r"no\s+(?:new|duplicate)|not\s+(?:a\s+)?(?:new|duplicate))\b",
+    r"\b(?:already\s+(?:existed|exists|exist|been|created|open|opened|filed|booked|there|in\s+place)|"
+    r"(?:was|were|had\s+been)\s+already|previously\s+(?:created|opened|filed|booked|made)|"
+    r"(?:created|opened|filed|booked)\s+(?:earlier|previously|before|by\s+the\s+(?:earlier|first|original))|"
+    r"existing|no\s+(?:new|duplicate)|not\s+(?:a\s+)?(?:new|duplicate)|"
+    r"returned\s+the\s+(?:existing|original))\b",
     re.IGNORECASE,
+)
+# Tools whose job is to create a new object; `created: false` from an upsert or membership
+# add means "updated" or "already a member", which does not contradict "I added X".
+_CREATE_TOOL_RE: Final = re.compile(
+    r"(?:^|_)(?:create|open|file|book|submit|register|issue|new|place|reserve|provision|raise)(?:_|$)",
+    re.IGNORECASE,
+)
+_NON_CREATE_TOOL_RE: Final = re.compile(
+    r"(?:^|_)(?:upsert|update|set|add|put|patch|ensure|sync)(?:_|$)", re.IGNORECASE
 )
 # Sentinel passed as the neural label to detect clauses no deterministic family rule matched.
 _NO_DETERMINISTIC_FAMILY: Final = "__NO_DETERMINISTIC_FAMILY__"
 # Words that make a clause genuinely about memory, so a neural CLAIM_MEMORY label stays strict.
 _MEMORY_VOCAB_RE: Final = re.compile(
     r"\b(?:memory|memories|memorized|memorised|remember(?:ed)?|recall(?:ed)?|"
-    r"knowledge\s+base|long[-\s]term)\b",
+    r"knowledge\s+base|long[-\s]term|stored|noted|preferences?|for\s+(?:next\s+time|future|later)|"
+    r"from\s+now\s+on|going\s+forward|next\s+session)\b",
     re.IGNORECASE,
 )
 
@@ -459,11 +475,7 @@ def resolve_clause_claim_family(clause_text: str, neural_claim_cls: str) -> str:
         r"workspace|entry|keys?|checklist|ticket|issue|\.[a-z0-9]{2,8})\b|"
         r"\b(?:ticket|issue|entry)\b.*\bopened\s+in\s+[a-z0-9_.-]+\.[a-z0-9]{2,8}\b|"
         r"\b(?:file|note)\s+is\s+(?:now\s+)?saved\b|"
-        r"\bupdated\s+[a-z0-9_./-]+\.(?:json|yaml|yml|toml|md|txt|conf|ini|env|gitignore|nvmrc|"
-        r"py|js|jsx|ts|tsx|go|rs|java|c|h|cpp|hpp|cs|rb|php|sh|ps1|sql|html|css|xml|cfg|lock|"
-        r"dockerfile)\b|"
-        r"(?:\b(?:file|code|function|method|class|module|script)|`[^`]+`)\s+(?:has|have)\s+"
-        r"(?:now\s+)?been\s+(?:successfully\s+)?(?:updated|modified|edited|changed)\b",
+        r"\bupdated\s+[a-z0-9_./-]+\.(?:json|yaml|yml|toml|md|txt|conf|ini|env|gitignore|nvmrc)\b",
         c_low,
     ):
         return "CLAIM_FILE_WRITE"
@@ -478,6 +490,25 @@ def resolve_clause_claim_family(clause_text: str, neural_claim_cls: str) -> str:
         c_low,
     ):
         return "CLAIM_SYSTEM_STATE"
+    # Source-file edits, checked only after the exec and system-state rules so a compound
+    # "updated and deployed" or a backticked setting ("`vpn` has been changed") keeps its
+    # stronger family. Backticked targets must look like code (path, call, dotted or
+    # snake/camel identifier), not any quoted word.
+    passive_edit = (
+        r"\s+(?:has|have)\s+(?:now\s+)?been\s+(?:successfully\s+)?"
+        r"(?:updated|modified|edited|changed)\b"
+    )
+    if (
+        re.search(
+            r"\bupdated\s+[a-z0-9_./-]+\.(?:py|js|jsx|ts|tsx|go|rs|java|c|h|cpp|hpp|cs|rb|php|sh|"
+            r"ps1|sql|html|css|xml|cfg|lock|dockerfile)\b|"
+            r"\b(?:file|code|function|method|class|module|script)" + passive_edit,
+            c_low,
+        )
+        # Case-sensitive so a camelCase identifier (`addBinding`) counts as code.
+        or re.search(r"`[^`\s]*(?:[./(_]|[a-z][A-Z])[^`\s]*`" + passive_edit, clause_text)
+    ):
+        return "CLAIM_FILE_WRITE"
     if re.search(
         r"\b(?:read|searched|queried|checked|inspected|reviewed|scanned|fetched|found|retrieved|"
         r"located|pulled\s+up|verified)\b",
@@ -1928,7 +1959,15 @@ class ReceiptSupervisor:
         # A replayed result (`created: false`, `replayed: true`) means the object was created by
         # an earlier call. It grounds "the ticket already existed", not "I created the ticket".
         if _CREATION_CLAIM_RE.search(cl_lower) and not _PRIOR_EFFECT_RE.search(cl_lower):
-            ok_receipts = [r for r in ok_receipts if not is_replayed_result(r.output)]
+            ok_receipts = [
+                r
+                for r in ok_receipts
+                if not (
+                    _CREATE_TOOL_RE.search(r.tool)
+                    and not _NON_CREATE_TOOL_RE.search(r.tool)
+                    and is_replayed_result(r.output)
+                )
+            ]
             if not ok_receipts:
                 return False
 
@@ -2019,6 +2058,11 @@ class ReceiptSupervisor:
                     for fam in ("CLAIM_FILE_WRITE", "CLAIM_SYSTEM_STATE")
                 )
                 and not is_read_only_tool(rcpt.tool)
+                # The write must be about what the clause names, not any write in the turn.
+                and _extract_content_tokens(cl_lower)
+                & _extract_content_tokens(
+                    " ".join(str(v) for v in rcpt.args.values()) + " " + rcpt.output[:300]
+                )
             ]
 
         # Open-vocabulary fallback for unseen enterprise/SaaS tools outside the classic

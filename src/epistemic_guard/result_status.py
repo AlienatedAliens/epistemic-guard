@@ -107,6 +107,34 @@ def is_replayed_result(content: str | Mapping[str, Any]) -> bool:
     obj = _as_mapping(content) if isinstance(content, (str, Mapping)) else None
     if obj is None:
         return False
-    if obj.get("created") is False:
-        return True
-    return any(obj.get(k) is True for k in ("replayed", "idempotent_replay", "deduplicated"))
+    # MCP wraps results as {"content": [{"type": "text", "text": "<json>"}]} and/or
+    # {"structuredContent": {...}}.
+    candidates: list[Mapping[str, Any]] = [obj]
+    structured = obj.get("structuredContent")
+    if isinstance(structured, Mapping):
+        candidates.append(structured)
+    blocks = obj.get("content")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, Mapping) and isinstance(block.get("text"), str):
+                inner = _as_mapping(block["text"])
+                if inner is not None:
+                    candidates.append(inner)
+    # One level of a `result` / `data` envelope.
+    for cand in list(candidates):
+        for key in ("result", "data"):
+            nested = cand.get(key)
+            if isinstance(nested, Mapping):
+                candidates.append(nested)
+
+    def _is_false(val: object) -> bool:
+        return val is False or (isinstance(val, str) and val.strip().lower() == "false")
+
+    def _is_true(val: object) -> bool:
+        return val is True or (isinstance(val, str) and val.strip().lower() == "true")
+
+    return any(
+        _is_false(c.get("created"))
+        or any(_is_true(c.get(k)) for k in ("replayed", "idempotent_replay", "deduplicated"))
+        for c in candidates
+    )
