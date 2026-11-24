@@ -523,6 +523,16 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         )
+    elif verdict.is_valid and verdict.verdict_status == "unverifiable":
+        detail = (
+            f"; named target(s) not recorded by: {', '.join(verdict.unconfirmed_target_tools)}"
+            if verdict.unconfirmed_target_tools
+            else ""
+        )
+        print(
+            f"UNVERIFIABLE: {len(active_receipts)} receipt(s) verified, but the narration could "
+            f"not be fully confirmed{detail} (device={verdict.device})."
+        )
     elif verdict.is_valid:
         print(
             f"OK: {len(active_receipts)} receipt(s) verified; assistant narration grounded "

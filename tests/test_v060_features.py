@@ -1560,3 +1560,43 @@ def test_write_receipt_without_target_makes_named_file_claim_unverifiable_not_fl
     from epistemic_guard.supervision import ReceiptSupervisor as RS
 
     assert RS._receipt_supports_clause(claim, "CLAIM_FILE_WRITE", [edit({"command": "edit 1:15"})]) is False
+
+
+def test_unconfirmable_target_relaxation_is_narrow() -> None:
+    """Adversarial-audit cases: the unconfirmable path must not swallow receipts that name a
+    target under an unknown key or value shape, multi-file or sensitive claims, non-file targets,
+    or prior-turn receipts; and a contradicted verdict must not list unconfirmed tools.
+    """
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+
+    def R(tool: str, args: dict[str, str]) -> ToolReceipt:
+        return ToolReceipt(tool=tool, ok=True, executed=True, args=args, output="ok")
+
+    must_flag = {
+        "object key": ("I updated config.yaml.", [R("edit_file", {"object": "Makefile", "content": "x"})]),
+        "fname key": ("I updated config.yaml.", [R("write_file", {"fname": "Dockerfile", "content": "x"})]),
+        "windows path": ("I updated config.yaml.", [R("write_file", {"content": r"C:\repo\Makefile"})]),
+        "s3 uri": ("I updated config.yaml.", [R("write_file", {"content": "s3://bucket/obj"})]),
+        "camelCase key": ("I updated config.yaml.", [R("write_file", {"sourcePath": "src/Makefile", "content": "x"})]),
+        "bucket key": ("I updated config.yaml.", [R("write_file", {"bucket": "prod-backups", "content": "x"})]),
+        "two files": ("I updated a.py and b.py.", [R("edit_file", {"command": "x"})]),
+        "five files": (
+            "I updated config.yaml, secrets.env, deploy.sh, nginx.conf and auth.py.",
+            [R("write_file", {"content": "x"})],
+        ),
+        "sensitive key file": ("I rewrote id_rsa.pub with my key.", [R("edit_file", {"command": "apply"})]),
+        "sensitive db": ("I updated production.sqlite.", [R("edit_file", {"command": "apply"})]),
+        "email target": ("I updated the billing email to ceo@corp.com.", [R("update_settings", {"value": "on"})]),
+    }
+    for name, (claim, rcpts) in must_flag.items():
+        v = sup.verify_narration(claim, receipts=rcpts)
+        assert v.is_valid is False, name
+        assert v.unconfirmed_target_tools == [], name
+
+    prior = sup.verify_narration("I updated config.yaml.", receipts=[], prior_receipts=[R("write_file", {"content": "x"})])
+    assert prior.is_valid is False
+    mixed = sup.verify_narration("I updated config.yaml. I emailed bob@corp.com.", receipts=[R("write_file", {"content": "x"})])
+    assert (mixed.is_valid, mixed.unconfirmed_target_tools) == (False, [])
+
+    ok = sup.verify_narration("I updated config.yaml.", receipts=[R("write_file", {"content": "foo: 1"})])
+    assert (ok.is_valid, ok.verdict_status, ok.unconfirmed_target_tools) == (True, "unverifiable", ["write_file"])

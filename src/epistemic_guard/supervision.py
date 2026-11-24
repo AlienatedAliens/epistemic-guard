@@ -426,29 +426,43 @@ _CREATE_TOOL_RE: Final = re.compile(
 _NON_CREATE_TOOL_RE: Final = re.compile(
     r"(?:^|_)(?:upsert|update|set|add|put|patch|ensure|sync)(?:_|$)", re.IGNORECASE
 )
-# Claim families whose named target may be recorded as unconfirmable (rather than contradicted)
-# when the write receipt names no target. Destructive, external and exec claims stay strict.
-_UNCONFIRMABLE_TARGET_FAMILIES: Final = frozenset({"CLAIM_FILE_WRITE", "CLAIM_SYSTEM_STATE"})
-# Same target shapes as the concrete-target check in `_receipt_supports_clause`, plus bare paths.
-_CONCRETE_TARGET_RE: Final = re.compile(
-    r"https?://[^\s,;)']+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|#[0-9]+|"
-    r"\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|(?:^|\s)~?[\\/][\w.\-\\/]+"
+# Only CLAIM_FILE_WRITE may record a named file as unconfirmable (rather than contradicted) when
+# the write receipt names no target. Destructive, external, exec and system-state claims, and
+# URL / email / #id targets, stay strict.
+_UNCONFIRMABLE_TARGET_FAMILIES: Final = frozenset({"CLAIM_FILE_WRITE"})
+# A receipt counts as naming no target only if every arg key is a content-only key. Any other key
+# (path, fname, object, sourcePath, bucket, zone, ...) is presumed to identify a target.
+_CONTENT_ONLY_ARG_KEYS: Final = frozenset(
+    {
+        "content", "contents", "text", "body", "diff", "patch", "command", "cmd", "code",
+        "snippet", "data", "value", "input", "replacement", "new_text", "old_text", "new_str",
+        "old_str", "search", "replace", "line", "lines", "start_line", "end_line", "range",
+        "line_range", "mode", "encoding",
+    }
 )
-_TARGET_ARG_KEY_RE: Final = re.compile(
-    r"(?:^|_)(?:path|paths|file|files|filename|filepath|dir|directory|target|dest|destination|"
-    r"url|uri|href|endpoint|key|id|name|table|database|db|repo|branch|channel|to|recipient|"
-    r"email|address)(?:_|$)",
+# Value shapes that identify a target even under a content-only key.
+_TARGET_VALUE_RE: Final = re.compile(
+    r"[a-z][a-z0-9+.-]*://\S+|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|#[0-9]+|"
+    r"\b[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}\b|[a-z]:\\|(?:^|[\s\"'=(:])~?[\\/][\w.\-\\/]+"
+)
+# File names that never relax: secrets, keys, databases, production config.
+_SENSITIVE_TARGET_RE: Final = re.compile(
+    r"(?:^|[\\/._-])(?:env|secrets?|credentials?|passwords?|tokens?|id_rsa|id_ed25519|"
+    r"authorized_keys|known_hosts|shadow|passwd|kubeconfig|prod|production)(?:$|[\\/._-])|"
+    r"\.(?:env|pem|key|p12|pfx|kdbx|db|sqlite3?|mdb|sql|tfstate)$",
     re.IGNORECASE,
 )
+_FILE_NAME_TARGET_RE: Final = re.compile(r"^[a-z0-9_.-]+\.[a-z][a-z0-9]{1,12}$")
 
 
 def _args_name_a_target(args: Mapping[str, object]) -> bool:
-    """True when tool args identify what the call acted on: a target-named key with a value, or
-    any value shaped like a path, URL, email, file name or `#id`."""
+    """True unless every arg key is content-only and no value is shaped like a path, URL, email,
+    file name or `#id`."""
     for key, val in args.items():
-        if _TARGET_ARG_KEY_RE.search(str(key)) and str(val).strip():
+        k_norm = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key)).lower()
+        if k_norm not in _CONTENT_ONLY_ARG_KEYS:
             return True
-        if _CONCRETE_TARGET_RE.search(str(val).lower()):
+        if _TARGET_VALUE_RE.search(str(val).lower()):
             return True
     return False
 
@@ -1978,6 +1992,7 @@ class ReceiptSupervisor:
         custom_tool_families: Mapping[str, Sequence[str]] | None = None,
         mcp_tool_tokens: Mapping[str, frozenset[str]] | None = None,
         unconfirmable_out: list[str] | None = None,
+        current_turn_call_ids: frozenset[str] | None = None,
     ) -> bool:
         ok_receipts = [r for r in receipts if r.ok and r.executed]
         if not ok_receipts or family == "DEONTIC_CAPITULATION":
@@ -2144,11 +2159,21 @@ class ReceiptSupervisor:
             # neither confirm nor contradict the file a claim names. For non-destructive families
             # that is recorded as unconfirmable (verdict `unverifiable`, tool listed) instead of
             # flagged. Only a caller that passes `unconfirmable_out` opts in.
-            targetless_rcpts = [
-                rcpt
-                for rcpt in matching_rcpts
-                if rcpt.args and not _args_name_a_target(rcpt.args)
-            ]
+            # Relaxation applies only when every matching receipt is a current-turn receipt whose
+            # args are content-only, and the clause names exactly one non-sensitive file name.
+            relax_ok = (
+                unconfirmable_out is not None
+                and family in _UNCONFIRMABLE_TARGET_FAMILIES
+                and len(concrete_targets) == 1
+                and bool(matching_rcpts)
+                and all(
+                    rcpt.args
+                    and not _args_name_a_target(rcpt.args)
+                    and (current_turn_call_ids is None or rcpt.call_id in current_turn_call_ids)
+                    for rcpt in matching_rcpts
+                )
+            )
+            targetless_rcpts = matching_rcpts if relax_ok else []
             unconfirmed_here: list[str] = []
             for tgt in concrete_targets:
                 clean_tgt = tgt.rstrip(".,!?;:")
@@ -2168,10 +2193,9 @@ class ReceiptSupervisor:
                 if in_args or in_zero_arg_rcpt:
                     continue
                 if (
-                    unconfirmable_out is not None
-                    and family in _UNCONFIRMABLE_TARGET_FAMILIES
-                    and targetless_rcpts
-                    and len(targetless_rcpts) == len(matching_rcpts)
+                    targetless_rcpts
+                    and _FILE_NAME_TARGET_RE.match(clean_tgt)
+                    and not _SENSITIVE_TARGET_RE.search(clean_tgt)
                 ):
                     unconfirmed_here.extend(r.tool for r in targetless_rcpts)
                     continue
@@ -2477,6 +2501,7 @@ class ReceiptSupervisor:
                     custom_tool_families=self._custom_tool_families,
                     mcp_tool_tokens=self._mcp_tool_tokens,
                     unconfirmable_out=unconfirmed_target_tools,
+                    current_turn_call_ids=frozenset(r.call_id for r in receipts),
                 ):
                     unsupported_claims.append(cl_text)
                     unsupported_spans.append(
@@ -2894,7 +2919,9 @@ class ReceiptSupervisor:
             unfulfilled_promises=unfulfilled,
             undisclosed_mutations=undisclosed,
             structured_actions=structured,
-            unconfirmed_target_tools=list(dict.fromkeys(unconfirmed_target_tools)),
+            unconfirmed_target_tools=(
+                list(dict.fromkeys(unconfirmed_target_tools)) if is_ok else []
+            ),
         )
 
     def stream(
