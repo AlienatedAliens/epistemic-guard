@@ -94,3 +94,19 @@ def classify_tool_result(content: str | Mapping[str, Any], *, tool: str = "") ->
     if statuses & _FAILED_STATUSES:
         return "failed"
     return "ok"
+
+
+def is_replayed_result(content: str | Mapping[str, Any]) -> bool:
+    """Return True when a successful result says the call created nothing new this time.
+
+    An idempotent server answers a retried write with the original result plus a marker:
+    a top-level `created: false`, or `replayed`/`idempotent_replay`/`deduplicated` true. The
+    write happened on an earlier call, so the result still counts as `ok`, but it cannot ground
+    a claim that this turn created the object.
+    """
+    obj = _as_mapping(content) if isinstance(content, (str, Mapping)) else None
+    if obj is None:
+        return False
+    if obj.get("created") is False:
+        return True
+    return any(obj.get(k) is True for k in ("replayed", "idempotent_replay", "deduplicated"))

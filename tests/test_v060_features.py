@@ -1428,3 +1428,53 @@ def test_passive_code_edit_claims_resolve_to_file_write_not_memory() -> None:
         assert v_mem.is_valid is True, mem_tool
     v_mem_wrong = sup.verify_narration("I saved your preference to memory.", receipts=[edit])
     assert v_mem_wrong.is_valid is False
+
+
+def test_neural_only_memory_label_is_grounded_as_generic_state_change() -> None:
+    """A CLAIM_MEMORY label that only the neural classifier produced, on a clause with no memory
+    vocabulary, is grounded by a succeeded write receipt and never by a read receipt. Clauses a
+    rule resolves to CLAIM_MEMORY, or that use memory words, keep requiring a memory tool.
+    """
+    from epistemic_guard.supervision import ReceiptSupervisor as RS
+
+    edit = ToolReceipt(tool="edit_file", ok=True, executed=True, args={"path": "h.py"}, output="ok")
+    read = ToolReceipt(tool="read_file", ok=True, executed=True, args={"path": "h.py"}, output="x")
+    patched = "The handler has been patched to skip empty rows."
+    assert RS._receipt_supports_clause(patched, "CLAIM_MEMORY", [edit]) is True
+    assert RS._receipt_supports_clause(patched, "CLAIM_MEMORY", [read]) is False
+    # Rule-resolved memory claim: stays strict.
+    assert RS._receipt_supports_clause("I saved that to memory.", "CLAIM_MEMORY", [edit]) is False
+    # Neural-only label, but the clause is about memory: stays strict.
+    assert RS._receipt_supports_clause("I remembered your preference.", "CLAIM_MEMORY", [edit]) is False
+    # Other neural-only families are unaffected (a write never grounds a delete).
+    assert RS._receipt_supports_clause("The rows are gone now.", "CLAIM_DELETE", [edit]) is False
+
+
+def test_replayed_result_cannot_ground_a_creation_claim() -> None:
+    """An idempotent replay (`created: false`, `replayed: true`) is a successful result for an
+    object an earlier call created. It grounds "already existed", not "I created".
+    """
+    from epistemic_guard.result_status import is_replayed_result
+
+    assert is_replayed_result('{"id": "T-1", "created": false}') is True
+    assert is_replayed_result({"id": "T-1", "replayed": True}) is True
+    assert is_replayed_result('{"id": "T-1", "created": true}') is False
+    assert is_replayed_result("Ticket T-1 created") is False
+    assert is_replayed_result('{"id": "T-1"}') is False
+
+    sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
+
+    def rcpt(out: str) -> ToolReceipt:
+        return ToolReceipt(
+            tool="create_ticket", ok=True, executed=True, args={"title": "deploy migration"}, output=out
+        )
+
+    fresh = rcpt('{"id": "T-1", "created": true}')
+    replay = rcpt('{"id": "T-1", "created": false}')
+    assert sup.verify_narration("I created ticket T-1 for the deploy migration.", receipts=[fresh]).is_valid
+    v = sup.verify_narration("I created ticket T-1 for the deploy migration.", receipts=[replay])
+    assert v.is_valid is False
+    assert sup.verify_narration(
+        "Ticket T-1 for the deploy migration already existed from the earlier attempt.",
+        receipts=[replay],
+    ).is_valid

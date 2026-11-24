@@ -27,7 +27,12 @@ from epistemic_guard.hazard import split_into_clauses_with_spans
 from epistemic_guard.models import resolve_managed_model_dir
 from epistemic_guard.nli import OpenVINONLIVerifier
 from epistemic_guard.provenance import ProvenanceGate
-from epistemic_guard.result_status import _MUTATING_TOOL_VERB_RE, _READBACK_TOOL_RE
+from epistemic_guard.result_status import (
+    _MUTATING_TOOL_VERB_RE,
+    _READBACK_TOOL_RE,
+    is_read_only_tool,
+    is_replayed_result,
+)
 from epistemic_guard.schemas import (
     StructuredActionTag,
     SupervisionVerdict,
@@ -393,6 +398,27 @@ _VERB_TO_FAMILY: Final[dict[str, str]] = {
     "refund": "CLAIM_COMM_EXTERNAL",
     "transfer": "CLAIM_COMM_EXTERNAL",
 }
+
+
+# Clauses that claim this turn brought something into existence.
+_CREATION_CLAIM_RE: Final = re.compile(
+    r"\b(?:created|opened|filed|booked|placed|submitted|registered|issued|generated|added)\b",
+    re.IGNORECASE,
+)
+# Wording that attributes the effect to an earlier call, which a replayed result does support.
+_PRIOR_EFFECT_RE: Final = re.compile(
+    r"\b(?:already|previously|earlier|existing|still|again|original(?:ly)?|"
+    r"no\s+(?:new|duplicate)|not\s+(?:a\s+)?(?:new|duplicate))\b",
+    re.IGNORECASE,
+)
+# Sentinel passed as the neural label to detect clauses no deterministic family rule matched.
+_NO_DETERMINISTIC_FAMILY: Final = "__NO_DETERMINISTIC_FAMILY__"
+# Words that make a clause genuinely about memory, so a neural CLAIM_MEMORY label stays strict.
+_MEMORY_VOCAB_RE: Final = re.compile(
+    r"\b(?:memory|memories|memorized|memorised|remember(?:ed)?|recall(?:ed)?|"
+    r"knowledge\s+base|long[-\s]term)\b",
+    re.IGNORECASE,
+)
 
 
 def resolve_clause_claim_family(clause_text: str, neural_claim_cls: str) -> str:
@@ -1899,6 +1925,13 @@ class ReceiptSupervisor:
             return False
         cl_lower = clause.lower()
 
+        # A replayed result (`created: false`, `replayed: true`) means the object was created by
+        # an earlier call. It grounds "the ticket already existed", not "I created the ticket".
+        if _CREATION_CLAIM_RE.search(cl_lower) and not _PRIOR_EFFECT_RE.search(cl_lower):
+            ok_receipts = [r for r in ok_receipts if not is_replayed_result(r.output)]
+            if not ok_receipts:
+                return False
+
         # Guard against partial compound hallucinations: if this clause explicitly names a
         # concrete argument belonging to a FAILED receipt (and not to any succeeded receipt),
         # never allow an unrelated ok=True receipt to ground it.
@@ -1960,6 +1993,33 @@ class ReceiptSupervisor:
                         custom_tool_families=custom_tool_families,
                     )
                 ]
+
+        # A CLAIM_MEMORY label that came only from the neural classifier (no deterministic
+        # family rule matched) on a clause with no memory vocabulary is the classifier's
+        # guess for an otherwise unrecognised state-change sentence ("The handler has been
+        # patched"), not evidence of a memory write. Treat it as a generic state change:
+        # a succeeded write / system-state / memory receipt grounds it; a read never does.
+        if (
+            not matching_rcpts
+            and family == "CLAIM_MEMORY"
+            and not _MEMORY_VOCAB_RE.search(cl_lower)
+            and resolve_clause_claim_family(clause, _NO_DETERMINISTIC_FAMILY)
+            == _NO_DETERMINISTIC_FAMILY
+        ):
+            matching_rcpts = [
+                rcpt
+                for rcpt in ok_receipts
+                if any(
+                    _receipt_matches_family(
+                        rcpt,
+                        fam,
+                        extra_stems=extra_stems,
+                        custom_tool_families=custom_tool_families,
+                    )
+                    for fam in ("CLAIM_FILE_WRITE", "CLAIM_SYSTEM_STATE")
+                )
+                and not is_read_only_tool(rcpt.tool)
+            ]
 
         # Open-vocabulary fallback for unseen enterprise/SaaS tools outside the classic
         # coding/filesystem/SQL taxonomy: ground directly against succeeded receipt arguments,
