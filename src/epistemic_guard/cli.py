@@ -65,7 +65,7 @@ def _cmd_doctor() -> int:
 
 
 def _cmd_demo() -> int:
-    print("epistemic-guard v0.6.5 — Live Verification Demo")
+    print("epistemic-guard v0.6.7 — Live Verification Demo")
     print("=" * 68)
 
     master_key = os.urandom(32)

@@ -149,7 +149,7 @@ from epistemic_guard.supervision import (
     parse_structured_action_tags,
 )
 
-__version__ = "0.6.5"
+__version__ = "0.6.7"
 
 __all__ = [
     "DEFAULT_SHINGLE_WINDOW",

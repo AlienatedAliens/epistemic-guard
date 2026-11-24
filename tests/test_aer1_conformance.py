@@ -189,7 +189,7 @@ def test_aer1_base64_utf8_duplicate_and_binding_rejections() -> None:
 
 
 def test_aer1_full_146_vector_conformance_corpus() -> None:
-    """Verify all 146 checks in the pinned `draft-zambo-aer1-26` corpus (`138` base + `8` probes)."""
+    """Run the pinned `draft-zambo-aer1-26` corpus: 146 checks counted by this test plus 8 metadata-probe checks (154 total). The 146 is this repo's own tally, not the published kit's count."""
     corpus_path = Path(__file__).resolve().parents[1] / "benchmarks" / "aer1_full_corpus.json"
     bundle = json.loads(corpus_path.read_text(encoding="utf-8"))
     fb: dict[str, str] = bundle["files_b64"]
