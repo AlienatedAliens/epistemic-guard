@@ -2,7 +2,30 @@
 
 This file starts at 0.6.7. Earlier releases are described by their git tags and GitHub release notes.
 
-## 0.6.7 (unreleased, local release candidate)
+## 0.6.8 (local release candidate)
+
+Narrow follow-up to 0.6.7. No new performance or accuracy figures.
+
+### Changed
+- **Result classifier reads unknown-outcome shapes by value, not field name** (`result_status.py`,
+  shared by both proxies and the transcript extractor). For a non-read-only tool, each of these is now
+  `indeterminate` (previously `ok` or `failed`): a `status`/`outcome`/`state`/`result_status` value that
+  reads unknown, indeterminate, uncertain or maybe-applied (for example `submission_uncertain`,
+  `outcome_unknown`); an `error`/`error_code`/`code` string ending `_unknown` or `_uncertain` (for
+  example `rent_outcome_unknown`), including when a `_failed` sibling is present; and a
+  `side_effect_status` that reads unknown. `retry_safe: false` alone is not a signal. The same checks
+  run on `structuredContent`, JSON text blocks and one `result`/`data` level. Read-only tools stay
+  exempt, and honest `failed`/`ok` results are unchanged.
+- The source distribution now includes `CHANGELOG.md` and `benchmarks/aer1_full_corpus.json`, so the
+  test suite runs from an unpacked sdist.
+
+### Not verified
+- The classifier change is covered by unit tests only. It has not been run against real MCP servers
+  or any benchmark, and its false-positive rate on real traffic is unmeasured.
+- The `_unknown`/`_uncertain` error-code and `side_effect_status` shapes follow a report of what real
+  servers emit; they were not found by name in the public codebook of the 100-server study.
+
+## 0.6.7 (released 2026-11-24)
 
 Covers everything on `main` after the v0.6.5 tag plus the `fix/claim-family-fallback` branch. No new
 performance or accuracy figures: none of the changes below has been re-benchmarked on a held-out set.

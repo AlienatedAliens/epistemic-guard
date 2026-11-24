@@ -45,6 +45,67 @@ _INDETERMINATE_STATUSES: Final[frozenset[str]] = frozenset(
 )
 
 
+_UNKNOWN_TOKENS: Final[frozenset[str]] = frozenset({"unknown", "indeterminate", "uncertain"})
+_OUTCOME_KEYS: Final[tuple[str, ...]] = ("status", "outcome", "state", "result_status")
+_SIDE_EFFECT_KEYS: Final[tuple[str, ...]] = ("side_effect_status", "side_effect", "effect_status")
+_ERROR_CODE_KEYS: Final[tuple[str, ...]] = ("error", "error_code", "code")
+
+
+def _says_unknown(val: object) -> bool:
+    """Return True when a status-like string value reads unknown, indeterminate or uncertain."""
+    norm = _norm_status(val)
+    if not norm:
+        return False
+    return (
+        norm in _INDETERMINATE_STATUSES
+        or "maybe_applied" in norm
+        or bool(set(re.split(r"[^a-z0-9]+", norm)) & _UNKNOWN_TOKENS)
+    )
+
+
+def _unknown_error_code(val: object) -> bool:
+    """Return True for an error CODE string such as `rent_outcome_unknown` or `x_uncertain`."""
+    if isinstance(val, Mapping):
+        return any(_unknown_error_code(val.get(k)) for k in ("code", "error_code"))
+    norm = _norm_status(val)
+    return bool(norm) and norm.endswith(("_unknown", "_uncertain"))
+
+
+def _candidates(obj: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """`obj` plus MCP envelopes: `structuredContent`, JSON text blocks, `result`/`data`."""
+    found: list[Mapping[str, Any]] = [obj]
+    structured = obj.get("structuredContent")
+    if isinstance(structured, Mapping):
+        found.append(structured)
+    blocks = obj.get("content")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, Mapping) and isinstance(block.get("text"), str):
+                inner = _as_mapping(block["text"])
+                if inner is not None:
+                    found.append(inner)
+    for cand in list(found):
+        for key in ("result", "data"):
+            nested = cand.get(key)
+            if isinstance(nested, Mapping):
+                found.append(nested)
+    return found
+
+
+def _reads_unknown(obj: Mapping[str, Any]) -> bool:
+    """Value-based unknown-outcome shapes, whatever the member is called.
+
+    (a) a status/outcome/state member whose value reads unknown/indeterminate/uncertain
+    (`submission_uncertain`, `outcome_unknown`); (b) an error code ending `_unknown`/`_uncertain`
+    (`rent_outcome_unknown`); (c) a side-effect member that reads unknown. `retry_safe: false` is
+    not a signal on its own.
+    """
+    return (
+        any(_says_unknown(obj.get(k)) for k in _OUTCOME_KEYS + _SIDE_EFFECT_KEYS)
+        or any(_unknown_error_code(obj.get(k)) for k in _ERROR_CODE_KEYS)
+    )
+
+
 def is_read_only_tool(tool_name: str) -> bool:
     """Return True iff `tool_name` is a read/query/probe tool with no mutating verb."""
     return bool(_READBACK_TOOL_RE.search(tool_name)) and not bool(
@@ -125,8 +186,11 @@ def _batch_items(obj: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
 def classify_tool_result(content: str | Mapping[str, Any], *, tool: str = "") -> ResultStatus:
     """Classify a tool result from explicit, machine-readable signals.
 
-    `indeterminate`: a top-level `status`/`outcome` of unknown or partly applied, for a tool that is
-    not read-only (a read tool's `status` usually describes the record it fetched, not the call);
+    `indeterminate`: a `status`/`outcome`/`state` whose value reads unknown, indeterminate,
+    uncertain or partly applied, an error code ending `_unknown`/`_uncertain`, or an unknown
+    side-effect status (also inside `structuredContent`, JSON text blocks and one `result`/`data`
+    level), for a tool that is not read-only (a read tool's `status` usually describes the record
+    it fetched, not the call);
     or a non-empty `error` that contradicts an explicit success signal (see below).
     `failed`: `ok`/`success` false, `isError`/`is_error` true, a non-empty `error`, a failed
     `status`, or text starting with `Error:`/`Traceback`.
@@ -145,7 +209,9 @@ def classify_tool_result(content: str | Mapping[str, Any], *, tool: str = "") ->
         return "ok"
     statuses = {_norm_status(obj.get("status")), _norm_status(obj.get("outcome"))}
     read_only = bool(tool) and is_read_only_tool(tool)
-    if not read_only and statuses & _INDETERMINATE_STATUSES:
+    if not read_only and (
+        statuses & _INDETERMINATE_STATUSES or any(_reads_unknown(c) for c in _candidates(obj))
+    ):
         return "indeterminate"
     if obj.get("ok") is False or obj.get("success") is False:
         return "failed"

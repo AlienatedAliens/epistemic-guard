@@ -1,6 +1,6 @@
 [project]
 name = "epistemic-guard"
-version = "0.6.7"
+version = "0.6.8"
 description = "Signed tool receipts, stdio & Streamable HTTP MCP proxies, Ed25519 memory write-gating, and CPU/NPU agent verification (zero LLM calls)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -76,6 +76,8 @@ include = [
     "/src",
     "/tests",
     "/AGENTS.md",
+    "/CHANGELOG.md",
+    "/benchmarks/aer1_full_corpus.json",
     "/LICENSE",
     "/MODEL_NOTICES.md",
     "/README.md",
