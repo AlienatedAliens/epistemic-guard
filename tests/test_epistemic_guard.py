@@ -915,6 +915,29 @@ def test_otel_span_evidence_export_and_recorder_hook() -> None:
     assert rcpt_attrs["epistemic_guard.receipt.call_id"] == recorder.receipts[0].call_id
 
 
+def test_otel_receipt_attributes_export_redacted_endpoint_id() -> None:
+    """The receipt's server (`endpoint_id`) is exported so tier rates can be grouped per server,
+    with credentials, query and fragment stripped from URL-shaped ids.
+    """
+    from epistemic_guard.integrations import receipt_to_otel_attributes
+
+    key = "epistemic_guard.receipt.endpoint_id"
+    cases = {
+        "https://user:s3cret@mcp.example.com:8443/mcp?api_key=abc#frag": "https://mcp.example.com:8443/mcp",
+        "http://127.0.0.1:47411/mcp": "http://127.0.0.1:47411/mcp",
+        "http://[::1]:9000/mcp?token=t": "http://[::1]:9000/mcp",
+        "stdio:demo": "stdio:demo",
+    }
+    for raw, expected in cases.items():
+        attrs = receipt_to_otel_attributes(
+            ToolReceipt(tool="write_file", evidence_tier="probe_unobservable", endpoint_id=raw)
+        )
+        assert attrs[key] == expected, raw
+        assert attrs["epistemic_guard.receipt.evidence_tier"] == "probe_unobservable"
+        assert "s3cret" not in str(attrs) and "api_key" not in str(attrs) and "token=" not in str(attrs)
+    assert key not in receipt_to_otel_attributes(ToolReceipt(tool="write_file"))
+
+
 def test_zero_arg_receipt_cannot_wildcard_concrete_targets() -> None:
     sup = ReceiptSupervisor(device="CPU", warn_on_missing=False)
     zero_arg_delete = ToolReceipt(
