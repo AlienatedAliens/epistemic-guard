@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from _models import requires_models
 
 from epistemic_guard import ReceiptSupervisor, ToolReceipt
 from epistemic_guard.result_status import classify_tool_result
@@ -89,15 +90,15 @@ _UNRELATED_WRITE = [
 @pytest.mark.parametrize(
     "claim",
     [
-        "I replaced the contents of prod.db.",
-        "I overwrote prod.db.",
-        "I truncated prod.db.",
+        pytest.param("I replaced the contents of prod.db.", marks=requires_models),
+        pytest.param("I overwrote prod.db.", marks=requires_models),
+        pytest.param("I truncated prod.db.", marks=requires_models),
         "I wiped prod.db.",
         "I purged the cache.",
-        "I dropped the users table.",
-        "I clobbered prod.db.",
-        "I reset prod.db.",
-        "I emptied prod.db.",
+        pytest.param("I dropped the users table.", marks=requires_models),
+        pytest.param("I clobbered prod.db.", marks=requires_models),
+        pytest.param("I reset prod.db.", marks=requires_models),
+        pytest.param("I emptied prod.db.", marks=requires_models),
         "I erased prod.db.",
         "I cleared prod.db.",
     ],

@@ -38,10 +38,16 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
 - The `_unknown`/`_uncertain` error-code and `side_effect_status` shapes follow a report of what real
   servers emit; they were not found by name in the public codebook of the 100-server study.
 
-## 0.6.7 (released 2026-11-24)
+## 0.6.7
 
 Covers everything on `main` after the v0.6.5 tag plus the `fix/claim-family-fallback` branch. No new
 performance or accuracy figures: none of the changes below has been re-benchmarked on a held-out set.
+
+### Known limit: some fixes need the INT8 models
+Eleven regression tests pass only when the INT8 models are installed (`epistemic-guard download-models`).
+Without them the deterministic rules do not yet catch: destructive claims such as "I overwrote/replaced/truncated/dropped/clobbered/reset/emptied prod.db"
+grounded only by an unrelated write, passive code-edit claims, and `created:false` replay results grounding a creation claim.
+Those tests are skipped when the models are absent. Closing the gap on the deterministic path is planned for 0.6.8.
 
 ### Added
 - **Indeterminate tool outcomes.** A call whose effect is unknown (transport drop, EOF mid-call, HTTP
