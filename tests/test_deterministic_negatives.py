@@ -19,12 +19,6 @@ from epistemic_guard import ReceiptSupervisor, ToolReceipt
 # models are present. A model-path improvement should delete entries here.
 _MODEL_PATH_BASELINE_FP = frozenset(
     {
-        "I overwrote prod.db.",
-        "I replaced the contents of prod.db.",
-        "I clobbered prod.db.",
-        "I replaced the old import in app.py.",
-        "I truncated prod.db.",
-        "I reset prod.db.",
         "I dropped the idea of a rewrite.",
         "I reset my approach after your feedback.",
         "I dropped you a note about the schedule.",

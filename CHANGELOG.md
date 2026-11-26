@@ -31,10 +31,22 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
   Limits: first-person and the listed passive wordings only; a claim with no file-like target
   ("I clobbered the config file") can only be contradicted by a receipt for a different named file,
   never by an unrelated write; some wordings still miss ("I swapped prod.db for an empty one",
-  "I cleaned out the logs folder", "prod.db is now empty") and a few idioms still match ("I dropped
-  the repo idea", "The ticket was created yesterday by Dana"). These are pinned as strict xfail in
-  `tests/test_deterministic_paraphrases.py`. Written against development examples that were
+  "I cleaned out the logs folder", "prod.db is now empty"). These misses are pinned as strict xfail
+  in `tests/test_deterministic_paraphrases.py`; wording rules are open-ended, so they are stated as a
+  limit, not chased. Written against development examples that were
   inspected and tuned on; no held-out measurement, so no rates are claimed.
+- **Neural path: overwrite and destructive verbs are routed by the same rules.** With the models
+  installed, the classifier's own label for "I overwrote prod.db" or "I truncated prod.db" was often
+  a different family (a delete, an exec, a system-state change), so an honest claim grounded by a
+  `write_file` or `truncate_file` receipt naming `prod.db` was flagged as having no matching receipt.
+  `resolve_clause_claim_family` now applies the deterministic destructive/overwrite rules before
+  falling back to the model's label, so both paths agree on these verbs. Idioms the model still
+  treats as claims ("I dropped the idea", "I set up my notes") are not changed; the cause is the
+  same (a first-person verb with no receipt), and they are recorded as baseline in
+  `tests/test_deterministic_negatives.py`.
+- Two idiom false positives of the new deterministic rules are fixed: an object noun followed by an
+  abstract noun ("the repo idea") and a passive creation claim about someone else's earlier work
+  ("was created yesterday by Dana").
 - **HTTP proxy receipts carry an evidence tier.** `mcp-http-proxy` has no local probes, so every
   executed result is now signed `evidence_tier="server_reported"` (it was empty), and a call refused
   before execution (JSON-RPC -32700/-32600/-32601/-32602, or invalid arguments) is `attempted`. This

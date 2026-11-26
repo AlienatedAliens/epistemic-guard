@@ -99,19 +99,10 @@ def test_known_misses(claim: str) -> None:
         "I opened with a short summary of the findings.",
         "I rolled back my earlier suggestion.",
         "The file was updated in the 2.0 release.",
+        "I dropped the repo idea and kept the single script.",
+        "The ticket was created yesterday by Dana.",
+        "The ticket was filed earlier by the support team.",
     ],
 )
 def test_idioms_near_the_rules_stay_valid(claim: str) -> None:
-    assert _valid(claim, []) is True
-
-
-@pytest.mark.parametrize(
-    "claim",
-    [
-        "I dropped the repo idea and kept the single script.",
-        "The ticket was created yesterday by Dana.",
-    ],
-)
-@pytest.mark.xfail(strict=True, reason="known false positive of the deterministic rules")
-def test_known_false_positives(claim: str) -> None:
     assert _valid(claim, []) is True

@@ -166,7 +166,9 @@ _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
 #   object: a file name with an extension, or a file/table/database-like noun.
 _DESTRUCTIVE_OBJECT_PAT: Final = (
     r"(?:\b[\w-]+\.[a-z][a-z0-9]{1,7}\b(?!-)|\b(?:files?|tables?|databases?|db|schema|collection|"
-    r"director(?:y|ies)|folders?|bucket|repo(?:sitory)?|branch|cache|config(?:uration)?)\b(?!-))"
+    r"director(?:y|ies)|folders?|bucket|repo(?:sitory)?|branch|cache|config(?:uration)?)\b(?!-)"
+    r"(?!\s+(?:idea|plan|approach|proposal|thought|concept|option|suggestion|question|topic|"
+    r"point|angle|route)s?\b))"
 )
 #   subject: "I", "I've", "I have", with the usual adverbs.
 _FIRST_PERSON_PAT: Final = (
@@ -178,6 +180,11 @@ _NOT_A_TURN_ACTION_PAT: Final = (
     r"message|summary|notes?|head|explanation|text)\b|\bbelow\b|\babove\b|\bupstream\b|"
     r"\b(?:latest\s+)?release\b|\bversion\s+\d|\bmaintainers?\b|\blast\s+(?:year|week|month)\b|"
     r"\baccording\s+to\b|\bby\s+the\s+(?:platform|ops|dev|devops)\s+team\b))"
+)
+#   a passive creation claim about someone else's earlier work is not a claim about this turn.
+_THIRD_PARTY_PASSIVE_PAT: Final = (
+    r"(?![^!?\n]*(?:\b(?:yesterday|earlier|previously|last|ago)\b|(?-i:\bby\s+(?!me\b)[A-Z][a-z]+)|"
+    r"\bby\s+the\s+(?:[a-z]+\s+)?team\b))"
 )
 _PASSIVE_AUX_PAT: Final = (
     r"(?:has|have|had|was|were|got)\s+(?:now\s+|just\s+|successfully\s+)*(?:been\s+)?"
@@ -191,39 +198,9 @@ _TICKET_NOUN_PAT: Final = (
     r"\b(?!-)"
 )
 
-_DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
-    (
-        "CLAIM_FILE_WRITE",
-        re.compile(
-            _FIRST_PERSON_PAT
-            + r"(?:saved|wrote|written|created|updated|modified|edited|archived)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "CLAIM_DELETE",
-        re.compile(
-            _FIRST_PERSON_PAT + r"(?:deleted|removed|erased|wiped|formatted|purged|cleared)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "CLAIM_LAUNCH_EXEC",
-        re.compile(
-            _FIRST_PERSON_PAT
-            + r"(?:executed|ran|installed|committed|pushed|killed|restarted|deployed)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "CLAIM_COMM_EXTERNAL",
-        re.compile(
-            _FIRST_PERSON_PAT
-            + r"(?:sent|emailed|messaged|dispatched|refunded|transferred|booked)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    # v0.6.8 rules (see the patterns above). Destructive and overwrite verbs:
+# Destructive and overwrite claims. Also used by `resolve_clause_claim_family` so the neural path
+# routes these verbs the same way (the model's own label for "I overwrote prod.db" is unreliable).
+_DESTRUCTIVE_CLAIM_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "CLAIM_FILE_WRITE",
         re.compile(
@@ -278,6 +255,41 @@ _DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] =
             re.IGNORECASE,
         ),
     ),
+)
+
+_DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:saved|wrote|written|created|updated|modified|edited|archived)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_DELETE",
+        re.compile(
+            _FIRST_PERSON_PAT + r"(?:deleted|removed|erased|wiped|formatted|purged|cleared)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_LAUNCH_EXEC",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:executed|ran|installed|committed|pushed|killed|restarted|deployed)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_COMM_EXTERNAL",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:sent|emailed|messaged|dispatched|refunded|transferred|booked)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    *_DESTRUCTIVE_CLAIM_PATTERNS,
     # Creation of a ticket-like object, active and passive.
     (
         "CLAIM_FILE_WRITE",
@@ -294,7 +306,8 @@ _DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] =
         re.compile(
             r"\b" + _TICKET_NOUN_PAT + r"[^.!?\n]{0,40}\b" + _PASSIVE_AUX_PAT
             + r"(?:created|opened|filed|raised|logged|registered|submitted|generated)\b"
-            + _NOT_A_TURN_ACTION_PAT,
+            + _NOT_A_TURN_ACTION_PAT
+            + _THIRD_PARTY_PASSIVE_PAT,
             re.IGNORECASE,
         ),
     ),
@@ -639,6 +652,12 @@ def resolve_clause_claim_family(clause_text: str, neural_claim_cls: str) -> str:
         c_low,
     ):
         return "CLAIM_MEMORY"
+    # v0.6.8: overwrite / truncate / reset / drop on a named file, table or database. The neural
+    # label for these is unreliable ("I overwrote prod.db" came back as a delete), so route them
+    # with the same rules the deterministic path uses.
+    for destructive_family, destructive_re in _DESTRUCTIVE_CLAIM_PATTERNS:
+        if destructive_re.search(clause_text):
+            return destructive_family
     if re.search(
         r"\b(?:deleted|removed|erased|wiped|purged|emptied|revoked|scrubbed|cleared|flushed|dropped)\b",
         c_low,
