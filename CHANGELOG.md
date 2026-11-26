@@ -16,6 +16,25 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
   `side_effect_status` that reads unknown. `retry_safe: false` alone is not a signal. The same checks
   run on `structuredContent`, JSON text blocks and one `result`/`data` level. Read-only tools stay
   exempt, and honest `failed`/`ok` results are unchanged.
+- **Deterministic claim rules no longer need the INT8 models for these wordings.** When the models
+  are absent, claims are found by regex rules. 0.6.8 adds: first-person overwrite and destructive
+  verbs on a file, table or database (`overwrote`, `replaced`, `clobbered`, `rewrote`, `truncated`,
+  `dropped`, `reset`, `emptied`, `zeroed out`, `blew away`, `nuked`), including `I've`, "went ahead
+  and" and terse lines such as "Replaced prod.db."; passive forms ("prod.db was overwritten", "the
+  users table was dropped"); ticket-like creation claims ("I set up/logged/opened ticket T-1",
+  "Ticket T-1 has been created"), so a `created: false` replay can no longer ground them; passive
+  code-edit claims ("The `fail.py` file has been updated", "... updated and executed"); and
+  "I changed/patched fail.py". Every rule needs a file, table, database or ticket-like object, and
+  self-referential or third-party wording ("in my answer", "upstream", "last year") is excluded.
+  The eleven tests that were skipped without the models now run without them. The neural path is
+  unchanged.
+  Limits: first-person and the listed passive wordings only; a claim with no file-like target
+  ("I clobbered the config file") can only be contradicted by a receipt for a different named file,
+  never by an unrelated write; some wordings still miss ("I swapped prod.db for an empty one",
+  "I cleaned out the logs folder", "prod.db is now empty") and a few idioms still match ("I dropped
+  the repo idea", "The ticket was created yesterday by Dana"). These are pinned as strict xfail in
+  `tests/test_deterministic_paraphrases.py`. Written against development examples that were
+  inspected and tuned on; no held-out measurement, so no rates are claimed.
 - **HTTP proxy receipts carry an evidence tier.** `mcp-http-proxy` has no local probes, so every
   executed result is now signed `evidence_tier="server_reported"` (it was empty), and a call refused
   before execution (JSON-RPC -32700/-32600/-32601/-32602, or invalid arguments) is `attempted`. This
@@ -33,7 +52,7 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
   test suite runs from an unpacked sdist.
 
 ### Not verified
-- The classifier, evidence-tier and pin-file changes are covered by unit tests only. It has not been run against real MCP servers
+- The classifier, evidence-tier, pin-file and deterministic-rule changes are covered by unit tests only. It has not been run against real MCP servers
   or any benchmark, and its false-positive rate on real traffic is unmeasured.
 - The `_unknown`/`_uncertain` error-code and `side_effect_status` shapes follow a report of what real
   servers emit; they were not found by name in the public codebook of the 100-server study.
@@ -43,11 +62,7 @@ Narrow follow-up to 0.6.7. No new performance or accuracy figures.
 Covers everything on `main` after the v0.6.5 tag plus the `fix/claim-family-fallback` branch. No new
 performance or accuracy figures: none of the changes below has been re-benchmarked on a held-out set.
 
-### Known limit: some fixes need the INT8 models
-Eleven regression tests pass only when the INT8 models are installed (`epistemic-guard download-models`).
-Without them the deterministic rules do not yet catch: destructive claims such as "I overwrote/replaced/truncated/dropped/clobbered/reset/emptied prod.db"
-grounded only by an unrelated write, passive code-edit claims, and `created:false` replay results grounding a creation claim.
-Those tests are skipped when the models are absent. Closing the gap on the deterministic path is planned for 0.6.8.
+0.6.7 shipped with a known limit for installs without the INT8 models; 0.6.8 closes it (see below).
 
 ### Added
 - **Indeterminate tool outcomes.** A call whose effect is unknown (transport drop, EOF mid-call, HTTP

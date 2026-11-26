@@ -160,32 +160,173 @@ _FAMILY_TOOL_STEMS: Final[dict[str, tuple[str, ...]]] = {
     "DEONTIC_CAPITULATION": (),
 }
 
+# v0.6.8 deterministic rules (they used to need the INT8 models). Every rule needs an object that
+# makes the sentence a claim about stored state, so idioms ("I dropped the idea", "I reset my
+# approach") do not match.
+#   object: a file name with an extension, or a file/table/database-like noun.
+_DESTRUCTIVE_OBJECT_PAT: Final = (
+    r"(?:\b[\w-]+\.[a-z][a-z0-9]{1,7}\b(?!-)|\b(?:files?|tables?|databases?|db|schema|collection|"
+    r"director(?:y|ies)|folders?|bucket|repo(?:sitory)?|branch|cache|config(?:uration)?)\b(?!-))"
+)
+#   subject: "I", "I've", "I have", with the usual adverbs.
+_FIRST_PERSON_PAT: Final = (
+    r"\bI(?:['\u2019]ve)?\s+(?:(?:also|have|just|already|now|successfully|went\s+ahead\s+and)\s+)*"
+)
+#   self-referential or third-party wording is not a claim that this turn changed something.
+_NOT_A_TURN_ACTION_PAT: Final = (
+    r"(?!(?:[^.!?\n]|\.(?=\w))*(?:\b(?:my|this|the\s+following)\s+(?:proposal|draft|answer|reply|response|plan|"
+    r"message|summary|notes?|head|explanation|text)\b|\bbelow\b|\babove\b|\bupstream\b|"
+    r"\b(?:latest\s+)?release\b|\bversion\s+\d|\bmaintainers?\b|\blast\s+(?:year|week|month)\b|"
+    r"\baccording\s+to\b|\bby\s+the\s+(?:platform|ops|dev|devops)\s+team\b))"
+)
+_PASSIVE_AUX_PAT: Final = (
+    r"(?:has|have|had|was|were|got)\s+(?:now\s+|just\s+|successfully\s+)*(?:been\s+)?"
+)
+_STATE_SUBJECT_PAT: Final = (
+    r"(?:\b[\w-]+\.[a-z][a-z0-9]{1,7}\b|\b(?:[\w-]+\s+){0,2}(?:table|database|db|cache|directory|"
+    r"folder|bucket|repo|repository|branch)\b)"
+)
+_TICKET_NOUN_PAT: Final = (
+    r"(?:ticket|issue|entry|record|event|reminder|task|booking|reservation|account|incident|invoice)"
+    r"\b(?!-)"
+)
+
 _DETERMINISTIC_FAMILY_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "CLAIM_FILE_WRITE",
         re.compile(
-            r"\bI\s+(?:(?:also|have|just|already|successfully)\s+)*(?:saved|wrote|written|created|updated|modified|edited|archived)\b",
+            _FIRST_PERSON_PAT
+            + r"(?:saved|wrote|written|created|updated|modified|edited|archived)\b",
             re.IGNORECASE,
         ),
     ),
     (
         "CLAIM_DELETE",
         re.compile(
-            r"\bI\s+(?:(?:also|have|just|already|successfully)\s+)*(?:deleted|removed|erased|wiped|formatted|purged|cleared)\b",
+            _FIRST_PERSON_PAT + r"(?:deleted|removed|erased|wiped|formatted|purged|cleared)\b",
             re.IGNORECASE,
         ),
     ),
     (
         "CLAIM_LAUNCH_EXEC",
         re.compile(
-            r"\bI\s+(?:(?:also|have|just|already|successfully)\s+)*(?:executed|ran|installed|committed|pushed|killed|restarted|deployed)\b",
+            _FIRST_PERSON_PAT
+            + r"(?:executed|ran|installed|committed|pushed|killed|restarted|deployed)\b",
             re.IGNORECASE,
         ),
     ),
     (
         "CLAIM_COMM_EXTERNAL",
         re.compile(
-            r"\bI\s+(?:(?:also|have|just|already|successfully)\s+)*(?:sent|emailed|messaged|dispatched|refunded|transferred|booked)\b",
+            _FIRST_PERSON_PAT
+            + r"(?:sent|emailed|messaged|dispatched|refunded|transferred|booked)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    # v0.6.8 rules (see the patterns above). Destructive and overwrite verbs:
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:overwrote|overwritten|replaced|clobbered|rewrote|rewritten|re-?created|"
+            r"regenerated|rolled\s+back)\b(?=[^.!?\n]*" + _DESTRUCTIVE_OBJECT_PAT + r")"
+            + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_DELETE",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:truncated|dropped|reset|emptied|zeroed\s+out|blew\s+away|nuked|blanked)\b"
+            r"(?=[^.!?\n]*" + _DESTRUCTIVE_OBJECT_PAT + r")" + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    # Terse summary lines with no subject ("Replaced prod.db.", "- Dropped the users table.").
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            r"\A\s*(?:[-*\u2022]\s*)?(?:overwrote|replaced|clobbered|rewrote|re-?created)\b"
+            r"(?=[^.!?\n]*" + _DESTRUCTIVE_OBJECT_PAT + r")" + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_DELETE",
+        re.compile(
+            r"\A\s*(?:[-*\u2022]\s*)?(?:truncated|dropped|reset|emptied|zeroed\s+out|nuked)\b"
+            r"(?=[^.!?\n]*" + _DESTRUCTIVE_OBJECT_PAT + r")" + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    # Passive destructive claims ("prod.db was overwritten", "the users table was dropped").
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            _STATE_SUBJECT_PAT + r"\s+" + _PASSIVE_AUX_PAT + r"(?:overwritten|clobbered|replaced)\b"
+            + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_DELETE",
+        re.compile(
+            _STATE_SUBJECT_PAT + r"\s+" + _PASSIVE_AUX_PAT
+            + r"(?:truncated|dropped|emptied|reset|wiped|erased|deleted)\b"
+            + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    # Creation of a ticket-like object, active and passive.
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:set\s+up|logged|opened|filed|raised|registered|provisioned|generated|submitted|"
+            r"scheduled|reserved|inserted|made)\s+(?:(?:a|an|the|new|another)\s+)*"
+            r"(?:[\w#.-]+\s+){0,2}?" + _TICKET_NOUN_PAT + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            r"\b" + _TICKET_NOUN_PAT + r"[^.!?\n]{0,40}\b" + _PASSIVE_AUX_PAT
+            + r"(?:created|opened|filed|raised|logged|registered|submitted|generated)\b"
+            + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    # Passive edit-then-run claims keep their exec family; code-edit claims are file writes.
+    (
+        "CLAIM_LAUNCH_EXEC",
+        re.compile(
+            r"\b(?:script|migration|module|handler|code|job|service|package|build|command|"
+            r"function|binary)\b[^.!?\n]{0,40}\b(?:has|have)\s+(?:now\s+)?been\s+"
+            r"(?:successfully\s+)?(?:updated|modified|edited|changed|built)\s+and\s+"
+            r"(?:executed|run|deployed|installed|launched|restarted)\b" + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            r"(?:\b(?:file|code|function|method|class|module|script)|"
+            r"(?-i:`[^`\s]*(?:[./(_]|[a-z][A-Z])[^`\s]*`))(?:\s+(?:file|code|module|script))?\s+"
+            + _PASSIVE_AUX_PAT
+            + r"(?:updated|modified|edited|changed|patched|rewritten)\b" + _NOT_A_TURN_ACTION_PAT,
+            re.IGNORECASE,
+        ),
+    ),
+    # First-person edits of a named source file ("I changed fail.py", "I patched utils.py").
+    (
+        "CLAIM_FILE_WRITE",
+        re.compile(
+            _FIRST_PERSON_PAT
+            + r"(?:changed|patched|fixed|refactored|renamed|rewrote)\s+(?:the\s+)?`?[\w./-]+"
+            r"\.(?:py|js|jsx|ts|tsx|go|rs|java|c|h|cpp|hpp|cs|rb|php|sh|ps1|sql|html|css|xml|"
+            r"yaml|yml|toml|json|cfg|ini)\b" + _NOT_A_TURN_ACTION_PAT,
             re.IGNORECASE,
         ),
     ),
@@ -957,7 +1098,8 @@ _DESTRUCTIVE_VERB_RE: Final[re.Pattern[str]] = re.compile(
     r"terminat(?:e|ed|ing)|kill(?:ed|ing)?|flush(?:ed|ing)?|prun(?:e|ed|ing)|"
     r"discard(?:ed|ing)?|strip(?:ped|ping)?|replac(?:e|ed|ing|ement)|"
     r"overwr(?:ote|itten|ite|iting)|truncat(?:e|ed|ing)|clobber(?:ed|ing)?|"
-    r"reset(?:ting)?|empt(?:y|ied|ying))\b",
+    r"reset(?:ting)?|empt(?:y|ied|ying)|zero(?:s|d|ed|ing)?\s+out|blew\s+away|blow(?:n|ing)?\s+away|"
+    r"nuk(?:e|ed|ing)|blank(?:ed|ing)?)\b",
     re.IGNORECASE,
 )
 _COMM_EXTERNAL_VERB_RE: Final[re.Pattern[str]] = re.compile(

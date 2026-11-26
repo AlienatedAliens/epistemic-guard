@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _models import requires_models
 
 from epistemic_guard import (
     CalibrationSample,
@@ -1454,7 +1453,6 @@ def test_neural_only_memory_label_is_grounded_as_generic_state_change() -> None:
     )
 
 
-@requires_models
 def test_passive_edit_pattern_does_not_swallow_stronger_families() -> None:
     """Compound "updated and executed/deployed/installed" claims keep their exec family, and a
     backticked setting keeps CLAIM_SYSTEM_STATE; an edit receipt grounds neither.
@@ -1481,7 +1479,6 @@ def test_passive_edit_pattern_does_not_swallow_stronger_families() -> None:
     assert sup.verify_narration("The `brightness` has been changed to 40%.", receipts=[bright]).is_valid
 
 
-@requires_models
 def test_replayed_result_cannot_ground_a_creation_claim() -> None:
     """An idempotent replay from a create-type tool grounds "already existed", not "I created".
     Upserts and membership adds that report `created: false` are not replays.
@@ -1532,7 +1529,6 @@ def test_replayed_result_cannot_ground_a_creation_claim() -> None:
     assert sup.verify_narration("I added Alice to the deploy channel.", receipts=[member]).is_valid
 
 
-@requires_models
 def test_write_receipt_without_target_makes_named_file_claim_unverifiable_not_flagged() -> None:
     """A write receipt that names no target can neither confirm nor contradict the file a claim
     names: the turn passes as `unverifiable` and lists the tool. A receipt naming a different
@@ -1566,7 +1562,6 @@ def test_write_receipt_without_target_makes_named_file_claim_unverifiable_not_fl
     assert RS._receipt_supports_clause(claim, "CLAIM_FILE_WRITE", [edit({"command": "edit 1:15"})]) is False
 
 
-@requires_models
 def test_unconfirmable_target_relaxation_is_narrow() -> None:
     """Adversarial-audit cases: the unconfirmable path must not swallow receipts that name a
     target under an unknown key or value shape, multi-file or sensitive claims, non-file targets,

@@ -1,8 +1,6 @@
-"""Test helper: some regression tests pin behaviour that only holds with the INT8 models installed."""
+"""Test helper: tells tests whether the INT8 models are installed (the neural path then differs)."""
 
 from __future__ import annotations
-
-import pytest
 
 from epistemic_guard.models import MODEL_SPECS, resolve_managed_model_dir
 
@@ -15,9 +13,3 @@ def _models_installed() -> bool:
         )
     except Exception:
         return False
-
-
-requires_models = pytest.mark.skipif(
-    not _models_installed(),
-    reason="needs the INT8 models (epistemic-guard download-models); the deterministic path does not yet cover this case",
-)
