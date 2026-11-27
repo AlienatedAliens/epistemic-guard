@@ -16,7 +16,20 @@ This file starts at 0.6.7. Earlier releases are described by their git tags and 
 ### Limits, stated plainly
 - Under a declared lagging root a real silent no-op write cannot be told from lag, so it is reported as
   `unverifiable`, not `contradicted`. That is the intended trade-off; it is never reported as verified.
-- The settle wait runs in the proxy's response path, which is why it is capped.
+- The settle wait runs in the proxy's response path, which is why it is capped: at 5 s, shared across all
+  responses in one server line (a batch does not multiply it). Several pipelined lines are still handled one
+  after another, so keep it small. A genuine silent no-op costs the full wait.
+- A concurrent writer (a sync client, another process) that touches the file during the wait can make a
+  no-op look like a real write, as it could before over microseconds; the wait widens that window. The probe
+  compares existence, size, hash and mtime, never the content the tool was asked to write.
+- A stat error that is not "file not found" (a stale or offline mount, permission denied) is now
+  `probe_stat_error`, tier `probe_unobservable`. Before, it read as an absent file, so a no-op delete on a
+  failing mount could be reported as a verified delete.
+- `effect_observation` gains `rechecks`, `settled`, `settle_s` and `lagging_root`, and its `verified` can now be
+  null for filesystem probes (it already could for git and SQLite). When a recheck flips a miss to a hit, the
+  first-pass reason is not kept, only `rechecks` and `settled`.
+- `--probe-eventual-root` requires `--probe-fs`. `wrap-config` does not forward the two new flags yet, and the
+  HTTP proxy has no probes.
 - The guard only reads. It never retries or re-sends a tool call, and a write that may already have landed is
   not replayed. Remote services still have no probe: their claims stay `unverifiable`.
 - Git and SQLite probes are unchanged. Not benchmarked on a held-out set; no accuracy or latency claim.

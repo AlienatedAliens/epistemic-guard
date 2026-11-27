@@ -11,6 +11,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from epistemic_guard.mcp_proxy import McpStdioProxy, ReceiptLogWriter, verify_receipt_log_file
 from epistemic_guard.provenance import SignerFactory
 from epistemic_guard.schemas import ToolReceipt
@@ -125,21 +127,19 @@ def test_a_real_effect_under_a_declared_root_is_still_verified(tmp_path: Path) -
     assert receipt.evidence_tier == "independently_verified"
 
 
-def test_probe_never_resends_a_tool_call(tmp_path: Path) -> None:
-    """The proxy only observes: a miss never produces a second client-to-server message."""
+def test_probe_only_observes_and_returns_the_server_line_unchanged(tmp_path: Path) -> None:
+    """The probe has no write path to the server: the proxy returns the original response bytes."""
     ws = tmp_path / "ws"
     ws.mkdir()
-    log_path = tmp_path / "receipts.jsonl"
-    signer = SignerFactory.from_master_key(b"\x56" * 32).tool_verified()
     proxy = McpStdioProxy(
-        ReceiptLogWriter(log_path, signer, truncate=True),
+        ReceiptLogWriter(tmp_path / "r.jsonl", SignerFactory.from_master_key(b"V" * 32).tool_verified(), truncate=True),
         endpoint_id="stdio:ec",
         probe_fs_root=ws,
         probe_settle_s=0.1,
     )
     proxy.observe_client_line(_call(1, "write_file", {"path": "a.txt", "content": "x"}))
-    out = proxy.process_server_line(_ok(1, "wrote a.txt"))
-    assert out is None or isinstance(out, (bytes, bytearray)) and b"tools/call" not in out
+    line = _ok(1, "wrote a.txt")
+    assert proxy.process_server_line(line) == line
 
 
 def _proxy(tmp_path: Path, ws: Path, **kw: object) -> McpStdioProxy:
@@ -190,3 +190,48 @@ def test_delete_that_still_shows_the_file_is_inconclusive_under_a_lagging_root(
     assert rec.evidence_tier == "probe_unobservable"
     assert rec.effect_observation is not None
     assert rec.effect_observation["reason"] == "probe_inconclusive_eventual_consistency"
+
+
+def test_batch_of_misses_shares_one_settle_budget(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    proxy = _proxy(tmp_path, ws, probe_settle_s=0.4)
+    n = 6
+    for i in range(1, n + 1):
+        proxy.observe_client_line(_call(i, "write_file", {"path": f"m{i}.txt", "content": "x"}))
+    batch = [
+        {"jsonrpc": "2.0", "id": i, "result": {"content": [{"type": "text", "text": "ok"}], "isError": False}}
+        for i in range(1, n + 1)
+    ]
+    t0 = time.monotonic()
+    proxy.process_server_line((json.dumps(batch) + chr(10)).encode("utf-8"))
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.4 * 2.5  # one shared budget, not 6 x 0.4 s
+
+
+def test_a_stat_error_after_a_delete_is_not_a_verified_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import epistemic_guard.mcp_proxy as mp
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "stuck.txt").write_text("x", encoding="utf-8")
+    real = mp._stat_and_hash_file
+    calls = {"n": 0}
+
+    def flaky(target: Path, **kw: object) -> dict[str, object]:
+        calls["n"] += 1
+        return real(target, **kw) if calls["n"] == 1 else {"exists": None, "stat_error": "PermissionError"}
+
+    monkeypatch.setattr(mp, "_stat_and_hash_file", flaky)
+    proxy = _proxy(tmp_path, ws)
+    proxy.observe_client_line(_call(1, "delete_file", {"path": "stuck.txt"}))
+    proxy.process_server_line(_ok(1, "deleted stuck.txt"))
+    rec = verify_receipt_log_file(
+        tmp_path / "r.jsonl",
+        expected_pubkey_hex=SignerFactory.from_master_key(b"W" * 32).tool_verified().public_key_bytes.hex(),
+    ).receipts[0]
+    assert rec.evidence_tier == "probe_unobservable"
+    assert rec.effect_observation is not None
+    assert rec.effect_observation["reason"] == "probe_stat_error"

@@ -190,8 +190,11 @@ def _stat_and_hash_file(
     """Read-only filesystem snapshot independent of any MCP server response."""
     try:
         st = target.stat()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return {"exists": False}
+    except OSError as exc:
+        # Not "absent": the mount may be stale, offline or denied. Never read this as a delete.
+        return {"exists": None, "stat_error": type(exc).__name__}
     snap: dict[str, Any] = {
         "exists": True,
         "is_dir": target.is_dir(),
@@ -261,8 +264,10 @@ def _judge_fs_effect(
     expected_op: str,
     before: Mapping[str, Any],
     after: Mapping[str, Any],
-) -> tuple[bool, str]:
-    """Judge one post-call disk snapshot against the pre-call one."""
+) -> tuple[bool | None, str]:
+    """Judge one post-call disk snapshot against the pre-call one (None: could not observe)."""
+    if "stat_error" in after or "stat_error" in before:
+        return None, "probe_stat_error"
     if expected_op == "write":
         if not after.get("exists"):
             return False, "file_missing_after_write"
@@ -297,14 +302,14 @@ def _evaluate_fs_probe(
     delay, rechecks = 0.05, 0
     after = _stat_and_hash_file(target_path)
     verified, reason = _judge_fs_effect(expected_op, before, after)
-    while not verified and time.monotonic() < deadline:
+    while verified is not True and time.monotonic() < deadline:
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 2, 0.5)
         rechecks += 1
         after = _stat_and_hash_file(target_path)
         verified, reason = _judge_fs_effect(expected_op, before, after)
     outcome: bool | None = verified
-    if not verified and lagging:
+    if verified is False and lagging:
         outcome, reason = None, "probe_inconclusive_eventual_consistency"
 
     observation: dict[str, Any] = {
@@ -317,7 +322,7 @@ def _evaluate_fs_probe(
         "verified": outcome,
         "reason": reason,
         "rechecks": rechecks,
-        "settled": bool(verified and rechecks),
+        "settled": bool(verified is True and rechecks),
         "settle_s": max(0.0, settle_s),
         "lagging_root": lagging,
     }
@@ -1348,6 +1353,7 @@ class McpStdioProxy:
         self._probe_fs_root: Path | None = (
             Path(probe_fs_root).resolve() if probe_fs_root is not None else None
         )
+        self._line_settle_deadline = 0.0
         self._probe_settle_s = (
             min(float(probe_settle_s), _PROBE_SETTLE_MAX_S)
             if math.isfinite(float(probe_settle_s)) and float(probe_settle_s) > 0
@@ -1593,6 +1599,7 @@ class McpStdioProxy:
         items = payload if is_batch else [payload]
         rewritten = False
         out_items: list[object] = []
+        self._line_settle_deadline = time.monotonic() + self._probe_settle_s
 
         for item in items:
             if not isinstance(item, Mapping) or "method" in item:
@@ -1799,7 +1806,7 @@ class McpStdioProxy:
                     exp_op,
                     target_path,
                     before_snap,
-                    settle_s=self._probe_settle_s,
+                    settle_s=max(0.0, self._line_settle_deadline - time.monotonic()),
                     lagging=any(
                         target_path.is_relative_to(root) for root in self._probe_eventual_roots
                     ),

@@ -258,6 +258,15 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.probe_eventual_root and not args.probe_fs:
+        print(
+            "epistemic-guard mcp-proxy: --probe-eventual-root requires --probe-fs",
+            file=sys.stderr,
+        )
+        return 2
+    if any(not r.strip() for r in args.probe_eventual_root):
+        print("epistemic-guard mcp-proxy: --probe-eventual-root needs a directory", file=sys.stderr)
+        return 2
     try:
         return run_mcp_stdio_proxy(
             cmd,
