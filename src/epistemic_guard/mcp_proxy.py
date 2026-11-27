@@ -252,30 +252,60 @@ def _arm_fs_probe(
     return (expected_op, target_resolved, _stat_and_hash_file(target_resolved))
 
 
-def _evaluate_fs_probe(
+# The settle wait runs inside the proxy's response path, so it is capped: a probe must not be able
+# to stall an agent for long. Non-finite or non-positive values mean no wait.
+_PROBE_SETTLE_MAX_S: Final[float] = 5.0
+
+
+def _judge_fs_effect(
     expected_op: str,
-    target_path: Path,
     before: Mapping[str, Any],
-) -> tuple[bool, dict[str, Any]]:
-    """Compare post-call disk state against pre-call snapshot independently of server output."""
-    after = _stat_and_hash_file(target_path)
+    after: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Judge one post-call disk snapshot against the pre-call one."""
     if expected_op == "write":
         if not after.get("exists"):
-            verified, reason = False, "file_missing_after_write"
-        elif (
+            return False, "file_missing_after_write"
+        if (
             before.get("exists")
             and before.get("size") == after.get("size")
             and before.get("sha256") == after.get("sha256")
             and before.get("mtime_ns") == after.get("mtime_ns")
         ):
-            verified, reason = False, "file_unchanged_after_ok"
-        else:
-            verified = True
-            reason = "file_created" if not before.get("exists") else "file_mutated"
-    elif after.get("exists"):
-        verified, reason = False, "file_still_exists_after_delete"
-    else:
-        verified, reason = True, "file_deleted"
+            return False, "file_unchanged_after_ok"
+        return True, "file_created" if not before.get("exists") else "file_mutated"
+    if after.get("exists"):
+        return False, "file_still_exists_after_delete"
+    return True, "file_deleted"
+
+
+def _evaluate_fs_probe(
+    expected_op: str,
+    target_path: Path,
+    before: Mapping[str, Any],
+    *,
+    settle_s: float = 0.0,
+    lagging: bool = False,
+) -> tuple[bool | None, dict[str, Any]]:
+    """Compare post-call disk state against the pre-call snapshot independently of server output.
+
+    A miss is re-checked for at most `settle_s` seconds (default 0: no wait). If it persists and
+    the target is under a root declared eventually consistent (`lagging`), the outcome is None
+    (inconclusive) and never a contradiction. The probe only reads; it never re-sends a call.
+    """
+    deadline = time.monotonic() + max(0.0, settle_s)
+    delay, rechecks = 0.05, 0
+    after = _stat_and_hash_file(target_path)
+    verified, reason = _judge_fs_effect(expected_op, before, after)
+    while not verified and time.monotonic() < deadline:
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 2, 0.5)
+        rechecks += 1
+        after = _stat_and_hash_file(target_path)
+        verified, reason = _judge_fs_effect(expected_op, before, after)
+    outcome: bool | None = verified
+    if not verified and lagging:
+        outcome, reason = None, "probe_inconclusive_eventual_consistency"
 
     observation: dict[str, Any] = {
         "observer": "epistemic_guard.mcp_proxy.filesystem_probe",
@@ -284,10 +314,14 @@ def _evaluate_fs_probe(
         "expected_op": expected_op,
         "before": dict(before),
         "after": after,
-        "verified": verified,
+        "verified": outcome,
         "reason": reason,
+        "rechecks": rechecks,
+        "settled": bool(verified and rechecks),
+        "settle_s": max(0.0, settle_s),
+        "lagging_root": lagging,
     }
-    return (verified, observation)
+    return (outcome, observation)
 
 
 _GIT_MUTATING_TOOL_RE: Final[re.Pattern[str]] = re.compile(
@@ -1302,6 +1336,8 @@ class McpStdioProxy:
         probe_git_repo: Path | str | None = None,
         probe_sqlite_path: Path | str | None = None,
         pin_file: Path | str | None = None,
+        probe_settle_s: float = 0.0,
+        probe_eventual_roots: Sequence[Path | str] = (),
     ) -> None:
         self._writer = writer
         self._pin_tools = pin_tools
@@ -1311,6 +1347,14 @@ class McpStdioProxy:
         self._endpoint_id = endpoint_id
         self._probe_fs_root: Path | None = (
             Path(probe_fs_root).resolve() if probe_fs_root is not None else None
+        )
+        self._probe_settle_s = (
+            min(float(probe_settle_s), _PROBE_SETTLE_MAX_S)
+            if math.isfinite(float(probe_settle_s)) and float(probe_settle_s) > 0
+            else 0.0
+        )
+        self._probe_eventual_roots: tuple[Path, ...] = tuple(
+            Path(r).resolve() for r in probe_eventual_roots
         )
         self._probe_git_repo: Path | None = (
             Path(probe_git_repo).resolve() if probe_git_repo is not None else None
@@ -1751,7 +1795,15 @@ class McpStdioProxy:
             probe_result: tuple[bool | None, dict[str, Any]] | None = None
             if pending.fs_probe is not None:
                 exp_op, target_path, before_snap = pending.fs_probe
-                probe_result = _evaluate_fs_probe(exp_op, target_path, before_snap)
+                probe_result = _evaluate_fs_probe(
+                    exp_op,
+                    target_path,
+                    before_snap,
+                    settle_s=self._probe_settle_s,
+                    lagging=any(
+                        target_path.is_relative_to(root) for root in self._probe_eventual_roots
+                    ),
+                )
             elif pending.git_probe is not None:
                 repo_path, before_git = pending.git_probe
                 probe_result = _evaluate_git_probe(repo_path, before_git)
@@ -1848,6 +1900,8 @@ def run_mcp_stdio_proxy(
     probe_git_repo: Path | str | None = None,
     probe_sqlite_path: Path | str | None = None,
     pin_file: Path | str | None = None,
+    probe_settle_s: float = 0.0,
+    probe_eventual_roots: Sequence[Path | str] = (),
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
 ) -> int:
@@ -1875,6 +1929,8 @@ def run_mcp_stdio_proxy(
         probe_git_repo=probe_git_repo,
         probe_sqlite_path=probe_sqlite_path,
         pin_file=pin_file,
+        probe_settle_s=probe_settle_s,
+        probe_eventual_roots=probe_eventual_roots,
     )
 
     child_env = _scrub_child_env(os.environ)

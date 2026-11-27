@@ -2,6 +2,25 @@
 
 This file starts at 0.6.7. Earlier releases are described by their git tags and GitHub release notes.
 
+## Unreleased
+
+### Added
+- **Filesystem probes can tolerate lagging storage (opt-in).** `mcp-proxy --probe-settle-s N` re-checks a
+  probe miss for at most N seconds (capped at 5; default 0, which changes nothing) and records `rechecks`
+  and `settled` in the signed observation. `--probe-eventual-root DIR` (repeatable) declares a directory
+  eventually consistent, for example a network or synced folder: a miss that persists there is reported as
+  `probe_inconclusive_eventual_consistency` with evidence tier `probe_unobservable`, so the claim comes out
+  `unverifiable` and never `contradicted`. Library: `McpStdioProxy(probe_settle_s=..., probe_eventual_roots=...)`.
+- Prompted by a public comment that an immediate read-back miss is not always a failure.
+
+### Limits, stated plainly
+- Under a declared lagging root a real silent no-op write cannot be told from lag, so it is reported as
+  `unverifiable`, not `contradicted`. That is the intended trade-off; it is never reported as verified.
+- The settle wait runs in the proxy's response path, which is why it is capped.
+- The guard only reads. It never retries or re-sends a tool call, and a write that may already have landed is
+  not replayed. Remote services still have no probe: their claims stay `unverifiable`.
+- Git and SQLite probes are unchanged. Not benchmarked on a held-out set; no accuracy or latency claim.
+
 ## 0.6.8 (local release candidate)
 
 Narrow follow-up to 0.6.7. No new performance or accuracy figures.

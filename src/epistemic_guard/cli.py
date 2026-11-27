@@ -276,6 +276,8 @@ def _cmd_mcp_proxy(args: argparse.Namespace) -> int:
             probe_git_repo=args.probe_git,
             probe_sqlite_path=args.probe_sqlite,
             pin_file=args.pin_file,
+            probe_settle_s=args.probe_settle_s,
+            probe_eventual_roots=args.probe_eventual_root,
         )
     except (EpistemicGuardError, OSError, ValueError) as exc:
         print(f"epistemic-guard mcp-proxy error: {exc}", file=sys.stderr)
@@ -823,6 +825,24 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Workspace root directory for independent out-of-process read-only filesystem "
             "effect probes (catches silent no-op write/delete servers returning isError: false)"
+        ),
+    )
+    mp.add_argument(
+        "--probe-settle-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds a filesystem probe may re-check a miss before reporting it (default 0: no "
+            "wait). Read-only; the proxy never re-sends a tool call."
+        ),
+    )
+    mp.add_argument(
+        "--probe-eventual-root",
+        action="append",
+        default=[],
+        help=(
+            "Directory declared eventually consistent (network or synced folder). A probe miss "
+            "that persists under it is reported as unverifiable, never as contradicted. Repeatable."
         ),
     )
     mp.add_argument(
